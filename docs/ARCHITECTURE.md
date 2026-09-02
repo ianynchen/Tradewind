@@ -132,6 +132,30 @@ Rules:
   and a conformance test suite runs the identical scenario matrix against every
   adapter, skipping cases its declared capabilities exclude.
 
+### 3.2 Event taxonomy (frozen)
+
+Frozen at task 11 (P-1 resolved, §7): the six members of `domain.events.Event`,
+finalized against the two adapters implemented so far (claude, langchain) rather
+than on paper. No member is added without a new P-numbered decision reopening
+this list.
+
+| Event | Emitted when | claude | langchain |
+|---|---|---|---|
+| `TurnStarted` | Always, the first event of every turn. | yes | yes |
+| `TextDelta` | A streamed text chunk, ahead of the `ItemCompleted` it assembles into. | no (SDK hands messages over whole, not incrementally) | yes |
+| `ItemCompleted` | One normalized message (`text`/`thinking`/`tool_use`/`tool_result`) is complete and mirrored. | yes | yes |
+| `PermissionRequested` | A tool call's broker verdict is `"deny"` — **deny-only, by design**: an `"allow"` verdict has no side effect distinct from the call itself proceeding, so it is not separately eventized. | yes | yes |
+| `TurnCompleted` | A turn finishes cleanly or is interrupted (`result.status` distinguishes the two). | yes | yes |
+| `TurnFailed` | A turn ends in an unrecoverable error. | yes | yes |
+
+`ThinkingDelta` (a streamed reasoning chunk) was removed from the draft
+taxonomy at task 11: `claude` never streams deltas at all, and `langchain`'s
+would-be emission site is unreachable — nothing in Tradewind's current request
+construction enables Anthropic extended thinking on that path, so it never sees
+a `"reasoning"` streaming chunk to map. Persisted `kind="thinking"`
+`ItemCompleted` items (emitted by both adapters) are unaffected — only the
+live, in-flight delta signal for that content was removed.
+
 ## 4. Domain Model — session schema
 
 Authoritative store schema (SQLite dialect; Postgres-compatible). Full field
@@ -307,8 +331,9 @@ already mirrored stays.
 
 ## 7. Pending Architectural Decisions
 
-- **P-1** Exact unified event taxonomy (working set: FR-7.1) — finalize against the
-  first two adapters implemented, not on paper.
+- ~~**P-1** Exact unified event taxonomy (working set: FR-7.1) — finalize against
+  the first two adapters implemented, not on paper.~~ **RESOLVED (task 11)**:
+  see §3.2 "Event taxonomy (frozen)".
 - **P-2** Broker mapping for Codex approval events (OQ-2) — spike before the Codex
   adapter is declared done.
 - **P-3** `spawn_agent` tool scheduling/limits (OQ-3, FR-9.2) — after first

@@ -151,7 +151,18 @@ def assistant_message_items(message: AssistantMessage) -> list[NormalizedMessage
     ThinkingBlock->thinking with `signature` into `raw`, ToolUseBlock->
     tool_use). `ServerToolUseBlock`/`ServerToolResultBlock` (server-executed
     tools such as web_search) are out of the brief's mapping scope and are
-    skipped rather than guessed at."""
+    skipped rather than guessed at.
+
+    Every produced item carries `message.uuid` as its `native_id` (task-11
+    fix: confirmed empirically this task that the live SDK stream, not only
+    `get_session_messages()`'s transcript-file read, populates this field --
+    it is the same id the corresponding line in the native transcript file
+    carries). Without this, `store.last_native_id()` never advances past a
+    live-driven turn, and `ResumePlanner.reconcile()`'s next
+    `read_native_transcript(after=None)` would re-import that same turn's
+    content from the transcript file as brand-new, duplicating it in the
+    mirror (task-11 report: caught live against a real session).
+    """
     items: list[NormalizedMessage] = []
     for block in message.content:
         if isinstance(block, TextBlock):
@@ -176,6 +187,8 @@ def assistant_message_items(message: AssistantMessage) -> list[NormalizedMessage
                     content={"id": block.id, "name": block.name, "input": dict(block.input)},
                 )
             )
+    for item in items:
+        item.native_id = message.uuid
     return items
 
 
@@ -196,7 +209,10 @@ def user_message_items(message: UserMessage) -> list[NormalizedMessage]:
     "[Request interrupted by user]") carries nothing this adapter mirrors
     itself -- the prompt is the turn runner's job (`TurnContext.prompt`),
     not an event this backend emits -- so only `ToolResultBlock`s produce
-    an item here."""
+    an item here.
+
+    Every produced item carries `message.uuid` as its `native_id` -- see
+    `assistant_message_items`'s docstring for why."""
     if isinstance(message.content, str):
         return []
     items: list[NormalizedMessage] = []
@@ -213,6 +229,8 @@ def user_message_items(message: UserMessage) -> list[NormalizedMessage]:
                     },
                 )
             )
+    for item in items:
+        item.native_id = message.uuid
     return items
 
 

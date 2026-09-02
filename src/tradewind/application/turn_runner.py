@@ -28,6 +28,7 @@ import anyio
 
 from tradewind.application.config import TradewindConfig
 from tradewind.application.ports import Backend, SessionStorePort, TurnContext
+from tradewind.application.resume import ResumePlanner
 from tradewind.application.tool_host import ToolHost
 from tradewind.domain.errors import ConfigError, SessionNotFound
 from tradewind.domain.events import Event, ItemCompleted, TurnCompleted, TurnFailed
@@ -129,6 +130,7 @@ class TurnRunner:
         self._store = store
         self._config = config
         self._resolve_backend = resolve_backend
+        self._resume_planner = ResumePlanner()
         # session_id -> a stop() call is pending/in-flight for its current
         # turn; consulted only when a turn's event stream ends without a
         # terminal event, to tell an expected interrupt apart from an
@@ -203,6 +205,15 @@ class TurnRunner:
         # the next `sweep_stale_turns` (session open).
         try:
             backend = self._resolve_backend(session_row.profile, profile)
+            if (
+                session_row.native_session_id is not None
+                and backend.capabilities().supports_transcript_read
+            ):
+                # Reconcile before this turn's history is loaded (below) so
+                # a human's out-of-band native activity (vendor CLI, DR-3)
+                # is already part of the mirror this turn's context rebuilds
+                # from (ARCHITECTURE §5.2).
+                await self._resume_planner.reconcile(session_row, backend, self._store)
             broker = (
                 options.permission_broker or self._config.permission_broker or _AllowAllBroker()
             )
@@ -293,6 +304,30 @@ class TurnRunner:
                     )
                     self._tap(synthesized, turn_id)
                     yield synthesized
+
+                # Native-id rehome (task-11 brief): a backend that exposes
+                # `last_native_session_id` (claude; not part of the `Backend`
+                # ABC -- `getattr` default handles every backend that
+                # doesn't) records the native id its own SDK actually used
+                # for this turn as soon as it has one, regardless of how the
+                # turn ended (completed/failed/interrupted -- see
+                # `ClaudeBackend._drive_client`'s `ResultMessage` handling).
+                # When that differs from what the session row already has
+                # (first native turn, or the CLI minted a new native id on
+                # this resume), re-home the row so the next turn's
+                # `reconcile()`/`resume=` both target the current one.
+                new_native_session_id = cast(
+                    "str | None", getattr(backend, "last_native_session_id", None)
+                )
+                if new_native_session_id is not None and (
+                    new_native_session_id != session_row.native_session_id
+                ):
+                    await anyio.to_thread.run_sync(
+                        self._store.rehome_native,
+                        session_id,
+                        backend.name,
+                        new_native_session_id,
+                    )
         except BaseException as exc:
             if terminal_status is None:
                 terminal_status = "failed"

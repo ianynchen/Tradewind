@@ -1,6 +1,21 @@
 """Domain events: frozen dataclasses forming the normalized event stream.
 
-Taxonomy is DRAFT until Task 11 / P-1.
+Taxonomy frozen at task 11 (ARCHITECTURE §3.2 "Event taxonomy (frozen)",
+P-1 resolved): the six members of the `Event` union below, each emitted by
+whichever adapter's own turn shape produces it -- see that subsection for
+the one-line-per-event summary of what emits what, and why
+`PermissionRequested` is deny-only.
+
+`ThinkingDelta` (a streamed reasoning chunk) was removed here: nothing
+reaches the code path that would emit it. `ClaudeBackend` has no
+delta-streaming path at all (its whole surface is `ItemCompleted`,
+including `kind="thinking"` -- the SDK hands thinking blocks over whole,
+not incrementally); `LangchainBackend`'s would-be emission site
+(`_delta_event`'s `"reasoning"` branch) is unreachable because nothing in
+Tradewind's current request construction enables Anthropic extended
+thinking on that path, so that branch never sees a `"reasoning"` streaming
+chunk. Persisted `kind="thinking"` `ItemCompleted` items are unaffected --
+only the live, in-flight delta signal for that content was ever removed.
 """
 
 from __future__ import annotations
@@ -18,11 +33,6 @@ class TurnStarted:
 
 @dataclass(frozen=True)
 class TextDelta:
-    text: str
-
-
-@dataclass(frozen=True)
-class ThinkingDelta:
     text: str
 
 
@@ -49,12 +59,4 @@ class TurnFailed:
     error: str
 
 
-Event = (
-    TurnStarted
-    | TextDelta
-    | ThinkingDelta
-    | ItemCompleted
-    | PermissionRequested
-    | TurnCompleted
-    | TurnFailed
-)
+Event = TurnStarted | TextDelta | ItemCompleted | PermissionRequested | TurnCompleted | TurnFailed

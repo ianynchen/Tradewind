@@ -12,20 +12,69 @@ backend-agnostic; only the *scripting* knobs on `ConformanceHarness` are
 backend-specific by necessity (each `tests/conformance/test_<backend>.py`
 supplies its own concrete harness wired to a scripted/fake double for that
 backend -- see `tests/conformance/test_langchain.py`).
+
+Task-11 generalization (controller-expanded scope, task-10 report's live-run
+findings): these scenarios ran only against `langchain`'s fake chat models
+until task 11 -- run live against `ClaudeBackend`
+(`tests/conformance/test_claude.py`), several failed for reasons that were
+never bugs in the adapter, only in scenario assumptions baked in against a
+scripted double:
+
+  - History assertions were exact-list comparisons that implicitly assumed
+    "no `kind==\"thinking\"` item ever appears" -- true of every fake model
+    used here, false of a real model under extended thinking (`ClaudeBackend`
+    emits one on essentially every turn). `_non_thinking()` below filters
+    those out before any history assertion; what's asserted afterward is
+    invariants (prompt present, assistant reply present, ordering) rather
+    than a snapshot of the exact item list.
+  - `tool_allow_deny` declared tools with `input_schema={"type": "object"}`
+    -- no `properties` -- giving a real model no schema-level anchor for a
+    call's shape, so it substituted its own guessed input instead of the
+    scripted one. Both tools now declare a real `properties`/`required`
+    shape, and the scenario asserts gating *behavior* (which handler ran,
+    which didn't, that the denial produced an error result keyed to the
+    right tool call) instead of an exact `tool_input`.
+  - `system_prompt_respected` asked a real model to reproduce its system
+    prompt byte-for-byte as its entire reply -- structurally impossible
+    against `ClaudeBackend`'s preset+append system-prompt shape (its own
+    module docstring). It now asks for a fixed token to appear in the reply
+    instead, which both a scripted fake and a real model reliably satisfy.
+
+`structured_output` is unchanged: it stays purely capability-gated (skips on
+any backend with `supports_structured_output=False`) rather than behavioral,
+since no backend advertises that capability yet to exercise against.
 """
 
 from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 import anyio
 import pytest
 
 from tradewind.application.client import Tradewind
-from tradewind.domain.events import Event, PermissionRequested, TurnCompleted, TurnFailed
-from tradewind.domain.models import Capabilities, SessionOptions, Tool, Verdict
+from tradewind.domain.events import (
+    Event,
+    ItemCompleted,
+    PermissionRequested,
+    TurnCompleted,
+    TurnFailed,
+)
+from tradewind.domain.models import Capabilities, SessionOptions, StoredMessage, Tool, Verdict
+
+
+def _non_thinking(messages: list[StoredMessage]) -> list[StoredMessage]:
+    """Drop `kind==\"thinking\"` items before a history assertion.
+
+    A real model may interleave extended-thinking blocks that no scenario
+    here scripts for or cares about (module docstring) -- `ClaudeBackend`
+    persists them faithfully (`kind=\"thinking\"` `ItemCompleted`, per its
+    own mapping spec), so filtering here, not suppressing them in the
+    adapter, is what keeps this scenario backend-agnostic.
+    """
+    return [m for m in messages if m.kind != "thinking"]
 
 
 @dataclass(frozen=True)
@@ -76,7 +125,12 @@ class ConformanceHarness(Protocol):
 
 async def single_turn_text(harness: ConformanceHarness) -> None:
     """A turn with no tools completes and its exchange lands in history in
-    order -- the baseline every backend must support."""
+    order -- the baseline every backend must support.
+
+    History is asserted as invariants, not an exact list (module
+    docstring): the prompt is present as the first non-thinking item, and
+    exactly one assistant `text` item follows it with the scripted reply.
+    """
     harness.script_text_response("hello there")
     session_id = str(uuid.uuid4())
     session = await harness.tradewind.create(session_id, SessionOptions())
@@ -85,32 +139,49 @@ async def single_turn_text(harness: ConformanceHarness) -> None:
 
     assert result.status == "completed"
     assert result.final_text == "hello there"
-    history = await harness.tradewind.history(session_id)
-    assert [(m.role, m.content.get("text")) for m in history] == [
-        ("user", "hi"),
-        ("assistant", "hello there"),
-    ]
+    history = _non_thinking(await harness.tradewind.history(session_id))
+    assert history[0].role == "user"
+    assert history[0].content.get("text") == "hi"
+    assistant_texts = [m for m in history if m.role == "assistant" and m.kind == "text"]
+    assert len(assistant_texts) == 1
+    assert assistant_texts[0].content.get("text") == "hello there"
 
 
 async def tool_allow_deny(harness: ConformanceHarness) -> None:
-    """The broker gates each tool call independently: an allowed call
-    executes and its result reaches the model; a denied call never
-    executes and is surfaced as `PermissionRequested` (FR-4.1)."""
+    """The broker gates each tool call independently: an allowed call's
+    handler executes; a denied call's handler never runs and is surfaced
+    as `PermissionRequested` plus an error `tool_result` keyed to the right
+    tool call (FR-4.1).
+
+    Both tools declare a real `properties`/`required` JSON Schema (module
+    docstring: a bare `{"type": "object"}` gives a real model no anchor for
+    a call's shape, so it substitutes its own guess) -- this scenario
+    therefore asserts gating *behavior*, not an exact `tool_input`, since a
+    live model's exact argument choice is not something this matrix
+    controls or cares about.
+    """
     if not (
         harness.capabilities.supports_interactive_permissions
         and harness.capabilities.supports_in_process_tools
     ):
         pytest.skip("backend does not support broker-gated in-process tools")
 
-    async def handler(**kwargs: object) -> str:
-        return f"ok:{kwargs}"
+    allowed_calls: list[dict[str, object]] = []
+    denied_calls: list[dict[str, object]] = []
 
+    async def allowed_handler(**kwargs: object) -> str:
+        allowed_calls.append(kwargs)
+        return "ok"
+
+    async def denied_handler(**kwargs: object) -> str:
+        denied_calls.append(kwargs)
+        return "should never run"
+
+    schema = {"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]}
     allowed = Tool(
-        name="allowed_tool", description="d", input_schema={"type": "object"}, handler=handler
+        name="allowed_tool", description="d", input_schema=schema, handler=allowed_handler
     )
-    denied = Tool(
-        name="denied_tool", description="d", input_schema={"type": "object"}, handler=handler
-    )
+    denied = Tool(name="denied_tool", description="d", input_schema=schema, handler=denied_handler)
 
     class _Broker:
         async def decide(self, tool_name: str, _tool_input: dict[str, object]) -> Verdict:
@@ -118,8 +189,8 @@ async def tool_allow_deny(harness: ConformanceHarness) -> None:
 
     harness.script_tool_calls_then_text(
         [
-            ScriptedToolCall(name="allowed_tool", args={"x": 1}, id="call_a"),
-            ScriptedToolCall(name="denied_tool", args={"y": 2}, id="call_b"),
+            ScriptedToolCall(name="allowed_tool", args={"x": "a"}, id="call_a"),
+            ScriptedToolCall(name="denied_tool", args={"x": "b"}, id="call_b"),
         ],
         final_text="done",
     )
@@ -131,10 +202,58 @@ async def tool_allow_deny(harness: ConformanceHarness) -> None:
 
     events = [event async for event in session.stream("go")]
 
+    assert len(allowed_calls) == 1
+    assert denied_calls == []
+
     permission_events = [e for e in events if isinstance(e, PermissionRequested)]
-    assert permission_events == [
-        PermissionRequested(tool_name="denied_tool", tool_input={"y": 2}, verdict="deny")
-    ]
+    assert len(permission_events) == 1
+    assert permission_events[0].tool_name == "denied_tool"
+    assert permission_events[0].verdict == "deny"
+
+    # Resolve `denied_tool`'s own tool_use id from the mirror rather than
+    # assuming the scripted "call_b" (a real model mints its own id; only
+    # the langchain fake harness happens to honor the scripted one) --
+    # backend-agnostic by construction. Matched by suffix, not equality:
+    # `ClaudeBackend` renders the wire tool name MCP-namespaced
+    # (`mcp__tradewind__denied_tool`, its own module docstring) in the
+    # `tool_use` item's `content["name"]` -- unlike `PermissionRequested.
+    # tool_name` above, which that adapter strips back to the bare name
+    # before eventizing it (`_strip_server_prefix`) -- while `langchain`
+    # never prefixes at all, so the caller-declared name is always at least
+    # a suffix of whatever wire name ends up in the mirror.
+    completed = [e.message for e in events if isinstance(e, ItemCompleted)]
+    tool_use_id_by_name = {
+        cast(str, m.content.get("name", "")): m.content.get("id")
+        for m in completed
+        if m.kind == "tool_use"
+    }
+    denied_id = next(
+        tool_id for name, tool_id in tool_use_id_by_name.items() if name.endswith("denied_tool")
+    )
+    tool_results_by_id = {
+        m.content.get("tool_use_id"): m for m in completed if m.kind == "tool_result"
+    }
+    assert denied_id in tool_results_by_id
+    assert tool_results_by_id[denied_id].content.get("is_error") is True
+
+    # Invariant: `tool_use` precedes its own matching `tool_result` in the
+    # event stream.
+    def _event_index(kind: str) -> int:
+        return next(
+            i
+            for i, e in enumerate(events)
+            if isinstance(e, ItemCompleted)
+            and e.message.kind == kind
+            and (
+                e.message.content.get("id")
+                if kind == "tool_use"
+                else e.message.content.get("tool_use_id")
+            )
+            == denied_id
+        )
+
+    assert _event_index("tool_use") < _event_index("tool_result")
+
     assert isinstance(events[-1], TurnCompleted)
     assert events[-1].result.final_text == "done"
 
@@ -167,7 +286,8 @@ async def resume_continues_context(harness: ConformanceHarness) -> None:
     """A turn run after `resume()` sees the prior turn's exchange in its
     rebuilt context -- the store is the conversation (component spec
     "History" decision), so a fresh handle on the same session still
-    continues it."""
+    continues it. History is filtered to non-thinking `text` items before
+    comparing (module docstring)."""
     harness.script_text_response("first reply")
     session_id = str(uuid.uuid4())
     session = await harness.tradewind.create(session_id, SessionOptions())
@@ -178,19 +298,16 @@ async def resume_continues_context(harness: ConformanceHarness) -> None:
     result = await resumed.run("second prompt")
 
     assert result.final_text == "second reply"
-    history = await harness.tradewind.history(session_id)
-    assert [m.content.get("text") for m in history] == [
-        "first prompt",
-        "first reply",
-        "second prompt",
-        "second reply",
-    ]
+    history = _non_thinking(await harness.tradewind.history(session_id))
+    texts = [m.content.get("text") for m in history if m.kind == "text"]
+    assert texts == ["first prompt", "first reply", "second prompt", "second reply"]
 
 
 async def history_flat_and_tree(harness: ConformanceHarness) -> None:
     """`history(include_children=False)` is one session's own log;
     `include_children=True` also includes a spawned child's (ARCHITECTURE
-    §4.2, I-1)."""
+    §4.2, I-1). History is filtered to non-thinking `text` items before
+    comparing (module docstring)."""
     harness.script_text_response("parent reply")
     parent_id = str(uuid.uuid4())
     parent = await harness.tradewind.create(parent_id, SessionOptions())
@@ -199,11 +316,12 @@ async def history_flat_and_tree(harness: ConformanceHarness) -> None:
     harness.script_text_response("child reply")
     child = await parent.spawn("child prompt")
 
-    flat = await harness.tradewind.history(parent_id)
-    assert [m.content.get("text") for m in flat] == ["parent prompt", "parent reply"]
+    flat = _non_thinking(await harness.tradewind.history(parent_id))
+    flat_texts = [m.content.get("text") for m in flat if m.kind == "text"]
+    assert flat_texts == ["parent prompt", "parent reply"]
 
-    tree = await harness.tradewind.history(parent_id, include_children=True)
-    tree_texts = {(m.session_id, m.content.get("text")) for m in tree}
+    tree = _non_thinking(await harness.tradewind.history(parent_id, include_children=True))
+    tree_texts = {(m.session_id, m.content.get("text")) for m in tree if m.kind == "text"}
     assert (parent_id, "parent prompt") in tree_texts
     assert (parent_id, "parent reply") in tree_texts
     assert (child.id, "child prompt") in tree_texts
@@ -231,20 +349,32 @@ async def structured_output(harness: ConformanceHarness) -> None:
     assert result.final_text is not None
 
 
+_ECHO_TOKEN = "ZANZIBAR"
+
+
 async def system_prompt_respected(harness: ConformanceHarness) -> None:
     """`SessionOptions.system_prompt` actually reaches the backend's
-    request (FR-8)."""
+    request (FR-8) -- a behavioral check, not an exact-echo assertion
+    (module docstring): a real model given a full system-prompt override
+    "reply with exactly this text" still won't literally echo it verbatim
+    once wrapped in a preset+append shape (`ClaudeBackend`'s own module
+    docstring), but reliably weaves in a fixed instructed token, which both
+    a scripted fake and a real model satisfy."""
     if not harness.capabilities.supports_system_prompt:
         pytest.skip("backend does not support a system prompt")
     harness.script_echo_system_prompt()
     session_id = str(uuid.uuid4())
     session = await harness.tradewind.create(
-        session_id, SessionOptions(system_prompt="be extremely terse")
+        session_id,
+        SessionOptions(
+            system_prompt=f"Always include the exact token {_ECHO_TOKEN} somewhere in every reply."
+        ),
     )
 
     result = await session.run("hi")
 
-    assert result.final_text == "be extremely terse"
+    assert result.final_text is not None
+    assert _ECHO_TOKEN in result.final_text
 
 
 SCENARIOS = (

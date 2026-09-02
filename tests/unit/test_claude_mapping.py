@@ -92,6 +92,36 @@ def test_assistant_multiple_blocks_preserve_order() -> None:
     assert [item.kind for item in items] == ["thinking", "text", "tool_use"]
 
 
+def test_assistant_items_carry_the_message_uuid_as_native_id() -> None:
+    # Task-11 fix: without this, `store.last_native_id()` never advances
+    # past a live-streamed turn and `ResumePlanner.reconcile()`'s next
+    # `read_native_transcript(after=None)` re-imports that turn's content
+    # from the transcript file as brand-new (task-11 report).  One message
+    # with several blocks -- thinking + tool_use, a common real combination
+    # (task-11 live run) -- must stamp the SAME uuid on every item it
+    # produces (matches `native_transcript_items`'s own per-entry
+    # convention), not just the first.
+    message = _assistant(
+        [
+            ThinkingBlock(thinking="thinking", signature="sig"),
+            ToolUseBlock(id="toolu_3", name="a_tool", input={}),
+        ],
+        uuid="msg-uuid-1",
+    )
+
+    items = assistant_message_items(message)
+
+    assert [item.native_id for item in items] == ["msg-uuid-1", "msg-uuid-1"]
+
+
+def test_assistant_items_native_id_is_none_when_message_uuid_is_none() -> None:
+    message = _assistant([TextBlock(text="hi")])
+
+    items = assistant_message_items(message)
+
+    assert items[0].native_id is None
+
+
 # --- user_message_items ---
 
 
@@ -160,6 +190,18 @@ def test_user_message_text_block_yields_nothing() -> None:
     message = UserMessage(content=[TextBlock(text="[Request interrupted by user]")])
 
     assert user_message_items(message) == []
+
+
+def test_user_tool_result_items_carry_the_message_uuid_as_native_id() -> None:
+    # Same task-11 fix as assistant_message_items -- see its own test.
+    message = UserMessage(
+        content=[ToolResultBlock(tool_use_id="toolu_1", content="ok", is_error=False)],
+        uuid="msg-uuid-2",
+    )
+
+    items = user_message_items(message)
+
+    assert items[0].native_id == "msg-uuid-2"
 
 
 # --- is_aborted_result ---

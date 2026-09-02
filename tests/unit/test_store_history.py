@@ -256,6 +256,39 @@ def test_import_native_items_dedupes_on_native_id_second_call_returns_zero(
     assert second == 0
 
 
+def test_import_native_items_keeps_multiple_items_sharing_one_native_id(tmp_path: Path) -> None:
+    # Task-11 regression: one native transcript entry (e.g. a single
+    # `AssistantMessage`/`SessionMessage` carrying both a thinking block and
+    # a tool_use block) legitimately produces MULTIPLE `NormalizedMessage`
+    # items stamped with the SAME `native_id` (`claude_backend.py`'s
+    # `native_transcript_items`/`assistant_message_items`: "native_id is the
+    # same for every item one transcript line produced"). Deduping against
+    # native_ids inserted earlier in the SAME call (not just those already
+    # in the DB before it started) silently dropped every item after the
+    # first one sharing an id -- confirmed live this task via
+    # `ResumePlanner.reconcile()` against a real Claude session.
+    store = _store(tmp_path)
+    store.create_session(_row("sess-1"))
+    items = [
+        _message(native_id="native-1", kind="thinking", content={"text": "thinking..."}),
+        _message(
+            native_id="native-1", kind="tool_use", content={"id": "t1", "name": "x", "input": {}}
+        ),
+    ]
+
+    inserted = store.import_native_items("sess-1", None, items)
+
+    assert inserted == 2
+    history = store.history("sess-1")
+    assert [m.kind for m in history] == ["thinking", "tool_use"]
+    assert all(m.native_id == "native-1" for m in history)
+
+    # Idempotency across calls is unaffected: re-importing the exact same
+    # batch a second time (both items already in the DB) imports nothing.
+    second = store.import_native_items("sess-1", None, items)
+    assert second == 0
+
+
 def test_import_native_items_none_native_id_always_inserted(tmp_path: Path) -> None:
     store = _store(tmp_path)
     store.create_session(_row("sess-1"))

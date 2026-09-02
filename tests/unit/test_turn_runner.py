@@ -392,6 +392,198 @@ async def test_stream_abandoned_without_stop_closes_backend_and_finalizes_turn(
     assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == ["failed"]
 
 
+# --- (5) reconcile: TurnRunner backfills the mirror before running a
+# native-path turn (task-11 brief) ---
+
+
+class _ReconcilingBackend(Backend):
+    """Reports `supports_transcript_read=True` and always answers
+    `read_native_transcript` with a fixed tail -- enough to prove
+    `TurnRunner.execute` actually calls `ResumePlanner.reconcile` (and thus
+    `store.import_native_items`) before running the turn, not that the
+    reconcile logic itself is correct (that's tests/unit/test_reconcile.py's
+    job)."""
+
+    name: ClassVar[BackendName] = "langchain"
+
+    def __init__(
+        self, profile: Profile, native_config: NativeStoreConfig, items: list[NormalizedMessage]
+    ) -> None:
+        super().__init__(profile, native_config)
+        self._items = items
+
+    def capabilities(self) -> Capabilities:
+        return Capabilities(
+            supports_system_prompt=True,
+            supports_structured_output=False,
+            supports_interactive_permissions=True,
+            supports_in_process_tools=True,
+            supports_native_resume=True,
+            supports_fork=False,
+            supports_transcript_read=True,
+        )
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        yield TurnStarted(turn_id=ctx.turn_id)
+        yield _completed("done")
+
+    async def probe_native(self, session: SessionRow) -> bool:
+        return session.native_session_id is not None
+
+    async def read_native_transcript(
+        self,
+        session: SessionRow,  # noqa: ARG002
+        after_native_id: str | None,  # noqa: ARG002
+    ) -> list[NormalizedMessage]:
+        return self._items
+
+    async def interrupt(self, session_id: str) -> None:
+        pass
+
+
+async def test_execute_reconciles_native_transcript_before_running_the_turn(
+    tmp_path: Path,
+) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    backfilled = NormalizedMessage(
+        role="assistant", kind="text", content={"text": "backfilled"}, native_id="native-9"
+    )
+    tw._backends["default"] = _ReconcilingBackend(profile, NativeStoreConfig(), [backfilled])
+    session = await tw.create(_VALID_ID, SessionOptions())
+    # A session only reconciles once it already has a native_session_id
+    # (execute()'s own guard) -- simulate a prior native turn having set one.
+    await anyio.to_thread.run_sync(
+        tw._store.rehome_native, _VALID_ID, "langchain", "native-session-x"
+    )
+
+    result = await session.run("hi")
+
+    assert result.status == "completed"
+    history = await tw.history(_VALID_ID)
+    native_items = [
+        (m.native_id, m.content.get("text")) for m in history if m.native_id is not None
+    ]
+    assert native_items == [("native-9", "backfilled")]
+    # The backfilled item landed before this turn's own prompt (reconcile
+    # runs before the prompt is appended -- execute()'s own ordering).
+    # `_completed("done")` only sets `TurnResult.final_text`, no
+    # `ItemCompleted` -- nothing else mirrors an assistant reply here.
+    assert [m.content.get("text") for m in history] == ["backfilled", "hi"]
+
+
+async def test_execute_skips_reconcile_when_session_has_no_native_session_id(
+    tmp_path: Path,
+) -> None:
+    # No prior native turn -> no native_session_id on the row yet -> the
+    # `session_row.native_session_id is not None` guard must skip reconcile
+    # entirely (nothing to reconcile against, and calling read_native_
+    # transcript(after=None) here would silently replay the WHOLE fake
+    # transcript into the mirror on turn 1, which is not what this test's
+    # backend is standing in for).
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    would_backfill = NormalizedMessage(
+        role="assistant", kind="text", content={"text": "should not appear"}, native_id="native-1"
+    )
+    tw._backends["default"] = _ReconcilingBackend(profile, NativeStoreConfig(), [would_backfill])
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    await session.run("hi")
+
+    history = await tw.history(_VALID_ID)
+    assert all(m.native_id is None for m in history)
+
+
+# --- (6) native-id rehome: TurnRunner re-homes the session row when a
+# backend's `last_native_session_id` differs from what's stored (task-11
+# brief) ---
+
+
+class _RehomingBackend(Backend):
+    """Sets `last_native_session_id` (an attribute outside the `Backend`
+    ABC -- `ClaudeBackend`'s own literal shape, task-10 brief) partway
+    through the turn, mirroring `ClaudeBackend._drive_client`'s
+    `ResultMessage` handling."""
+
+    name: ClassVar[BackendName] = "claude"
+
+    def __init__(
+        self, profile: Profile, native_config: NativeStoreConfig, new_native_session_id: str
+    ) -> None:
+        super().__init__(profile, native_config)
+        self.last_native_session_id: str | None = None
+        self._new_native_session_id = new_native_session_id
+
+    def capabilities(self) -> Capabilities:
+        return Capabilities(
+            supports_system_prompt=True,
+            supports_structured_output=False,
+            supports_interactive_permissions=True,
+            supports_in_process_tools=True,
+            supports_native_resume=True,
+            supports_fork=True,
+            supports_transcript_read=False,
+        )
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        yield TurnStarted(turn_id=ctx.turn_id)
+        self.last_native_session_id = self._new_native_session_id
+        yield _completed("done")
+
+    async def probe_native(self, session: SessionRow) -> bool:
+        return session.native_session_id is not None
+
+    async def read_native_transcript(
+        self,
+        session: SessionRow,  # noqa: ARG002
+        after_native_id: str | None,  # noqa: ARG002
+    ) -> list[NormalizedMessage]:
+        raise Unsupported("fake backend has no native transcript")
+
+    async def interrupt(self, session_id: str) -> None:
+        pass
+
+
+async def test_execute_rehomes_native_session_id_when_backend_reports_a_new_one(
+    tmp_path: Path,
+) -> None:
+    profile = _profile(backend="claude")
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _RehomingBackend(profile, NativeStoreConfig(), "native-new")
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    result = await session.run("hi")
+
+    assert result.status == "completed"
+    row = await anyio.to_thread.run_sync(tw._store.get_session, _VALID_ID)
+    assert row is not None
+    assert row.native_session_id == "native-new"
+    # The pre-turn (backend, native_session_id) pair -- here ("claude",
+    # None), since this session never had a native id before -- is appended
+    # to native_history, not discarded (SessionStorePort.rehome_native's
+    # own append-only contract).
+    assert row.native_history == [{"backend": "claude", "native_session_id": None}]
+
+
+async def test_execute_does_not_rehome_when_backend_reports_the_same_native_session_id(
+    tmp_path: Path,
+) -> None:
+    profile = _profile(backend="claude")
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _RehomingBackend(profile, NativeStoreConfig(), "native-same")
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await anyio.to_thread.run_sync(tw._store.rehome_native, _VALID_ID, "claude", "native-same")
+
+    await session.run("hi")
+
+    row = await anyio.to_thread.run_sync(tw._store.get_session, _VALID_ID)
+    assert row is not None
+    # Still just the one rehome from setup above -- execute() must not have
+    # appended a second, no-op entry when the backend's id already matched.
+    assert row.native_history == [{"backend": "claude", "native_session_id": None}]
+
+
 def _turn_statuses(store: object, session_id: str) -> list[str]:
     """Reads the `turns` table's `status` column directly for `session_id`
     -- `SessionStorePort` has no read verb for a single turn's terminal

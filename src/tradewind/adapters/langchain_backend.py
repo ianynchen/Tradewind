@@ -65,7 +65,6 @@ from tradewind.domain.events import (
     ItemCompleted,
     PermissionRequested,
     TextDelta,
-    ThinkingDelta,
     TurnCompleted,
     TurnFailed,
     TurnStarted,
@@ -188,13 +187,21 @@ def _rebuild_messages(ctx: TurnContext) -> list[BaseMessage]:
 
 
 def _delta_event(block: ContentBlock) -> Event | None:
+    """Streamed-chunk delta for one content block, or `None` for a block
+    type this adapter doesn't stream a live signal for.
+
+    `"reasoning"` chunks are deliberately unmapped here (task-11 taxonomy
+    freeze, `domain.events` module docstring): nothing in this adapter's
+    request construction enables Anthropic extended thinking today, so this
+    branch never actually sees one -- the completed reasoning block, if a
+    caller enables it themselves via `chat_model_factory`, still lands as a
+    persisted `kind="thinking"` `ItemCompleted` (`_completed_items` below),
+    only its live delta is not separately eventized.
+    """
     block_type = block.get("type")
     if block_type == "text":
         text = cast(str, block.get("text", ""))
         return TextDelta(text=text) if text else None
-    if block_type == "reasoning":
-        text = cast(str, block.get("reasoning", ""))
-        return ThinkingDelta(text=text) if text else None
     return None
 
 

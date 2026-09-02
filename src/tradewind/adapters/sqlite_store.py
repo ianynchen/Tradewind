@@ -483,6 +483,16 @@ class SqliteSessionStore(SessionStorePort):
                 "SELECT native_id FROM messages WHERE session_id = ? AND native_id IS NOT NULL",
                 (session_id,),
             )
+            # Snapshot of native_ids already persisted *before* this call --
+            # deliberately never mutated by the loop below (task-11 fix): a
+            # single native transcript entry legitimately produces several
+            # `items` sharing one `native_id` (`claude_backend.py`'s
+            # `native_transcript_items`/`assistant_message_items` -- e.g. a
+            # thinking block plus a tool_use block from one assistant turn),
+            # and all of them must land, not just the first. Dedup here is
+            # about not re-inserting a *previous call's* rows (idempotency
+            # across repeated `reconcile()` calls), not about uniqueness of
+            # `native_id` within one call.
             existing_native_ids = {
                 cast(str, row[0]) for row in cast("list[tuple[object, ...]]", cur.fetchall())
             }
@@ -518,8 +528,6 @@ class SqliteSessionStore(SessionStorePort):
                         json.dumps(raw) if raw is not None else None,
                     ),
                 )
-                if item.native_id is not None:
-                    existing_native_ids.add(item.native_id)
                 inserted += 1
             self._conn.commit()
             return inserted

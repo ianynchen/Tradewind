@@ -224,12 +224,18 @@ class SessionStorePort(ABC):
         self, session_id: str, turn_id: str | None, items: list[NormalizedMessage]
     ) -> int:
         """Bulk-insert `items` into `session_id`'s message log, deduping on
-        `native_id`.
+        `native_id` against messages already persisted *before* this call
+        (idempotency across repeated calls, e.g. `ResumePlanner.reconcile()`
+        re-running with an unchanged cursor) -- not within `items` itself:
+        several items in one call may legitimately share one `native_id`
+        (one native transcript entry producing several normalized items,
+        e.g. a thinking block plus a tool_use block from one assistant
+        turn) and all of them are inserted, not just the first.
 
-        An item whose `native_id` already exists among `session_id`'s
-        messages is skipped; items with `native_id=None` are always
-        inserted. Inserted items are assigned `seq` after the session's
-        current tail, preserving `items` order.
+        An item whose `native_id` already existed in the store before this
+        call is skipped; items with `native_id=None` are always inserted.
+        Inserted items are assigned `seq` after the session's current tail,
+        preserving `items` order.
 
         Returns:
             The number of items actually inserted.
