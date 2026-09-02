@@ -145,8 +145,8 @@ async def test_run_builds_langchain_backend_via_the_registered_factory(
     profile = _profile()
     model = _ScriptedChatModel(responses=[AIMessage(content="pong")])
 
-    def fake_langchain_factory(p: Profile) -> Backend:
-        return LangchainBackend(p, NativeStoreConfig(), chat_model_factory=lambda _spec: model)
+    def fake_langchain_factory(p: Profile, native_config: NativeStoreConfig) -> Backend:
+        return LangchainBackend(p, native_config, chat_model_factory=lambda _spec: model)
 
     # Patches the module-level registry `tradewind/__init__.py` populates at
     # import time -- exercises `Tradewind._resolve_backend`'s real lookup
@@ -160,6 +160,44 @@ async def test_run_builds_langchain_backend_via_the_registered_factory(
 
     assert result.status == "completed"
     assert result.final_text == "pong"
+
+
+# --- (1c) TradewindConfig.native_stores actually reaches the backend
+# factory (final review wave, item 1 -- previously every factory built its
+# backend with a fresh, empty NativeStoreConfig() regardless of what the
+# caller configured) ---
+
+
+async def test_run_passes_the_configured_native_store_config_to_the_backend_factory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    received_native_configs: list[NativeStoreConfig] = []
+
+    def fake_langchain_factory(p: Profile, native_config: NativeStoreConfig) -> Backend:
+        received_native_configs.append(native_config)
+        return LangchainBackend(
+            p,
+            native_config,
+            chat_model_factory=lambda _spec: _ScriptedChatModel(
+                responses=[AIMessage(content="pong")]
+            ),
+        )
+
+    monkeypatch.setattr(_client, "_backend_factories", {"langchain": fake_langchain_factory})
+
+    native_stores = NativeStoreConfig(isolation_mode=True, codex_home=tmp_path / "codex-home")
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile, native_stores=native_stores))
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    result = await session.run("ping")
+
+    assert result.status == "completed"
+    # Not just equal in value -- the exact object `TradewindConfig.native_stores`
+    # holds, proving `_resolve_backend` reads `self._config.native_stores`
+    # rather than constructing its own.
+    assert received_native_configs == [native_stores]
+    assert received_native_configs[0] is native_stores
 
 
 # --- shared fake Backend for the tap/broker/cleanup tests below ---
@@ -417,6 +455,41 @@ async def test_stream_abandoned_without_stop_closes_backend_and_finalizes_turn(
     # And specifically finalized as `failed` (no `stop()` was ever called,
     # so this wasn't an interrupt) with the "no terminal event" reason.
     assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == ["failed"]
+
+
+async def test_stream_abandoned_after_stop_finalizes_as_interrupted_not_failed(
+    tmp_path: Path,
+) -> None:
+    # Minor #5 fix regression: `execute()`'s own `except BaseException`
+    # clause used to classify EVERY abandonment (including this one, where
+    # `stop()` already marked the interrupt as pending) as `failed` with a
+    # junk empty-`GeneratorExit` message, because it set `terminal_status`
+    # before the `finally` block's own `_interrupt_requested` check ever
+    # ran. `stop()` here can't make `_HangingBackend` end its `run()` on its
+    # own (its `interrupt()` is a no-op, same as the test above) -- the
+    # stream still has to be abandoned to end the turn -- so this
+    # reproduces "pending stop + abandoned stream" specifically, not a
+    # clean interrupt.
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _HangingBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    stream = session.stream("hi")
+    async with aclosing(stream):
+        async for event in stream:
+            assert isinstance(event, TurnStarted)
+            break
+        # `_interrupt_requested` must already carry this session_id BEFORE
+        # `stream.aclose()` runs below (leaving the `async with aclosing`
+        # block) -- that's what the `finally` block's classification reads.
+        await session.stop()
+
+    assert fake.cleaned_up is True
+    # Classified `interrupted`, not `failed` -- the bug this test guards
+    # against would have produced `["failed"]` here.
+    assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == ["interrupted"]
 
 
 # --- (5) reconcile: TurnRunner backfills the mirror before running a

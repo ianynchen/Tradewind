@@ -39,20 +39,20 @@ def _build_default_store(path: Path) -> SessionStorePort:
     return SqliteSessionStore(path)
 
 
-def _build_langchain_backend(profile: Profile) -> Backend:
-    return LangchainBackend(profile, NativeStoreConfig())
+def _build_langchain_backend(profile: Profile, native_config: NativeStoreConfig) -> Backend:
+    return LangchainBackend(profile, native_config)
 
 
-def _build_claude_backend(profile: Profile) -> Backend:
-    return ClaudeBackend(profile, NativeStoreConfig())
+def _build_claude_backend(profile: Profile, native_config: NativeStoreConfig) -> Backend:
+    return ClaudeBackend(profile, native_config)
 
 
-def _build_codex_backend(profile: Profile) -> Backend:
-    return CodexBackend(profile, NativeStoreConfig())
+def _build_codex_backend(profile: Profile, native_config: NativeStoreConfig) -> Backend:
+    return CodexBackend(profile, native_config)
 
 
-def _build_cursor_backend(profile: Profile) -> Backend:
-    return CursorBackend(profile, NativeStoreConfig())
+def _build_cursor_backend(profile: Profile, native_config: NativeStoreConfig) -> Backend:
+    return CursorBackend(profile, native_config)
 
 
 _client._set_default_store_factory(_build_default_store)

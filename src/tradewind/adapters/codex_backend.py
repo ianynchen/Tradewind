@@ -97,13 +97,24 @@ live in the spike). `sandbox` defaults to `workspace-write` -- deliberately
 force every write through an approval prompt for its own verification
 purposes), since the brief calls for "a mode that permits tool use with
 approvals": `workspace-write` lets ordinary in-workspace operations proceed
-while destructive/out-of-workspace ones still escalate. Both
-`sandbox`/`approval_policy` are overridable per profile via
+while destructive/out-of-workspace ones still escalate. **Except when no
+broker is actually configured anywhere** (`SessionOptions.permission_broker`
+and `TradewindConfig.permission_broker` both unset -- `turn_runner.py` then
+hands every backend `_AllowAllBroker`, which permits every call with no
+human/policy backstop at all): final review wave ruling ("disclose AND safe
+default") -- `workspace-write` with nothing gating tool calls would grant
+Codex unrestricted filesystem writes by default, so `_run_turn` detects that
+exact case (`ctx.broker`'s duck-typed `is_default_allow_all` marker, see
+`turn_runner._AllowAllBroker`) and defaults `sandbox` to `read-only`
+instead. Both `sandbox`/`approval_policy` are overridable per profile via
 `Profile.backend_options["sandbox"]`/`["approval_policy"]` (raw
 `SandboxMode`/`AskForApprovalValue` wire-value strings -- e.g. `"read-only"`,
 `"never"`), since bypassing the `Sandbox`/`ApprovalMode` convenience enums
 (spike §2) means this adapter talks the SDK's raw wire vocabulary directly
-rather than inventing a second one.
+rather than inventing a second one -- an explicit `backend_options["sandbox"]`
+always wins over either default, broker configured or not. See README.md's
+"Security defaults" section for the caller-facing summary and
+`docs/RUNBOOK.md` for more detail.
 
 **Event mapping** (`thread_item_to_messages`, pure functions, tested in
 `tests/unit/test_codex_mapping.py` against hand-built SDK dataclasses):
@@ -239,6 +250,13 @@ _TOOL_NAME_FROM_MESSAGE_RE = re.compile(r'run tool "(.*)"\?$')
 _DEFAULT_SANDBOX = SandboxMode.workspace_write
 _DEFAULT_APPROVAL_POLICY_VALUE = AskForApprovalValue.on_request
 
+# Safe default (module docstring's "Approval/sandbox defaults" section, item
+# 3a): used instead of `_DEFAULT_SANDBOX` only when the effective broker is
+# `turn_runner._AllowAllBroker` (no broker configured anywhere) -- with
+# nothing gating tool calls at all, `workspace-write` would mean
+# unrestricted filesystem writes by default.
+_SAFE_DEFAULT_SANDBOX_NO_BROKER = SandboxMode.read_only
+
 # Sentinel `_consume` recognizes to mean "`_drive_turn` has nothing more to
 # put on the queue" -- distinct from any `Notification`/`Event`/exception
 # that could legitimately be queued, so `is` identity is unambiguous.
@@ -319,16 +337,19 @@ def _denied_shim_permission_event(item: ThreadItem) -> PermissionRequested | Non
     which layer made it, so this recognizes tradewind's own denied-tool
     sentinel (`_DENIED_TOOL_RESULT_CONTENT`) on a tool_call item and
     synthesizes the event from it, rather than leaving deny-via-`ToolHost`
-    silently unobserved. Only ever matches items from tradewind's own shim
-    (the only external MCP server this adapter ever registers -- module
-    docstring), so there is no real risk of some unrelated third-party
-    tool's genuinely-different failure coincidentally producing this exact
-    string and misfiring.
+    silently unobserved. Explicitly scoped to `root.server ==
+    _SHIM_SERVER_NAME` (mirroring `_decide_mcp_elicitation`'s own
+    `server_name == _SHIM_SERVER_NAME` check) -- item-6a fix: without that
+    guard, any OTHER MCP server's failed call whose result text happens to
+    equal `_DENIED_TOOL_RESULT_CONTENT` (a plain, unnamespaced string, not
+    something only `ToolHost` could produce) would misfire this synthesis
+    for a tool tradewind's own broker was never even consulted about.
     """
     root = item.root
     if isinstance(root, McpToolCallThreadItem):
         if (
-            root.status != McpToolCallStatus.completed
+            root.server == _SHIM_SERVER_NAME
+            and root.status != McpToolCallStatus.completed
             and _mcp_result_text(root) == _DENIED_TOOL_RESULT_CONTENT
         ):
             arguments = root.arguments if isinstance(root.arguments, dict) else {}
@@ -702,8 +723,15 @@ def _codex_env(native_config: NativeStoreConfig) -> dict[str, str] | None:
     return {"CODEX_HOME": str(native_config.codex_home)}
 
 
-def _sandbox_mode_from_options(backend_options: dict[str, Any]) -> SandboxMode:
-    value = backend_options.get("sandbox", _DEFAULT_SANDBOX.value)
+def _sandbox_mode_from_options(
+    backend_options: dict[str, Any], *, allow_all_broker: bool
+) -> SandboxMode:
+    """`backend_options["sandbox"]` always wins when set. Otherwise: safe
+    default (module docstring, item 3a) -- `read-only` when `allow_all_broker`
+    is True (no broker configured anywhere, nothing else would gate tool
+    calls), else the existing `workspace-write` default."""
+    default = _SAFE_DEFAULT_SANDBOX_NO_BROKER if allow_all_broker else _DEFAULT_SANDBOX
+    value = backend_options.get("sandbox", default.value)
     return SandboxMode(value)
 
 
@@ -927,7 +955,12 @@ class CodexBackend(Backend):
             )
             client = CodexClient(config=config, approval_handler=approval_handler)
             backend_options = self.profile.backend_options
-            sandbox = _sandbox_mode_from_options(backend_options)
+            # Duck-typed marker check (module docstring, item 3a) -- see
+            # `turn_runner._AllowAllBroker.is_default_allow_all`'s own
+            # comment for why this is `getattr`, not an `isinstance` check
+            # against a class this adapter never imports.
+            allow_all_broker = cast(bool, getattr(ctx.broker, "is_default_allow_all", False))
+            sandbox = _sandbox_mode_from_options(backend_options, allow_all_broker=allow_all_broker)
             approval_policy_value = _approval_policy_value_from_options(backend_options)
             effort = _reasoning_effort(ctx.model_spec.effort)
 
@@ -959,8 +992,11 @@ class CodexBackend(Backend):
                 daemon=True,
             )
             worker.start()
+            terminal_event_observed = False
             try:
                 async for event in self._consume(ctx.turn_id, out_queue):
+                    if isinstance(event, (TurnCompleted, TurnFailed)):
+                        terminal_event_observed = True
                     yield event
             finally:
                 # Identity-checked pop, same reasoning as `ClaudeBackend.
@@ -970,6 +1006,29 @@ class CodexBackend(Backend):
                 # with its own handle.
                 if handle_ref and self._turn_handles.get(session_id) is handle_ref[0]:
                     self._turn_handles.pop(session_id, None)
+                if not terminal_event_observed and handle_ref:
+                    # Item-4 fix: reached when the caller abandoned
+                    # `session.stream()` before this turn ever reached
+                    # `TurnCompleted`/`TurnFailed` (`aclosing` propagates
+                    # `GeneratorExit` into the `async for` above from an
+                    # early `break`/`aclose()`) -- `_drive_turn`'s worker
+                    # thread is then still blocked inside `TurnHandle.
+                    # stream()` waiting on a notification that will never
+                    # come, so `worker.join()` below would hang the process
+                    # indefinitely without first asking Codex to actually
+                    # stop the turn. Guarded try/except, same reasoning as
+                    # `interrupt()`'s own comment above: a race with the
+                    # turn finishing on its own between the
+                    # `terminal_event_observed` check and this call is
+                    # exactly the kind of "nothing to interrupt anymore"
+                    # case that must stay a no-op, not escape a `finally`.
+                    try:
+                        await anyio.to_thread.run_sync(handle_ref[0].interrupt)
+                    except Exception:
+                        _logger.exception(
+                            "best-effort interrupt on an abandoned turn failed",
+                            extra={"session_id": session_id},
+                        )
                 await anyio.to_thread.run_sync(worker.join)
         except Exception as exc:
             # Only reachable for a failure *before* `_consume` starts

@@ -287,7 +287,10 @@ to `can_use_tool`; on langchain Tradewind's own loop executes tools directly.
 2. Probe failure (reaped file, moved machine, archived thread) → REPLAY: on
    `langchain`, reconstruct the exact messages array (lossless); on SDK backends,
    inject a rendered/summarized transcript into a fresh native session and record
-   the new native id.
+   the new native id. **Not yet wired** (§7 P-7): no caller invokes
+   `ResumePlanner.plan()`/`probe_native()` today, so this degrade path is
+   unreachable in practice — a reaped native store currently surfaces as
+   `TurnFailed` instead.
 3. Caller may force `REPLAY` or `FRESH` (e.g. cross-backend continuation under a
    different profile).
 
@@ -359,6 +362,16 @@ already mirrored stays.
   capability. Needs a follow-up spike on stable cross-representation item ids (or an
   architecture change to how `import_native_items`/`reconcile` dedupe) before Codex's
   FR-6.4 backfill can be relied on. See `docs/RUNBOOK.md` for the confirmed evidence.
+- **P-7** NATIVE→REPLAY degrade unimplemented (§5.2, found in the final review wave):
+  `ResumePlanner.plan()`/`probe_native()` are both implemented but have no callers —
+  `TurnRunner.execute` never invokes either, and every SDK-backed adapter resumes
+  unconditionally by native id whenever `session.native_session_id` is set. A reaped
+  native store (deleted Claude session file, expired Codex thread, archived Cursor
+  agent, …) therefore surfaces to the caller today as a plain `TurnFailed` from the
+  provider's own resume error, instead of degrading to a REPLAY turn (rendering a
+  summarized mirror transcript into a fresh native session, per §5.2 point 2). Wiring
+  the degrade — calling `probe_native()` ahead of the native-path branch and routing a
+  `False` result into the REPLAY injection path — is phase-2 work, not implemented here.
 
 ## 8. References
 

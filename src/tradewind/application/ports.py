@@ -128,8 +128,13 @@ class SessionStorePort(ABC):
         assigned `seq`.
 
         `seq` is `1 + max(seq)` over the *session's* messages (not the
-        turn's), assigned inside the write transaction so concurrent
-        appends never collide.
+        turn's); an implementation must serialize concurrent callers against
+        this read-then-write so two appends never collide on the same
+        `seq` (`SqliteSessionStore` does this with its own single
+        in-process `threading.Lock` around its one shared connection, not a
+        database transaction). This contract assumes a single process owns
+        write access to a given store -- a second OS process writing to the
+        same store concurrently is not coordinated against.
 
         Failure modes:
             ValueError: `turn_id` names a turn that exists but belongs to a

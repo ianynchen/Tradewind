@@ -23,7 +23,7 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from contextlib import aclosing
 from pathlib import Path
-from typing import cast
+from typing import ClassVar, cast
 
 import anyio
 
@@ -58,6 +58,21 @@ class _AllowAllBroker:
     `TradewindConfig.permission_broker`'s field comment. Test-locked by
     `tests/unit/test_turn_runner.py::test_tool_executes_when_no_broker_is_configured_anywhere`.
     """
+
+    # Duck-typed marker (final review wave, item 3a): lets a backend that
+    # needs to know whether the *effective* broker is exactly this no-op
+    # fallback -- as opposed to any caller-supplied `PermissionBroker`, of
+    # whatever concrete type -- tell the two apart via `getattr(ctx.broker,
+    # "is_default_allow_all", False)` rather than an `isinstance` check.
+    # `CodexBackend` is the first consumer (a safer `sandbox` default when
+    # nothing gates tool calls at all -- see its own module docstring's
+    # "Approval/sandbox defaults" section). Duck-typing, not an
+    # `isinstance` check against this class, deliberately keeps `adapters`
+    # from having to import `application.turn_runner` itself (it may only
+    # import `application.config`/`.ports`/`.tool_host` -- GUIDELINES §8) --
+    # the same reasoning `TurnRunner.execute`'s own `getattr(backend,
+    # "take_native_session_id", None)` uses in the opposite direction.
+    is_default_allow_all: ClassVar[bool] = True
 
     async def decide(self, _tool_name: str, _tool_input: dict[str, object]) -> Verdict:
         return "allow"
@@ -482,7 +497,22 @@ class TurnRunner:
                         new_native_session_id,
                     )
         except BaseException as exc:
-            if terminal_status is None:
+            # `GeneratorExit` (the caller abandoning `session.stream()` --
+            # `break`/early `aclose()` -- rather than draining it to a
+            # terminal event) is deliberately excluded from setting
+            # `terminal_status` here: its `str()` is always empty, so
+            # classifying it as `failed` right here would both produce a
+            # junk "turn runner: unhandled exception: " message AND
+            # pre-empt the `finally` block's own interrupted-vs-failed
+            # check below -- even when `request_stop()` already marked this
+            # session's interrupt as pending, an abandonment-with-pending-
+            # stop would then wrongly finalize as `failed` instead of
+            # `interrupted` (fix round N, minor #5). Leaving
+            # `terminal_status` unset here lets the `finally` block's own
+            # `_interrupt_requested` check classify it correctly either way;
+            # a genuine exception (anything else) still finalizes as
+            # `failed` with its own message immediately, unchanged.
+            if terminal_status is None and not isinstance(exc, GeneratorExit):
                 terminal_status = "failed"
                 error = f"turn runner: unhandled exception: {exc}"
             raise

@@ -91,6 +91,32 @@ Notes:
   `supports_system_prompt` is emulated one layer up (never inside the adapter, per R-1): the
   Turn Runner writes `.cursor/rules/tradewind-session.mdc` under the session's `cwd`, falling
   back to folding the instructions into the first prompt.
+- **NATIVE→REPLAY degrade is not implemented** (`docs/ARCHITECTURE.md` §5.2/§7 P-7): a reaped
+  or expired native session on `claude`/`codex`/`cursor` surfaces to the caller as a plain
+  `TurnFailed` today rather than degrading to a REPLAY turn.
+
+## Security defaults
+
+What "no configuration" actually means, so a caller never gets more access than they intended:
+
+- **No broker configured anywhere** — neither `SessionOptions.permission_broker` nor
+  `TradewindConfig.permission_broker` set — means every caller-registered tool call is
+  *allowed*, not silently inert (`turn_runner.py`'s `_AllowAllBroker` fallback). Configure a
+  broker if you want tool calls gated at all.
+- **Built-in provider tools, per backend**: `claude` disables the Claude Code CLI's own
+  built-in dev tools entirely (`ClaudeAgentOptions.tools=[]`) — only tools Tradewind itself
+  registers are ever reachable. `codex` leaves Codex's own built-in shell/`apply_patch` tools
+  enabled but broker-gated; when no broker is configured anywhere (see above), `codex` also
+  defaults its `sandbox` to `read-only` instead of `workspace-write`, so an unconfigured caller
+  never gets unrestricted filesystem writes with nothing gating them. Either default is
+  overridden by an explicit `Profile.backend_options["sandbox"]`, broker configured or not.
+- **The toolproxy unix socket** (`codex`'s out-of-process tool-call bridge) has no
+  authentication of its own — filesystem permissions (a `0o700` socket directory) and the
+  same-machine, same-OS-user assumption are the only boundary.
+
+See [docs/RUNBOOK.md](docs/RUNBOOK.md#socket-security-posture-toolproxy-shim-task-12) and
+[docs/RUNBOOK.md](docs/RUNBOOK.md#codex-sandbox-default-when-no-broker-is-configured-final-fix-wave)
+for the full detail behind each of these.
 
 ## Integration-test environment variables
 

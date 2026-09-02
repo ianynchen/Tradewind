@@ -12,9 +12,9 @@ assigned exactly once, at import time, by the top-level `tradewind`
 package (outside the layers contract):
 
 - `_set_default_store_factory`: builds `SqliteSessionStore`.
-- `_set_backend_factories`: maps `BackendName -> Callable[[Profile],
-  Backend]`; only `"langchain"` is registered as of task-9, the others
-  arrive with their own adapter tasks.
+- `_set_backend_factories`: maps `BackendName -> Callable[[Profile,
+  NativeStoreConfig], Backend]`; only `"langchain"` is registered as of
+  task-9, the others arrive with their own adapter tasks.
 
 Neither is per-instance state: every `Tradewind` in a process shares them.
 `Tradewind.__init__` stays a single-argument constructor exactly as
@@ -36,7 +36,7 @@ from typing import cast
 
 import anyio
 
-from tradewind.application.config import TradewindConfig
+from tradewind.application.config import NativeStoreConfig, TradewindConfig
 from tradewind.application.ports import Backend, SessionStorePort
 from tradewind.application.turn_runner import TurnRunner
 from tradewind.domain.errors import (
@@ -57,7 +57,7 @@ from tradewind.domain.models import (
 )
 
 StoreFactory = Callable[[Path], SessionStorePort]
-BackendFactory = Callable[[Profile], Backend]
+BackendFactory = Callable[[Profile, NativeStoreConfig], Backend]
 
 _default_store_factory: StoreFactory | None = None
 _backend_factories: dict[BackendName, BackendFactory] = {}
@@ -197,7 +197,7 @@ class Tradewind:
                 f"no backend factory registered for backend {profile.backend!r}; "
                 "`import tradewind` before constructing Tradewind"
             )
-        backend = factory(profile)
+        backend = factory(profile, self._config.native_stores)
         self._backends[profile_name] = backend
         return backend
 

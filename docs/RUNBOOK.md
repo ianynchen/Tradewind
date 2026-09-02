@@ -137,6 +137,21 @@ permissions and the same-user assumption:
 - Socket filenames are kept short (`{uuid4().hex[:8]}.sock`) to stay under the ~104-byte
   `sockaddr_un.sun_path` cap on macOS when `socket_dir` is deeply nested.
 
+### Codex sandbox default when no broker is configured (final fix wave)
+
+`CodexBackend` used to default `sandbox` to `workspace-write` unconditionally (module
+docstring's "Approval/sandbox defaults" section) — fine when a `PermissionBroker` actually
+gates tool calls, but with no broker configured anywhere (`SessionOptions.permission_broker`
+and `TradewindConfig.permission_broker` both unset, the common case — `turn_runner.py`'s
+`_AllowAllBroker` fallback then permits every call), `workspace-write` meant unrestricted
+filesystem writes with no human-in-the-loop backstop at all. Controller ruling ("disclose AND
+safe default"): `CodexBackend._run_turn` now detects that exact case — a duck-typed
+`is_default_allow_all` marker on `_AllowAllBroker`, checked via `getattr(ctx.broker, ...)` so
+the adapter never has to import `application.turn_runner` itself — and defaults `sandbox` to
+`read-only` instead. An explicit `Profile.backend_options["sandbox"]` still always wins,
+whichever broker is or isn't configured. See README.md's "Security defaults" section for the
+caller-facing summary.
+
 ### Env gates for integration/live runs
 
 | Variable | Gates | Notes |

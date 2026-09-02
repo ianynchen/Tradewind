@@ -390,6 +390,27 @@ def test_failed_mcp_tool_call_with_a_different_error_produces_no_permission_even
     assert _denied_shim_permission_event(item) is None
 
 
+def test_denied_mcp_tool_call_from_a_non_shim_server_produces_no_permission_event() -> None:
+    # Item-6a fix: `_DENIED_TOOL_RESULT_CONTENT` is a plain, unnamespaced
+    # sentinel -- some OTHER MCP server's own genuine failure could
+    # coincidentally produce the exact same text. Only tradewind's own shim
+    # server (`ToolHost.call()`'s broker gate) ever means an actual deny
+    # here, so a different `server` must not synthesize the event.
+    item = _item(
+        McpToolCallThreadItem(
+            id="call-7",
+            server="some-other-mcp-server",
+            tool="denied_tool",
+            arguments={"x": "b"},
+            status=McpToolCallStatus.failed,
+            result=McpToolCallResult(content=[{"type": "text", "text": "permission denied"}]),
+            type="mcpToolCall",
+        )
+    )
+
+    assert _denied_shim_permission_event(item) is None
+
+
 def test_non_tool_call_item_produces_no_permission_event() -> None:
     item = _item(AgentMessageThreadItem(id="item-9", text="hi", type="agentMessage"))
 

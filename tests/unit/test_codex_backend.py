@@ -12,20 +12,26 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
+from contextlib import aclosing
 from pathlib import Path
 from typing import Any
 
 import pytest
+from openai_codex.generated.v2_all import SandboxMode
 
+import tradewind.adapters.codex_backend as codex_backend
 from tradewind.adapters.codex_backend import (
     CodexBackend,
     _codex_env,
+    _sandbox_mode_from_options,
     make_approval_handler,
 )
 from tradewind.application.config import NativeStoreConfig
+from tradewind.application.ports import TurnContext
+from tradewind.application.tool_host import ToolHost
 from tradewind.domain.errors import ConfigError
-from tradewind.domain.events import PermissionRequested
-from tradewind.domain.models import ModelSpec, Profile, SubscriptionAuth, Verdict
+from tradewind.domain.events import PermissionRequested, TurnStarted
+from tradewind.domain.models import ModelSpec, Profile, SessionRow, SubscriptionAuth, Verdict
 
 
 def _profile() -> Profile:
@@ -389,3 +395,109 @@ def test_codex_env_sets_codex_home_when_isolation_mode_is_on() -> None:
 def test_codex_env_raises_when_isolation_mode_is_on_without_a_codex_home() -> None:
     with pytest.raises(ConfigError, match="codex_home"):
         _codex_env(NativeStoreConfig(isolation_mode=True, codex_home=None))
+
+
+# --- item-4 fix: abandoning `run()` before a terminal event must interrupt
+# the still-in-flight worker, not hang `worker.join()` forever ------------
+
+
+def _make_turn_context(*, broker: Any, tools: ToolHost) -> TurnContext:
+    return TurnContext(
+        session=SessionRow(
+            session_id="s1", backend="codex", profile="default", options_snapshot={}
+        ),
+        turn_id="turn-1",
+        prompt="hi",
+        model_spec=ModelSpec(model="gpt-5.4-mini"),
+        system_prompt=None,
+        output_schema=None,
+        tools=tools,
+        broker=broker,
+        load_history=lambda: [],
+    )
+
+
+async def test_run_interrupts_the_handle_when_abandoned_before_a_terminal_event(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`fake_drive_turn` stands in for `_drive_turn`'s real worker thread: it
+    registers a fake `TurnHandle` and then BLOCKS -- exactly like a real,
+    still in-flight `TurnHandle.stream()` would -- until `interrupt()` is
+    actually called on that handle. Abandoning `backend.run(ctx)` (via
+    `aclosing`, same pattern as `TurnRunner.execute`'s own abandonment
+    handling) after the first worker-produced event must therefore call
+    `handle.interrupt()` from `_run_turn`'s `finally` for this test to ever
+    complete -- before the item-4 fix, `worker.join()` would wait on this
+    thread forever and the test would hang until its own timeout instead.
+    """
+    interrupt_calls: list[bool] = []
+    released = threading.Event()
+
+    class _FakeTurnHandle:
+        def interrupt(self) -> None:
+            interrupt_calls.append(True)
+            released.set()
+
+    def fake_drive_turn(
+        client: Any,  # noqa: ARG001 -- matches _drive_turn's real signature
+        session: Any,  # noqa: ARG001 -- matches _drive_turn's real signature
+        prompt: Any,  # noqa: ARG001 -- matches _drive_turn's real signature
+        model: Any,  # noqa: ARG001 -- matches _drive_turn's real signature
+        effort: Any,  # noqa: ARG001 -- matches _drive_turn's real signature
+        output_schema: Any,  # noqa: ARG001 -- matches _drive_turn's real signature
+        system_prompt: Any,  # noqa: ARG001 -- matches _drive_turn's real signature
+        sandbox: Any,  # noqa: ARG001 -- matches _drive_turn's real signature
+        approval_policy_value: Any,  # noqa: ARG001 -- matches _drive_turn's real signature
+        out_queue: queue.Queue[object],
+        record_native_id: Any,
+        record_handle: Any,
+    ) -> None:
+        record_native_id("thread-1")
+        record_handle(_FakeTurnHandle())
+        out_queue.put(PermissionRequested(tool_name="probe", tool_input={}, verdict="allow"))
+        assert released.wait(timeout=5), "handle.interrupt() was never called -- would hang"
+        out_queue.put(codex_backend._DONE)
+
+    monkeypatch.setattr(codex_backend, "_drive_turn", fake_drive_turn)
+
+    backend = CodexBackend(_profile(), NativeStoreConfig())
+    tool_host = ToolHost([], [], lambda ref: ref)
+    ctx = _make_turn_context(broker=_ScriptedBroker("allow"), tools=tool_host)
+
+    events: list[object] = []
+    try:
+        stream = backend.run(ctx)
+        async with aclosing(stream):
+            async for event in stream:
+                events.append(event)
+                if isinstance(event, PermissionRequested):
+                    break  # abandon the stream right after the worker's first event
+    finally:
+        await tool_host.stop_socket()
+
+    assert isinstance(events[0], TurnStarted)
+    assert interrupt_calls == [True]
+
+
+# --- _sandbox_mode_from_options: safe default when no broker is configured
+# (final review wave, item 3a) ------------------------------------------
+
+
+def test_sandbox_defaults_to_read_only_when_no_broker_is_configured_anywhere() -> None:
+    assert _sandbox_mode_from_options({}, allow_all_broker=True) == SandboxMode.read_only
+
+
+def test_sandbox_keeps_workspace_write_default_when_a_broker_is_configured() -> None:
+    assert _sandbox_mode_from_options({}, allow_all_broker=False) == SandboxMode.workspace_write
+
+
+def test_sandbox_explicit_backend_option_wins_regardless_of_broker() -> None:
+    explicit = {"sandbox": "danger-full-access"}
+    assert (
+        _sandbox_mode_from_options(explicit, allow_all_broker=True)
+        == SandboxMode.danger_full_access
+    )
+    assert (
+        _sandbox_mode_from_options(explicit, allow_all_broker=False)
+        == SandboxMode.danger_full_access
+    )
