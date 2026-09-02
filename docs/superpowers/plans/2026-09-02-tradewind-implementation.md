@@ -20,7 +20,7 @@
 - Flags describe NATIVE capability only; emulation lives in application layer (§3.1 R-1).
 - Secrets never written to the store (I-2): MCP secret fields redacted to config references.
 - Tests that need real provider credentials carry `@pytest.mark.integration` and skip cleanly when credentials are absent.
-- **Available test credentials (2026-09-02):** Claude Agent SDK (subscription on this machine) and Codex SDK (subscription) — full integration testing. **No Anthropic API key** — langchain live tests must use a free local model (Ollama) injected as the chat model; the Anthropic-live test stays written but skipped until a key exists. **No Cursor subscription** — Cursor integration and the P-5 spike are BLOCKED; only credential-free unit tests run for Task 15.
+- **Available test credentials (2026-09-02):** Claude Agent SDK (subscription on this machine) and Codex SDK (subscription) — full integration testing. **No Anthropic API key** — langchain live tests use a free hosted model injected as the chat model: primary = Groq free tier (`langchain-groq` `ChatGroq`, `llama-3.3-70b-versatile`, tool calling, ~1000 req/day, no card; key in `GROQ_API_KEY` read by the TEST, never by the library); offline alternative = Ollama locally. The Anthropic-live test stays written but skipped until a key exists. **No Cursor subscription** — Cursor integration and the P-5 spike are BLOCKED; only credential-free unit tests run for Task 15.
 
 ## File Structure (locked)
 
@@ -337,7 +337,7 @@ class Backend(ABC):
 - Adapter behavior per `docs/components/03-langchain-adapter.md`: rebuild messages from `load_history()` (thinking kinds OMITTED; `tool_use`/`tool_result` → real content blocks), `system` param each request, loop with broker gate (`deny` → synthesized error tool_result + `PermissionRequested` event), max 25 iterations guard, interrupt via `anyio.CancelScope` registered per session id, capabilities exactly the table in the spec (`supports_fork=False`).
 
 - [ ] **Step 1: Failing unit tests with a scripted fake chat model** — (a) two-tool turn: model emits tool_calls A,B; broker allows A denies B; assert A executed, B got error tool_result, events contain `PermissionRequested(verdict="deny")`, final `TurnCompleted`; (b) rebuild: seed mirror with text+thinking+tool pair, assert request messages exclude thinking and include reconstructed tool blocks; (c) interrupt mid-loop → iterator ends, no exception escapes, last event `TurnFailed` NOT emitted (status handled by runner).
-- [ ] **Step 2–5: FAIL → implement → PASS.** The adapter constructs `ChatAnthropic` by default but accepts any injected `BaseChatModel` (this is also how the fake-model unit tests work). Integration tests, two variants: (a) `test_langchain_live.py` against the real Anthropic API — written now, skipped while no API key exists; (b) `test_langchain_ollama.py` — inject `ChatOllama` with a local tool-calling model (`ollama pull qwen3` on the mini; skip if the ollama daemon is unreachable) and run one real tool-loop turn free of charge. Add dev-only dep `langchain-ollama` (pinned). check.sh; commit `feat(adapter): langchain backend with broker-gated tool loop`
+- [ ] **Step 2–5: FAIL → implement → PASS.** The adapter constructs `ChatAnthropic` by default but accepts any injected `BaseChatModel` (this is also how the fake-model unit tests work). Integration tests, two variants: (a) `test_langchain_live.py` against the real Anthropic API — written now, skipped while no API key exists; (b) `test_langchain_free.py` — inject `ChatGroq(model="llama-3.3-70b-versatile")` (skip when `GROQ_API_KEY` unset) and run one real tool-loop turn free of charge; keep an `ChatOllama` fixture variant as the offline fallback (skip when daemon unreachable). Add dev-only deps `langchain-groq` and `langchain-ollama` (pinned). check.sh; commit `feat(adapter): langchain backend with broker-gated tool loop`
 
 ### Task 9: Turn runner + wiring + conformance baseline
 
@@ -451,7 +451,7 @@ class Backend(ABC):
 - Create: `README.md`, `docs/RUNBOOK.md`
 - Modify: `docs/ARCHITECTURE.md` (pending list), `docs/REQUIREMENTS.md` (OQ status)
 
-- [ ] **Step 1:** Full `scripts/check.sh` + conformance matrix across the three testable adapters on the mini — claude (subscription), codex (subscription), langchain (Ollama free model) — with cursor rows recorded as `BLOCKED: no subscription`; paste the matrix result table into RUNBOOK, including the blocked rows so the gap is visible.
+- [ ] **Step 1:** Full `scripts/check.sh` + conformance matrix across the three testable adapters on the mini — claude (subscription), codex (subscription), langchain (Groq free tier) — with cursor rows recorded as `BLOCKED: no subscription`; paste the matrix result table into RUNBOOK, including the blocked rows so the gap is visible.
 - [ ] **Step 2:** README: install, 20-line embedding example (config → ensure → run → history), capability matrix table.
 - [ ] **Step 3:** Update pending/OQ statuses; commit `docs: close out phase; conformance evidence`.
 
