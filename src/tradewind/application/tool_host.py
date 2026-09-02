@@ -256,11 +256,34 @@ class ToolHost:
             # works fine once `_serve_socket_forever` is spawned through a
             # real `TaskGroup.start_soon`, which `_socket_keeper_run` does.)
             keeper = asyncio.ensure_future(self._socket_keeper_run(listener, ready, stop))
-            await ready.wait()
+            # Assigned *before* awaiting readiness (fix round 2, Important):
+            # if the task awaiting `serve_socket()` is cancelled while
+            # suspended at `ready.wait()` below, `stop_socket()` must still
+            # be able to reach this listener/keeper to tear it down --
+            # otherwise the cancellation leaks a live, listening socket
+            # nothing can ever reach again (the local `listener`/`keeper`
+            # variables would simply die with the cancelled call).
             self._socket_listener = listener
             self._socket_keeper = keeper
             self._socket_stop = stop
             self._socket_path = socket_path
+            try:
+                await ready.wait()
+            except BaseException:
+                # Cancelled (or some other failure) mid-wait: tear the
+                # now-orphaned server back down before propagating,
+                # shielded so this cleanup can't itself be cut short by the
+                # same (or a further) cancellation.
+                with anyio.CancelScope(shield=True):
+                    stop.set()
+                    await listener.aclose()
+                    await keeper
+                socket_path.unlink(missing_ok=True)
+                self._socket_listener = None
+                self._socket_keeper = None
+                self._socket_stop = None
+                self._socket_path = None
+                raise
             return socket_path
 
     async def _socket_keeper_run(
@@ -282,16 +305,39 @@ class ToolHost:
 
     async def stop_socket(self) -> None:
         """Stop the socket server started by `serve_socket` and remove the
-        socket file. A no-op if no socket server is running. Safe to call
-        from a different task than the one that called `serve_socket()`
-        (see the comment in `serve_socket` on why the keeper task is a
-        plain `asyncio.Task` running its own self-contained `TaskGroup`)."""
+        socket file. A no-op if no socket server is running.
+
+        Safe to call from any task *except* the keeper's own subtree (see
+        the comment in `serve_socket` on why the keeper task is a plain
+        `asyncio.Task` running its own self-contained `TaskGroup` -- that is
+        what makes calling this from an *unrelated* task safe in the first
+        place). The keeper task itself is guarded below (raises
+        `RuntimeError`): waiting for `keeper` from inside `keeper` itself
+        would deadlock forever. A tool handler invoked *through* this
+        socket is a narrower, unguarded instance of the same problem --
+        `_handle_socket_connection`, and thus any tool call it dispatches
+        via `call()`, runs as a descendant of the keeper's inner
+        `TaskGroup` (spawned via `_socket_keeper_run`'s `tg.start_soon`),
+        so calling `stop_socket()` from such a handler deadlocks the same
+        way, just not detectably from here (fix round 2, ruling: documented
+        restriction, not fully enforced -- accepted risk). Tool handlers
+        served by this socket must never call `stop_socket()`.
+        """
         listener = self._socket_listener
         keeper = self._socket_keeper
         stop = self._socket_stop
         socket_path = self._socket_path
         if listener is None or keeper is None or stop is None or socket_path is None:
             return
+        if asyncio.current_task() is keeper:
+            raise RuntimeError(
+                "ToolHost.stop_socket() must not be called from the socket server's own "
+                "keeper task -- awaiting it here would deadlock waiting for this same "
+                "task to finish. (Narrow guard: a tool handler invoked *through* this "
+                "socket runs as a descendant of the keeper task, not the keeper task "
+                "itself, and hits the same deadlock undetected -- never call "
+                "stop_socket() from a tool handler served by this socket.)"
+            )
         stop.set()
         await listener.aclose()
         await keeper  # waits for the keeper's own TaskGroup to fully wind down
@@ -317,10 +363,27 @@ class ToolHost:
                     # the caller sees why, and the *server* (other
                     # connections, and new ones after this) is unaffected.
                     error = protocol.ErrorResponse(error="line too long")
-                    await stream.send((protocol.encode_response(error) + "\n").encode("utf-8"))
+                    await self._send_response_line(stream, error)
                     return
                 response = await self._handle_socket_line(line)
-                await stream.send((protocol.encode_response(response) + "\n").encode("utf-8"))
+                if not await self._send_response_line(stream, response):
+                    return
+
+    async def _send_response_line(self, stream: SocketStream, response: protocol.Response) -> bool:
+        """Write one NDJSON response line; returns whether it was actually
+        sent. If the peer already vanished, `stream.send()` can raise
+        `BrokenResourceError`/`ClosedResourceError` (fix round 2, cheap
+        hardening) -- left uncaught, that would propagate out of
+        `_handle_socket_connection` and out of `listener.serve()`'s
+        internal task group, killing the *whole* socket server over one
+        departed peer. Caught here instead: the caller just ends this one
+        connection (`async with stream:` closes it) and the server carries
+        on."""
+        try:
+            await stream.send((protocol.encode_response(response) + "\n").encode("utf-8"))
+        except (anyio.BrokenResourceError, anyio.ClosedResourceError):
+            return False
+        return True
 
     async def _handle_socket_line(self, line: bytes) -> protocol.Response:
         try:

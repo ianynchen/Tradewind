@@ -7,6 +7,7 @@ socket server ToolHost.serve_socket adds to `ToolHost`, and the real
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -179,6 +180,65 @@ async def test_serve_socket_concurrent_first_callers_start_only_one_listener(
     assert len(set(results)) == 1
 
 
+async def test_serve_socket_cancelled_during_ready_wait_leaves_no_orphaned_socket() -> None:
+    """Fix round 2, Important: `serve_socket` assigns `_socket_listener`/
+    `_socket_keeper`/`_socket_stop`/`_socket_path` *before* awaiting
+    `ready.wait()`. If the caller is cancelled while suspended there, the
+    already-started listener/keeper must be torn down, not leaked as an
+    orphaned, unreachable listening socket.
+
+    Choreographed via a patched `_socket_keeper_run` that blocks *before*
+    ever calling `ready.set()`, so the cancellation is guaranteed to land
+    while `serve_socket()` is genuinely suspended at `ready.wait()` (not a
+    race against the real keeper reaching it first).
+    """
+    socket_dir = Path(tempfile.mkdtemp(prefix="tw-cancel-"))
+    host = ToolHost([_echo_tool()], [], _resolve_ref_raises, socket_dir=socket_dir)
+    keeper_started = anyio.Event()
+    release_keeper = anyio.Event()
+    real_keeper_run = host._socket_keeper_run
+
+    async def gated_keeper_run(listener: object, ready: anyio.Event, stop: anyio.Event) -> None:
+        keeper_started.set()
+        await release_keeper.wait()
+        await real_keeper_run(listener, ready, stop)  # type: ignore[arg-type]
+
+    host._socket_keeper_run = gated_keeper_run  # type: ignore[method-assign]
+
+    caught: list[BaseException] = []
+
+    async def _serve() -> None:
+        try:
+            await host.serve_socket()
+        except BaseException as exc:  # captured for the assertion below
+            caught.append(exc)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(_serve)
+        await keeper_started.wait()  # `serve_socket` is now blocked at `ready.wait()`
+        tg.cancel_scope.cancel()
+        # Released *before* `tg` blocks on `_serve` finishing: `_serve`'s
+        # cleanup path awaits the (still-gated) keeper, so it must be able
+        # to unblock during this `async with` exit, not after.
+        release_keeper.set()
+
+    assert len(caught) == 1
+    assert isinstance(caught[0], asyncio.CancelledError)
+    assert host._socket_path is None
+    assert host._socket_listener is None
+    assert host._socket_keeper is None
+    assert host._socket_stop is None
+    assert list(socket_dir.iterdir()) == []  # no orphaned socket file left behind
+
+    # A fresh serve_socket() still works after the cancelled attempt.
+    socket_path = await host.serve_socket()
+    try:
+        response = await _socket_call(socket_path, protocol.ListRequest())
+        assert isinstance(response, protocol.ListResponse)
+    finally:
+        await host.stop_socket()
+
+
 async def test_socket_list_lists_registered_tools_in_anthropic_format() -> None:
     host = ToolHost([_echo_tool()], [], _resolve_ref_raises)
     socket_path = await host.serve_socket()
@@ -288,6 +348,29 @@ async def test_socket_oversized_line_gets_an_error_response_and_server_stays_up(
         await host.stop_socket()
 
 
+async def test_socket_peer_closes_before_response_does_not_crash_server() -> None:
+    """Fix round 2, cheap hardening: if the peer vanishes between sending a
+    request and the server writing its response, `stream.send()` can raise
+    `BrokenResourceError`/`ClosedResourceError`. Uncaught, that would
+    propagate out of `listener.serve()`'s internal task group and take
+    down the *whole* server, not just this one connection. This test
+    doesn't pin down the exact race (whether the server's `send()` lands
+    before or after the close reaches the OS) -- what it asserts is the
+    outcome that must hold either way: the server survives a vanishing
+    peer and keeps serving other connections."""
+    host = ToolHost([_echo_tool()], [], _resolve_ref_raises)
+    socket_path = await host.serve_socket()
+    try:
+        stream = await anyio.connect_unix(socket_path)
+        await stream.send((protocol.encode_request(protocol.ListRequest()) + "\n").encode())
+        await stream.aclose()  # vanish before ever reading the response
+
+        response = await _socket_call(socket_path, protocol.ListRequest())
+        assert isinstance(response, protocol.ListResponse)
+    finally:
+        await host.stop_socket()
+
+
 async def test_socket_handles_concurrent_connections() -> None:
     host = ToolHost([_echo_tool()], [], _resolve_ref_raises)
     socket_path = await host.serve_socket()
@@ -324,6 +407,38 @@ async def test_stop_socket_is_a_no_op_when_no_socket_is_running() -> None:
     host = ToolHost([], [], _resolve_ref_raises)
 
     await host.stop_socket()  # must not raise
+
+
+async def test_stop_socket_raises_when_called_from_the_keeper_task_itself() -> None:
+    """Fix round 2: `stop_socket()` awaits the keeper task to confirm
+    shutdown -- calling it *from* the keeper task would deadlock waiting
+    for itself, so it's guarded with a `RuntimeError` instead. (The
+    broader case -- a tool handler served through this socket, a
+    descendant of the keeper rather than the keeper itself -- is a
+    documented restriction, not detected; not exercised here since hitting
+    it for real would just hang the test.)"""
+    host = ToolHost([_echo_tool()], [], _resolve_ref_raises)
+    caught: list[BaseException] = []
+    real_keeper_run = host._socket_keeper_run
+
+    async def keeper_run_that_self_stops(
+        listener: object, ready: anyio.Event, stop: anyio.Event
+    ) -> None:
+        try:
+            await host.stop_socket()
+        except BaseException as exc:  # captured for the assertion below
+            caught.append(exc)
+        await real_keeper_run(listener, ready, stop)  # type: ignore[arg-type]
+
+    host._socket_keeper_run = keeper_run_that_self_stops  # type: ignore[method-assign]
+
+    await host.serve_socket()
+    try:
+        assert len(caught) == 1
+        assert isinstance(caught[0], RuntimeError)
+        assert "keeper task" in str(caught[0])
+    finally:
+        await host.stop_socket()
 
 
 async def test_aexit_stops_the_socket_server_too() -> None:
