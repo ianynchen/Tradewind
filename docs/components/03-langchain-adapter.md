@@ -29,7 +29,7 @@ port, `ToolHost` (direct in-process execution — no MCP shim needed here),
 | Loop ownership | Tradewind's own loop, no AgentExecutor/LangGraph | DR-1; the broker check *is* the loop's middle, not a bolt-on. |
 | History | rebuild full messages array from store per request | Store as source of truth (FR-5.1); makes REPLAY trivially lossless. |
 | System prompt | `system` parameter every request | FR-8: `supports_system_prompt = True`, true system-channel authority. |
-| Structured output | tool-choice forcing with the caller's schema | Reliable on the Anthropic API; `supports_structured_output = True`. |
+| Structured output | deferred | Tool-choice forcing with the caller's schema is the intended design, but where in the loop forcing applies (every iteration vs. only once caller tools are exhausted, and whether the forced call terminates the loop) is not yet decided; `supports_structured_output = False` until it is (task-8 fix round 1). |
 | Interrupt | cancel the in-flight task / close the stream | Stateless API: nothing server-side to clean up; turn recorded `cancelled`/`interrupted` (FR-6.2). |
 | Fork | none in the adapter | Flags describe *native* capability (R-1): `supports_fork = False`. Fork-by-copy is a client-level operation over the store (`Tradewind.fork`), available to any store-of-record session, decided above the port. |
 | Thinking in rebuild | omitted | The API rejects replayed thinking blocks without signatures (signatures live in `raw_json`); thinking is legally droppable from history, so the rebuild excludes it. |
@@ -38,7 +38,7 @@ port, `ToolHost` (direct in-process execution — no MCP shim needed here),
 
 ```
 supports_system_prompt          True
-supports_structured_output      True
+supports_structured_output      False   # deferred — tool-choice forcing design pending
 supports_interactive_permissions True   # broker gates every tool execution
 supports_in_process_tools       True
 supports_native_resume          False   # resume is always mirror-rebuild (lossless here)

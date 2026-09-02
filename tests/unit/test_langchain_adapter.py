@@ -26,6 +26,7 @@ from tradewind.adapters.langchain_backend import LangchainBackend
 from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import TurnContext
 from tradewind.application.tool_host import ToolHost
+from tradewind.domain.errors import Unsupported
 from tradewind.domain.events import (
     ItemCompleted,
     PermissionRequested,
@@ -185,6 +186,27 @@ async def test_tool_loop_allows_one_tool_and_denies_another() -> None:
     ]
     assert {item.content["name"] for item in tool_use_items} == {"allowed_tool", "denied_tool"}
 
+    # Full relative order (fix round 1, minor 2): both tool_use items land
+    # before any tool_result/PermissionRequested for either call, and
+    # denied_tool's PermissionRequested precedes its own synthesized
+    # tool_result -- not just "these events all occurred somewhere".
+    def _kind(event: object) -> str:
+        if isinstance(event, ItemCompleted):
+            return f"item:{event.message.kind}:{event.message.content.get('name') or event.message.content.get('tool_use_id')}"
+        return type(event).__name__
+
+    assert [_kind(e) for e in events] == [
+        "TurnStarted",
+        "item:tool_use:allowed_tool",
+        "item:tool_use:denied_tool",
+        "item:tool_result:call_a",
+        "PermissionRequested",
+        "item:tool_result:call_b",
+        "TextDelta",
+        "item:text:None",
+        "TurnCompleted",
+    ]
+
 
 # --- (b) rebuild: thinking omitted, tool_use/tool_result reconstructed (Step 1b) ---
 
@@ -298,7 +320,10 @@ async def test_interrupt_of_unknown_session_is_a_no_op() -> None:
 def test_capabilities_match_spec_table() -> None:
     caps = _backend(_ScriptedChatModel(responses=[AIMessage(content="x")])).capabilities()
     assert caps.supports_system_prompt is True
-    assert caps.supports_structured_output is True
+    # Structured output is deferred (fix round 1, Important): tool-choice
+    # forcing is not implemented, so the flag must say so honestly rather
+    # than advertise unimplemented behavior.
+    assert caps.supports_structured_output is False
     assert caps.supports_interactive_permissions is True
     assert caps.supports_in_process_tools is True
     assert caps.supports_native_resume is False
@@ -312,11 +337,26 @@ async def test_probe_native_always_false() -> None:
 
 
 async def test_read_native_transcript_raises_unsupported() -> None:
-    from tradewind.domain.errors import Unsupported
-
     backend = _backend(_ScriptedChatModel(responses=[AIMessage(content="x")]))
     with pytest.raises(Unsupported):
         await backend.read_native_transcript(_session_row(), None)
+
+
+# --- output_schema is rejected up front, matching supports_structured_output=False ---
+
+
+async def test_run_with_output_schema_raises_unsupported_before_turn_started() -> None:
+    model = _ScriptedChatModel(responses=[AIMessage(content="x")])
+    ctx = _make_ctx()
+    ctx.output_schema = {"type": "object", "properties": {}}
+
+    events: list[object] = []
+    with pytest.raises(Unsupported):
+        async for event in _backend(model).run(ctx):
+            events.append(event)
+
+    # No TurnStarted (or anything else) was yielded before the raise.
+    assert events == []
 
 
 # --- max-iteration guard -> TurnFailed, not TurnCompleted ---

@@ -286,9 +286,15 @@ class LangchainBackend(Backend):
 
     def capabilities(self) -> Capabilities:
         # Exactly the table in docs/components/03-langchain-adapter.md.
+        # `supports_structured_output=False`: tool-choice-forced structured
+        # output is deferred (controller ruling, task-8 fix round 1) — the
+        # design for *where* in the loop forcing applies is not yet made,
+        # so the flag stays honest rather than advertising unimplemented
+        # behavior. `run()` raises `Unsupported` if a caller asks for it
+        # anyway via `ctx.output_schema`.
         return Capabilities(
             supports_system_prompt=True,
-            supports_structured_output=True,
+            supports_structured_output=False,
             supports_interactive_permissions=True,
             supports_in_process_tools=True,
             supports_native_resume=False,
@@ -319,6 +325,13 @@ class LangchainBackend(Backend):
             scope.cancel()
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        if ctx.output_schema is not None:
+            # Raised before `TurnStarted`, not surfaced as `TurnFailed`:
+            # this is a capability mismatch (`supports_structured_output`
+            # is False), the same kind of error `read_native_transcript`
+            # raises directly rather than emitting an event for.
+            raise Unsupported("structured output not yet implemented for langchain backend")
+
         session_id = ctx.session.session_id
         scope = anyio.CancelScope()
         self._scopes[session_id] = scope
@@ -327,7 +340,15 @@ class LangchainBackend(Backend):
                 async for event in self._run_turn(ctx):
                     yield event
         finally:
-            self._scopes.pop(session_id, None)
+            # Only pop the scope this call registered: a second `run()` on
+            # the same `session_id` (e.g. this one interrupted, a new turn
+            # started before this generator's `finally` runs) would already
+            # have overwritten `self._scopes[session_id]` with its own
+            # scope, and popping unconditionally here would drop that
+            # newer scope out of the registry, leaving its own future
+            # `interrupt()` a silent no-op.
+            if self._scopes.get(session_id) is scope:
+                self._scopes.pop(session_id, None)
         # Falling off the end here covers both a clean finish (the loop
         # below always yields its own terminal event) and an interrupt:
         # `scope.cancel()` unwinds the `async for` above via `Cancelled`,
