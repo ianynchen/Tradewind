@@ -159,12 +159,19 @@ async def tool_allow_deny(harness: ConformanceHarness) -> None:
     therefore asserts gating *behavior*, not an exact `tool_input`, since a
     live model's exact argument choice is not something this matrix
     controls or cares about.
+
+    Gated on `supports_interactive_permissions` alone (task-14 fix round 1)
+    -- the only capability this scenario actually exercises (whether the
+    broker gates a tool call at all). `supports_in_process_tools` used to be
+    ANDed in here too, but that flag is about *delivery mechanism* (in-
+    process bridge vs. an out-of-process subprocess shim), which this
+    scenario doesn't care about and never asserts on -- it silently skipped
+    every shim-only backend (codex, `supports_in_process_tools=False`) even
+    though broker gating works identically for it (`ToolHost.call()`'s own
+    authoritative gate, `tool_host.py`).
     """
-    if not (
-        harness.capabilities.supports_interactive_permissions
-        and harness.capabilities.supports_in_process_tools
-    ):
-        pytest.skip("backend does not support broker-gated in-process tools")
+    if not harness.capabilities.supports_interactive_permissions:
+        pytest.skip("backend does not support broker-gated tool calls")
 
     allowed_calls: list[dict[str, object]] = []
     denied_calls: list[dict[str, object]] = []

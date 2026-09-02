@@ -47,6 +47,7 @@ from openai_codex.generated.v2_all import (
 )
 
 from tradewind.adapters.codex_backend import (
+    _denied_shim_permission_event,
     _final_text_from_items,
     _usage_dict,
     mcp_server_config_overrides,
@@ -278,6 +279,121 @@ def test_unknown_item_kind_maps_to_event_with_raw() -> None:
     assert messages[0].native_id == "plan-1"
     assert messages[0].raw is not None
     assert messages[0].raw.get("id") == "plan-1"
+
+
+# --- _denied_shim_permission_event (task-14 fix round 1: FR-4.1) --------
+#
+# `ToolHost.call()`'s own broker gate (`tool_host.py`) denies tradewind's
+# tool calls made through the shim server -- the approval_handler layer
+# auto-accepts those and never learns about a deny (module docstring), so
+# this function is what surfaces the required `PermissionRequested` event,
+# recognizing `ToolHost.call()`'s own "permission denied" sentinel on a
+# completed (not `completed`-status) mcpToolCall/dynamicToolCall item.
+
+
+def test_denied_mcp_tool_call_produces_permission_requested() -> None:
+    item = _item(
+        McpToolCallThreadItem(
+            id="call-3",
+            server="toolproxy",
+            tool="denied_tool",
+            arguments={"x": "b"},
+            status=McpToolCallStatus.failed,
+            result=McpToolCallResult(content=[{"type": "text", "text": "permission denied"}]),
+            type="mcpToolCall",
+        )
+    )
+
+    event = _denied_shim_permission_event(item)
+
+    assert event is not None
+    assert event.tool_name == "denied_tool"
+    assert event.tool_input == {"x": "b"}
+    assert event.verdict == "deny"
+
+
+def test_denied_mcp_tool_call_via_error_field_produces_permission_requested() -> None:
+    item = _item(
+        McpToolCallThreadItem(
+            id="call-4",
+            server="toolproxy",
+            tool="denied_tool",
+            arguments={},
+            status=McpToolCallStatus.failed,
+            error=McpToolCallError(message="permission denied"),
+            type="mcpToolCall",
+        )
+    )
+
+    event = _denied_shim_permission_event(item)
+
+    assert event is not None
+    assert event.tool_name == "denied_tool"
+
+
+def test_denied_dynamic_tool_call_produces_permission_requested() -> None:
+    item = _item(
+        DynamicToolCallThreadItem(
+            id="dyn-3",
+            tool="denied_tool",
+            arguments={"x": "b"},
+            status=DynamicToolCallStatus.failed,
+            content_items=[
+                DynamicToolCallOutputContentItem(
+                    InputTextDynamicToolCallOutputContentItem(
+                        text="permission denied", type="inputText"
+                    )
+                )
+            ],
+            type="dynamicToolCall",
+        )
+    )
+
+    event = _denied_shim_permission_event(item)
+
+    assert event is not None
+    assert event.tool_name == "denied_tool"
+    assert event.verdict == "deny"
+
+
+def test_completed_mcp_tool_call_produces_no_permission_event() -> None:
+    item = _item(
+        McpToolCallThreadItem(
+            id="call-5",
+            server="toolproxy",
+            tool="allowed_tool",
+            arguments={"x": "a"},
+            status=McpToolCallStatus.completed,
+            result=McpToolCallResult(content=[{"type": "text", "text": "ok"}]),
+            type="mcpToolCall",
+        )
+    )
+
+    assert _denied_shim_permission_event(item) is None
+
+
+def test_failed_mcp_tool_call_with_a_different_error_produces_no_permission_event() -> None:
+    # A real tool failure (not a broker deny) must not be misread as one --
+    # only the exact "permission denied" sentinel triggers this.
+    item = _item(
+        McpToolCallThreadItem(
+            id="call-6",
+            server="toolproxy",
+            tool="allowed_tool",
+            arguments={},
+            status=McpToolCallStatus.failed,
+            error=McpToolCallError(message="connection timed out"),
+            type="mcpToolCall",
+        )
+    )
+
+    assert _denied_shim_permission_event(item) is None
+
+
+def test_non_tool_call_item_produces_no_permission_event() -> None:
+    item = _item(AgentMessageThreadItem(id="item-9", text="hi", type="agentMessage"))
+
+    assert _denied_shim_permission_event(item) is None
 
 
 # --- thread_read_items ----------------------------------------------------

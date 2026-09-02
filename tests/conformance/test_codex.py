@@ -14,18 +14,26 @@ instruction string per upcoming turn; `_ScriptedSession.run`/`.stream` pop it
 and pass it through `overrides["system_prompt"]`, which `_drive_turn` wires
 to `base_instructions`).
 
-`tool_allow_deny` is expected to SKIP here, not run: `matrix.py`'s own gate
-is `supports_interactive_permissions AND supports_in_process_tools`, and
-`CodexBackend.capabilities().supports_in_process_tools` is `False` per the
-brief's explicit capability table (Codex has no in-process tool bridge --
-tools reach it only through the `tradewind.toolproxy` stdio shim). This is a
-real gap worth flagging: the scenario's own behaviour (broker gates a tool
-call regardless of delivery mechanism) does NOT actually depend on
-"in-process" vs "shim", so `matrix.py`'s skip condition is testing the wrong
-thing for a shim-only backend -- flagged in the task-14 report for
-controller follow-up, not fixed here (`matrix.py` is shared test
-infrastructure, out of this task's file scope; ripping it up unilaterally
-would be exactly the kind of unrequested change GUIDELINES §7 warns against).
+`tool_allow_deny` now RUNS here (task-14 fix round 1): `matrix.py`'s gate was
+`supports_interactive_permissions AND supports_in_process_tools`, which
+wrongly skipped every shim-only backend (`supports_in_process_tools=False`)
+even though broker gating works identically for one -- fixed to gate on
+`supports_interactive_permissions` alone (`matrix.py`'s own docstring for
+the scenario has the full reasoning). Running it live against Codex
+surfaced one more real, model-specific finding: `gpt-5.4-mini` uses a
+dynamic-tool-discovery mechanism (`tool_search.tool_search_tool`, a built-in
+meta-tool) for MCP-registered tools -- they are NOT included in the static
+tool list the model sees by default, and a plain "call tool X" instruction
+with no mention of searching produced zero tool calls at all (confirmed:
+the model listed its available tools when asked directly, and
+`allowed_tool` was absent; explicitly telling it to search first found it
+immediately, under the exact `mcp__toolproxy.allowed_tool`-style name, and
+it called it correctly end to end). `_tool_calls_instruction` below now
+tells the model to search for the tools first if they aren't in its normal
+list -- a harness/prompting fix, not an adapter fix: the adapter's own
+tool-call mapping and broker gating were already confirmed correct once the
+model actually issued the call (real `tool_use`/`tool_result` items, right
+name, right input, right broker verdict).
 """
 
 from __future__ import annotations
@@ -101,6 +109,11 @@ def _tool_calls_instruction(tool_calls: list[matrix.ScriptedToolCall], final_tex
     )
     return (
         f"For the very next message from the user in this conversation: call {calls}. "
+        "These are MCP tools from the 'toolproxy' server, not one of your built-in "
+        "functions -- if you don't see them in your normal tool list, use your tool "
+        "search / MCP tool discovery mechanism first to find them (their names may "
+        "appear namespaced, e.g. 'mcp__toolproxy.<name>' or similar -- call whichever "
+        "exact match you find for each name above), then call each one. "
         "Call every one of them -- some may come back denied by the permission system; "
         "that is an expected, normal tool result, not an error, so do not stop or retry "
         "for it. Once you have a result (allowed or denied) for every one of them, reply "
@@ -254,8 +267,8 @@ async def test_single_turn_text(harness: CodexHarness) -> None:
 
 
 async def test_tool_allow_deny(harness: CodexHarness) -> None:
-    # Expected to skip: `supports_in_process_tools` is False (module
-    # docstring) -- exercises the skip machinery, not tool gating.
+    # Runs live now (task-14 fix round 1, module docstring): the shim-only
+    # gate was wrong, and CodexBackend's broker gating works.
     await matrix.tool_allow_deny(cast(Any, harness))
 
 

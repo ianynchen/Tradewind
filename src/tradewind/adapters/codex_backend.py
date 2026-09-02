@@ -217,6 +217,15 @@ _SHIM_SERVER_NAME = "toolproxy"
 # tool this adapter genuinely could not name (fail-closed, not a real tool).
 _UNKNOWN_TOOL_NAME = "<unknown>"
 
+# tradewind's own established denied-tool-result sentinel -- `ToolHost.
+# call()`'s broker-deny branch (`tool_host.py`) and `LangchainBackend`'s tool
+# loop (`langchain_backend.py`) both use this exact string, deliberately, as
+# the `tool_result` content for a denied call. `_denied_shim_permission_event`
+# below recognizes it to synthesize the `PermissionRequested` event FR-4.1
+# requires (task-14 fix round 1: found live -- see that function's docstring
+# for why the approval_handler itself can't emit it for shim calls).
+_DENIED_TOOL_RESULT_CONTENT = "permission denied"
+
 # `mcpServer/elicitation/request`'s `message` field is exactly
 # `Allow the {server} MCP server to run tool "{tool}"?` (spike §4, verified
 # live against `codex app-server` 0.147.0) -- not a documented, stable
@@ -287,6 +296,57 @@ def _tool_call_messages(
             native_id=native_id,
         ),
     ]
+
+
+def _denied_shim_permission_event(item: ThreadItem) -> PermissionRequested | None:
+    """`PermissionRequested` for a completed `McpToolCallThreadItem`/
+    `DynamicToolCallThreadItem` that `ToolHost.call()`'s own broker gate
+    denied, or `None` for anything else (found live, task-14 fix round 1).
+
+    **Why this exists here and not in the `approval_handler`**: this
+    adapter's `mcpServer/elicitation/request` branch (`_decide_mcp_
+    elicitation`) auto-accepts every call to tradewind's own shim server
+    without consulting the broker at all -- deliberately, per the
+    controller ruling, since `ToolHost.call()` (reached moments later, over
+    the toolproxy socket, once Codex's own MCP client actually issues
+    `tools/call`) gates authoritatively for that path. That division of
+    labor means the approval_handler layer never learns whether the call
+    was actually denied -- only `ToolHost.call()`'s own return value
+    (`ToolOutcome(content="permission denied", is_error=True)`) carries
+    that fact, and it flows back to this adapter only as the completed
+    item's own result content, by the time `item/completed` arrives here.
+    FR-4.1 requires `PermissionRequested` fire on every deny regardless of
+    which layer made it, so this recognizes tradewind's own denied-tool
+    sentinel (`_DENIED_TOOL_RESULT_CONTENT`) on a tool_call item and
+    synthesizes the event from it, rather than leaving deny-via-`ToolHost`
+    silently unobserved. Only ever matches items from tradewind's own shim
+    (the only external MCP server this adapter ever registers -- module
+    docstring), so there is no real risk of some unrelated third-party
+    tool's genuinely-different failure coincidentally producing this exact
+    string and misfiring.
+    """
+    root = item.root
+    if isinstance(root, McpToolCallThreadItem):
+        if (
+            root.status != McpToolCallStatus.completed
+            and _mcp_result_text(root) == _DENIED_TOOL_RESULT_CONTENT
+        ):
+            arguments = root.arguments if isinstance(root.arguments, dict) else {}
+            return PermissionRequested(
+                tool_name=root.tool, tool_input=cast("dict[str, Any]", arguments), verdict="deny"
+            )
+        return None
+    if isinstance(root, DynamicToolCallThreadItem):
+        if (
+            root.status != DynamicToolCallStatus.completed
+            and _dynamic_tool_call_result_text(root) == _DENIED_TOOL_RESULT_CONTENT
+        ):
+            arguments = root.arguments if isinstance(root.arguments, dict) else {}
+            return PermissionRequested(
+                tool_name=root.tool, tool_input=cast("dict[str, Any]", arguments), verdict="deny"
+            )
+        return None
+    return None
 
 
 def thread_item_to_messages(item: ThreadItem) -> list[NormalizedMessage]:
@@ -705,9 +765,21 @@ def _drive_turn(
 
         turn_started = client.turn_start(
             thread_id,
+            # `prompt` (the positional `input_items` arg) is what actually
+            # reaches the wire: `CodexClient.turn_start` builds its payload
+            # as `{**_params_dict(params), "threadId": ..., "input":
+            # self._normalize_input_items(input_items)}` (client.py) --
+            # the trailing dict-literal key always wins, so this positional
+            # `prompt` (a bare `str`, which `_normalize_input_items` wraps
+            # as `[{"type": "text", "text": prompt}]`) overwrites whatever
+            # `TurnStartParams.input` below produces, every time.
             prompt,
             params=TurnStartParams(
                 thread_id=thread_id,
+                # Required by `TurnStartParams` (no default) but never
+                # actually sent -- see the comment above. Built from the
+                # same `prompt` purely to satisfy pydantic validation, not
+                # because its value matters.
                 input=[UserInput(TextUserInput(type="text", text=prompt))],
                 model=model,
                 effort=effort,
@@ -787,6 +859,33 @@ class CodexBackend(Backend):
     async def read_native_transcript(
         self, session: SessionRow, after_native_id: str | None
     ) -> list[NormalizedMessage]:
+        """Read `session`'s native `codex` thread via `thread/read
+        (includeTurns=true)` and map it into `NormalizedMessage`s
+        (`Backend.read_native_transcript`'s contract).
+
+        **Known limitation (FR-6.4, confirmed live, task-14 fix round 1):**
+        once `after_native_id` is given (i.e. after the first turn), this
+        will return **nothing**, not a genuine backfill. Codex's
+        live-streamed `item/completed` ids and its `thread/read`-returned
+        item ids are two *different* id schemes for the same logical item
+        (confirmed empirically -- see `thread_read_items`'s docstring for
+        the full reproduction and reasoning), so `after_native_id` -- always
+        a live-scheme id, from `store.last_native_id()` -- can never match
+        an item this call returns; `thread_read_items` treats that cursor
+        miss as "nothing new" rather than "everything" (the opposite of
+        `ClaudeBackend`'s own rule) specifically to avoid corrupting the
+        mirror with duplicate history, at the cost of this method never
+        actually surfacing a human's out-of-band `codex` CLI activity on the
+        same thread (DR-3) until a real fix lands (id normalization or a
+        content-hash-based dedup). This is a data-completeness gap, not a
+        capability lie: `read_native_transcript` itself works correctly
+        (confirmed: `after_native_id=None`, the fresh-session case, reads
+        the full transcript fine) and every other consumer of
+        `supports_transcript_read`/`supports_native_resume` -- `probe_native`,
+        `thread_resume`-based context continuity, single-turn reads --
+        is unaffected, so the capability flags stay `True` rather than being
+        flipped to hide this.
+        """
         native_session_id = session.native_session_id
         if native_session_id is None:
             return []
@@ -899,6 +998,9 @@ class CodexBackend(Backend):
                 agent = _as_agent_message(payload.item)
                 if agent is not None:
                     agent_messages.append(agent)
+                permission_event = _denied_shim_permission_event(payload.item)
+                if permission_event is not None:
+                    yield permission_event
                 for message in thread_item_to_messages(payload.item):
                     yield ItemCompleted(message=message)
             elif isinstance(payload, ThreadTokenUsageUpdatedNotification):
