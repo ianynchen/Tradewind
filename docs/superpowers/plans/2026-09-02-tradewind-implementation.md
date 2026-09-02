@@ -20,6 +20,7 @@
 - Flags describe NATIVE capability only; emulation lives in application layer (§3.1 R-1).
 - Secrets never written to the store (I-2): MCP secret fields redacted to config references.
 - Tests that need real provider credentials carry `@pytest.mark.integration` and skip cleanly when credentials are absent.
+- **Available test credentials (2026-09-02):** Claude Agent SDK (subscription on this machine) and Codex SDK (subscription) — full integration testing. **No Anthropic API key** — langchain live tests must use a free local model (Ollama) injected as the chat model; the Anthropic-live test stays written but skipped until a key exists. **No Cursor subscription** — Cursor integration and the P-5 spike are BLOCKED; only credential-free unit tests run for Task 15.
 
 ## File Structure (locked)
 
@@ -336,7 +337,7 @@ class Backend(ABC):
 - Adapter behavior per `docs/components/03-langchain-adapter.md`: rebuild messages from `load_history()` (thinking kinds OMITTED; `tool_use`/`tool_result` → real content blocks), `system` param each request, loop with broker gate (`deny` → synthesized error tool_result + `PermissionRequested` event), max 25 iterations guard, interrupt via `anyio.CancelScope` registered per session id, capabilities exactly the table in the spec (`supports_fork=False`).
 
 - [ ] **Step 1: Failing unit tests with a scripted fake chat model** — (a) two-tool turn: model emits tool_calls A,B; broker allows A denies B; assert A executed, B got error tool_result, events contain `PermissionRequested(verdict="deny")`, final `TurnCompleted`; (b) rebuild: seed mirror with text+thinking+tool pair, assert request messages exclude thinking and include reconstructed tool blocks; (c) interrupt mid-loop → iterator ends, no exception escapes, last event `TurnFailed` NOT emitted (status handled by runner).
-- [ ] **Step 2–5: FAIL → implement → PASS. Integration test (marked): one real API turn with one tool, skipped without `ApiKeyAuth`. check.sh; commit** `feat(adapter): langchain backend with broker-gated tool loop`
+- [ ] **Step 2–5: FAIL → implement → PASS.** The adapter constructs `ChatAnthropic` by default but accepts any injected `BaseChatModel` (this is also how the fake-model unit tests work). Integration tests, two variants: (a) `test_langchain_live.py` against the real Anthropic API — written now, skipped while no API key exists; (b) `test_langchain_ollama.py` — inject `ChatOllama` with a local tool-calling model (`ollama pull qwen3` on the mini; skip if the ollama daemon is unreachable) and run one real tool-loop turn free of charge. Add dev-only dep `langchain-ollama` (pinned). check.sh; commit `feat(adapter): langchain backend with broker-gated tool loop`
 
 ### Task 9: Turn runner + wiring + conformance baseline
 
@@ -425,7 +426,14 @@ class Backend(ABC):
 - Produces: `CodexBackend(Backend)` — `run()`: `Codex(CodexConfig(config_overrides=<mcp_servers incl. ToolHost.shim_server_def()>))`; `thread_start()`/`thread_resume(native_id)`; capture `thread.id` → `rehome_native`; per-turn `thread.turn(prompt, approval_mode=…, sandbox=…, model=ctx.model_spec.model, effort=ctx.model_spec.effort, output_schema=ctx.output_schema)`; stream via `turn.stream()` mapped to events (thread items → kinds incl. `command_execution`/`file_change` native fits); broker wired per Task 13 findings; `interrupt()` via held `TurnHandle.interrupt()`; `read_native_transcript` via `thread_read(include_turns=True)`; `probe_native` via `thread_read` success. Capabilities: system_prompt T (base_instructions), structured_output T, interactive_permissions T (approval granularity), in_process_tools F, native_resume T, fork T (`thread_fork`), transcript_read T. Isolation mode: set `CODEX_HOME` in the spawned client env ONLY when `native_stores.isolation_mode` (DR-3).
 - [ ] **Steps: mapping unit tests (fixture ThreadItems → NormalizedMessage) FAIL → implement → PASS; conformance `@integration` green/skipped; manual `codex resume <thread-id>` evidence in RUNBOOK; check.sh; commit** `feat(adapter): codex backend with MCP shim tools`
 
-### Task 15: Spike + Cursor adapter
+### Task 15: Spike + Cursor adapter — **PARTIALLY BLOCKED (no Cursor subscription)**
+
+> Only the credential-free portions run now: mapping unit tests and the adapter
+> code itself (written against the pinned SDK's types). The P-5 spike (Step 1)
+> and the conformance run (Step 4) REQUIRE a Cursor subscription — mark both
+> checkboxes `BLOCKED: cursor subscription` and leave ARCHITECTURE P-5 open.
+> Do not fake or stub these as passed; the adapter ships `experimental` until
+> they run for real.
 
 **Files:**
 - Create: `docs/research/2026-09-XX-cursor-cli-resume-spike.md`, `src/tradewind/adapters/cursor_backend.py`, rules-file emulation in `application/turn_runner.py`
@@ -443,7 +451,7 @@ class Backend(ABC):
 - Create: `README.md`, `docs/RUNBOOK.md`
 - Modify: `docs/ARCHITECTURE.md` (pending list), `docs/REQUIREMENTS.md` (OQ status)
 
-- [ ] **Step 1:** Full `scripts/check.sh` + complete conformance matrix across all four adapters on the mini (integration creds present); paste the matrix result table into RUNBOOK.
+- [ ] **Step 1:** Full `scripts/check.sh` + conformance matrix across the three testable adapters on the mini — claude (subscription), codex (subscription), langchain (Ollama free model) — with cursor rows recorded as `BLOCKED: no subscription`; paste the matrix result table into RUNBOOK, including the blocked rows so the gap is visible.
 - [ ] **Step 2:** README: install, 20-line embedding example (config → ensure → run → history), capability matrix table.
 - [ ] **Step 3:** Update pending/OQ statuses; commit `docs: close out phase; conformance evidence`.
 
