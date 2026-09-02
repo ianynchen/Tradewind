@@ -4,7 +4,7 @@ set -euo pipefail
 # Quality gate checks for tradewind package
 
 echo "Running code format check..."
-uv run ruff format --check
+uv run ruff format --check src tests
 
 echo "Running linter..."
 uv run ruff check
