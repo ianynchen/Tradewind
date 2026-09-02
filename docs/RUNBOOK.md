@@ -49,7 +49,7 @@ uv run pytest tests/conformance/test_cursor.py -v      # always self-skips; no e
 - `tests/conformance/test_cursor.py` — 1 skipped (module-level `BLOCKED` skip, expected, no
   Cursor subscription on this machine).
 - langchain: no `GROQ_API_KEY`/`ANTHROPIC_API_KEY` on this machine, so
-  `tests/integration/test_langchain_live.py`'s Groq live test **PASSED on 2026-09-02** (`ChatGroq(model="openai/gpt-oss-120b")` via the free tier; the originally planned `llama-3.3-70b-versatile` was retired by Groq and the test updated). The Anthropic-API variant **PASSED on 2026-09-02** (real API key in git-ignored `.env`; note: pinned `claude-3-5-haiku-20241022` is past its announced EOL yet still served — bump the model when it finally 404s)
+  `tests/integration/test_langchain_live.py`'s Groq live test **PASSED on 2026-09-02** (`ChatGroq(model="openai/gpt-oss-120b")` via the free tier; the originally planned `llama-3.3-70b-versatile` was retired by Groq and the test updated). The Anthropic-API variant **PASSED on 2026-09-02** (real API key in git-ignored `.env`; runs on `claude-haiku-4-5` (bumped from the EOL'd 3.5 pin before the first successful run))
   (both self-skip; part of `check.sh`'s 7 skips). The langchain adapter's own conformance
   coverage (`tests/conformance/test_langchain.py`, fake `_ScriptedChatModel`) runs and passes
   on every `check.sh` invocation — see the matrix row above.
