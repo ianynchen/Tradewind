@@ -1,21 +1,46 @@
 """Tests for tradewind.application.client.Tradewind session lifecycle
 verbs: create/resume/ensure/fork, id validation, tier/tool checks
-(task-6 brief).
+(task-6 brief); run/stream/stop/spawn client-level wiring against a fake
+`Backend` (task-9 brief -- the happy-path behaviour of these four is
+covered end to end by `tests/conformance/test_langchain.py` against the
+real adapter; this file stays focused on client-level error paths and
+lineage bookkeeping that conformance doesn't need to re-prove).
 """
 
 from __future__ import annotations
 
+from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from pydantic import SecretStr
 
 from tradewind.adapters.sqlite_store import SqliteSessionStore
 from tradewind.application.client import Session, Tradewind
-from tradewind.application.config import StoreConfig, TradewindConfig
-from tradewind.application.ports import SessionStorePort
-from tradewind.domain.errors import ConfigError, SessionExists, SessionNotFound, ToolMismatch
-from tradewind.domain.models import ApiKeyAuth, ModelSpec, Profile, SessionOptions, Tool
+from tradewind.application.config import NativeStoreConfig, StoreConfig, TradewindConfig
+from tradewind.application.ports import Backend, SessionStorePort
+from tradewind.domain.errors import (
+    ConfigError,
+    SessionExists,
+    SessionNotFound,
+    ToolMismatch,
+    TurnExecutionFailed,
+    Unsupported,
+)
+from tradewind.domain.events import Event, TurnCompleted, TurnFailed
+from tradewind.domain.models import (
+    ApiKeyAuth,
+    BackendName,
+    Capabilities,
+    ModelSpec,
+    NormalizedMessage,
+    Profile,
+    SessionOptions,
+    SessionRow,
+    Tool,
+    TurnResult,
+)
 
 _VALID_ID_A = "11111111-1111-1111-1111-111111111111"
 _VALID_ID_B = "22222222-2222-2222-2222-222222222222"
@@ -235,35 +260,133 @@ async def test_fork_missing_source_raises_session_not_found(tmp_path: Path) -> N
         await tw.fork(_VALID_ID_A, _VALID_ID_B)
 
 
-# --- run/stream/stop/spawn: not wired yet (Step 2, task-9 note) ---
+# --- run/stream/stop/spawn: client-level wiring against a fake Backend
+# (task-9) -- happy-path behaviour end to end is covered by
+# tests/conformance/test_langchain.py against the real adapter. ---
 
 
-async def test_run_raises_not_implemented(tmp_path: Path) -> None:
+class _FakeBackend(Backend):
+    """A minimal `Backend` whose `run()` replays a fixed, caller-supplied
+    event script -- enough to drive `TurnRunner`'s client-level wiring
+    (mirroring, finalization, stop()) without a real adapter."""
+
+    name: ClassVar[BackendName] = "claude"
+
+    def __init__(
+        self, profile: Profile, native_config: NativeStoreConfig, events: list[Event]
+    ) -> None:
+        super().__init__(profile, native_config)
+        self._events = events
+        self.interrupted: list[str] = []
+
+    def capabilities(self) -> Capabilities:
+        return Capabilities(
+            supports_system_prompt=True,
+            supports_structured_output=False,
+            supports_interactive_permissions=True,
+            supports_in_process_tools=True,
+            supports_native_resume=False,
+            supports_fork=False,
+            supports_transcript_read=False,
+        )
+
+    async def run(self, ctx: object) -> AsyncIterator[Event]:  # noqa: ARG002 -- Backend interface
+        for event in self._events:
+            yield event
+
+    async def probe_native(self, session: SessionRow) -> bool:  # noqa: ARG002
+        return False
+
+    async def read_native_transcript(
+        self,
+        session: SessionRow,  # noqa: ARG002
+        after_native_id: str | None,  # noqa: ARG002
+    ) -> list[NormalizedMessage]:
+        raise Unsupported("fake backend has no native transcript")
+
+    async def interrupt(self, session_id: str) -> None:
+        self.interrupted.append(session_id)
+
+
+def _seed_backend(
+    tw: Tradewind, events: list[Event], profile_name: str = "default"
+) -> _FakeBackend:
+    fake = _FakeBackend(_profile(), NativeStoreConfig(), events)
+    tw._backends[profile_name] = fake
+    return fake
+
+
+def _completed(text: str = "ok") -> TurnCompleted:
+    return TurnCompleted(
+        result=TurnResult(
+            turn_id="fake-turn", status="completed", final_text=text, usage={}, cost_usd=None
+        )
+    )
+
+
+async def test_run_returns_turn_result_from_turn_completed(tmp_path: Path) -> None:
     tw = Tradewind(_config(tmp_path))
+    _seed_backend(tw, [_completed("hi there")])
     session = await tw.create(_VALID_ID_A, SessionOptions())
-    with pytest.raises(NotImplementedError):
+
+    result = await session.run("hello")
+
+    assert result.status == "completed"
+    assert result.final_text == "hi there"
+
+
+async def test_run_raises_turn_execution_failed_on_turn_failed_event(tmp_path: Path) -> None:
+    tw = Tradewind(_config(tmp_path))
+    _seed_backend(tw, [TurnFailed(turn_id="fake-turn", error="boom")])
+    session = await tw.create(_VALID_ID_A, SessionOptions())
+
+    with pytest.raises(TurnExecutionFailed, match="boom"):
         await session.run("hello")
 
 
-async def test_stop_raises_not_implemented(tmp_path: Path) -> None:
+async def test_run_with_unknown_tier_override_raises_config_error(tmp_path: Path) -> None:
     tw = Tradewind(_config(tmp_path))
+    _seed_backend(tw, [_completed()])
     session = await tw.create(_VALID_ID_A, SessionOptions())
-    with pytest.raises(NotImplementedError):
+
+    with pytest.raises(ConfigError):
+        await session.run("hello", tier="does-not-exist")
+
+
+async def test_stop_calls_backend_interrupt_for_this_session(tmp_path: Path) -> None:
+    tw = Tradewind(_config(tmp_path))
+    fake = _seed_backend(tw, [_completed()])
+    session = await tw.create(_VALID_ID_A, SessionOptions())
+
+    await session.stop()
+
+    assert fake.interrupted == [_VALID_ID_A]
+
+
+async def test_stop_of_unknown_session_raises_session_not_found(tmp_path: Path) -> None:
+    tw = Tradewind(_config(tmp_path))
+    session = Session(id=_VALID_ID_A, _client=tw)
+
+    with pytest.raises(SessionNotFound):
         await session.stop()
 
 
-async def test_spawn_raises_not_implemented(tmp_path: Path) -> None:
+async def test_spawn_creates_child_with_subagent_lineage_and_runs_the_prompt(
+    tmp_path: Path,
+) -> None:
     tw = Tradewind(_config(tmp_path))
-    session = await tw.create(_VALID_ID_A, SessionOptions())
-    with pytest.raises(NotImplementedError):
-        await session.spawn("hello")
+    _seed_backend(tw, [_completed("child reply")])
+    parent = await tw.create(_VALID_ID_A, SessionOptions())
 
+    child = await parent.spawn("child prompt")
 
-def test_stream_raises_not_implemented(tmp_path: Path) -> None:
-    tw = Tradewind(_config(tmp_path))
-    session = Session(id=_VALID_ID_A, _client=tw)
-    with pytest.raises(NotImplementedError):
-        session.stream("hello")
+    assert child.id != parent.id
+    store = SqliteSessionStore(tmp_path / "sessions.db")
+    child_row = store.get_session(child.id)
+    assert child_row is not None
+    assert child_row.spawn_kind == "subagent"
+    assert child_row.parent_session_id == _VALID_ID_A
+    assert child_row.spawned_by_message_id is None
 
 
 # --- history: id validation, unknown session, kwarg passthrough (fix round 1) ---

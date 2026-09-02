@@ -29,3 +29,9 @@ class ToolMismatch(TradewindError):
 
 class ConfigError(TradewindError):
     """Configuration failed validation."""
+
+
+class TurnExecutionFailed(TradewindError):
+    """`Session.run()` raises this when its turn's event stream ends in a
+    `TurnFailed` event (task-9 brief): the message is that event's `error`
+    string, verbatim."""

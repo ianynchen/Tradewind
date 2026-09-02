@@ -1,28 +1,35 @@
 """Application client: `Tradewind` (session lifecycle) and `Session` (a
-thin per-session handle bound to it) (task-6 brief).
+thin per-session handle bound to it) (task-6 brief; turn wiring task-9).
 
 Layering note (controller ruling): the application layer may not import
 adapters (import-linter `layers` contract; GUIDELINES §8 "dependencies
 flow inward"), but `StoreConfig.sqlite_path` needs a concrete
-`SessionStorePort` built from it. Rather than construct one here, this
-module exposes `_set_default_store_factory` — a module-private, constant
-import-time seam (GUIDELINES §8 permits mutation "as a deliberate choice
-with a stated reason") assigned exactly once, at import time, by the
-top-level `tradewind` package (outside the layers contract) with a
-factory that builds `SqliteSessionStore`. It is not per-instance state:
-every `Tradewind` built from a `sqlite_path` in a process shares the same
-factory, and `Tradewind.__init__` stays a single-argument constructor
-exactly as specified, with no knowledge of which adapter module backs it.
+`SessionStorePort` built from it, and a session's `Profile.backend` needs a
+concrete `Backend` adapter. Rather than construct either here, this module
+exposes two module-private, constant import-time seams (GUIDELINES §8
+permits mutation "as a deliberate choice with a stated reason"), each
+assigned exactly once, at import time, by the top-level `tradewind`
+package (outside the layers contract):
 
-`run`/`stream`/`stop`/`spawn` raise `NotImplementedError`: the turn runner
-lands in a later task (task-6 brief, Step 3-5 note).
+- `_set_default_store_factory`: builds `SqliteSessionStore`.
+- `_set_backend_factories`: maps `BackendName -> Callable[[Profile],
+  Backend]`; only `"langchain"` is registered as of task-9, the others
+  arrive with their own adapter tasks.
+
+Neither is per-instance state: every `Tradewind` in a process shares them.
+`Tradewind.__init__` stays a single-argument constructor exactly as
+specified, with no knowledge of which adapter modules back it. Per the
+task-9 ruling ("adapters are built lazily per profile, cached on the
+instance" -- component spec 01), each `Tradewind` instance keeps its own
+`_backends` cache keyed by profile name, populated on first use via the
+shared factory.
 """
 
 from __future__ import annotations
 
 import uuid
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
 from typing import cast
@@ -30,10 +37,17 @@ from typing import cast
 import anyio
 
 from tradewind.application.config import TradewindConfig
-from tradewind.application.ports import SessionStorePort
-from tradewind.domain.errors import ConfigError, SessionNotFound, ToolMismatch
-from tradewind.domain.events import Event
+from tradewind.application.ports import Backend, SessionStorePort
+from tradewind.application.turn_runner import TurnRunner
+from tradewind.domain.errors import (
+    ConfigError,
+    SessionNotFound,
+    ToolMismatch,
+    TurnExecutionFailed,
+)
+from tradewind.domain.events import Event, TurnCompleted, TurnFailed
 from tradewind.domain.models import (
+    BackendName,
     Profile,
     SessionOptions,
     SessionRow,
@@ -43,8 +57,10 @@ from tradewind.domain.models import (
 )
 
 StoreFactory = Callable[[Path], SessionStorePort]
+BackendFactory = Callable[[Profile], Backend]
 
 _default_store_factory: StoreFactory | None = None
+_backend_factories: dict[BackendName, BackendFactory] = {}
 
 
 def _set_default_store_factory(factory: StoreFactory) -> None:
@@ -60,6 +76,20 @@ def _set_default_store_factory(factory: StoreFactory) -> None:
     """
     global _default_store_factory
     _default_store_factory = factory
+
+
+def _set_backend_factories(factories: dict[BackendName, BackendFactory]) -> None:
+    """Assign the constant, import-time registry of `Backend` constructors,
+    one per `BackendName`, used by every `Tradewind` instance in the
+    process to build the adapter behind a session's profile.
+
+    Module-private, assigned exactly once by `tradewind/__init__.py` at
+    package import time (see the module docstring); replaces the whole
+    registry rather than merging into it, matching `_set_default_store_
+    factory`'s "assigned exactly once" contract.
+    """
+    global _backend_factories
+    _backend_factories = dict(factories)
 
 
 def _resolve_store(config: TradewindConfig) -> SessionStorePort:
@@ -103,24 +133,44 @@ def _snapshot_tool_names(snapshot: dict[str, object]) -> set[str]:
 class Session:
     """A thin handle bound to the `Tradewind` instance that produced it.
 
-    Carries only identity; all behaviour is delegated back to the owning
-    client (`_client`), which holds the store, profiles, and config.
+    Carries identity plus the live `SessionOptions` (tools, `mcp_servers`,
+    `permission_broker`) supplied when this handle was acquired -- the
+    parts I-2 forbids the store from persisting, so they only ever live on
+    the in-memory handle that was given them. A bare `resume(session_id)`
+    (no `options`) gets the empty default: that handle can still run turns,
+    just without tools/a custom broker for the duration of this handle.
+    Everything else behaviour needs (profile, tier, system_prompt,
+    output_schema) is read back from the persisted session row on every
+    call, so it stays correct regardless of how the handle was acquired.
     """
 
     id: str
     _client: Tradewind
+    _options: SessionOptions = field(default_factory=lambda: SessionOptions())
 
     async def run(self, prompt: str, **overrides: object) -> TurnResult:
-        raise NotImplementedError("wired in turn runner task")
+        result: TurnResult | None = None
+        async for event in self.stream(prompt, **overrides):
+            if isinstance(event, TurnCompleted):
+                result = event.result
+            elif isinstance(event, TurnFailed):
+                raise TurnExecutionFailed(event.error)
+        if result is None:
+            # Unreachable in practice: TurnRunner.execute always yields one
+            # of the two events above before its stream ends. Fails loud
+            # rather than returning `None` through a `TurnResult`-typed API
+            # if that invariant is ever broken.
+            raise TurnExecutionFailed("turn ended without a result")
+        return result
 
     def stream(self, prompt: str, **overrides: object) -> AsyncIterator[Event]:
-        raise NotImplementedError("wired in turn runner task")
+        return self._client._turn_runner.execute(self.id, self._options, prompt, overrides)
 
     async def stop(self) -> None:
-        raise NotImplementedError("wired in turn runner task")
+        await self._client._stop(self.id)
 
     async def spawn(self, prompt: str, *, tier: TierName | None = None) -> Session:
-        raise NotImplementedError("wired in turn runner task")
+        return await self._client._spawn(self, prompt, tier)
 
 
 class Tradewind:
@@ -132,6 +182,24 @@ class Tradewind:
         self._config = config
         self._store = _resolve_store(config)
         self._store.migrate()
+        self._backends: dict[str, Backend] = {}
+        self._turn_runner = TurnRunner(
+            store=self._store, config=config, resolve_backend=self._resolve_backend
+        )
+
+    def _resolve_backend(self, profile_name: str, profile: Profile) -> Backend:
+        cached = self._backends.get(profile_name)
+        if cached is not None:
+            return cached
+        factory = _backend_factories.get(profile.backend)
+        if factory is None:
+            raise ConfigError(
+                f"no backend factory registered for backend {profile.backend!r}; "
+                "`import tradewind` before constructing Tradewind"
+            )
+        backend = factory(profile)
+        self._backends[profile_name] = backend
+        return backend
 
     async def aclose(self) -> None:
         """No resources to release yet; kept for `__aexit__` symmetry and
@@ -166,7 +234,8 @@ class Tradewind:
         _validate_tier(profile, options.tier)
         row = self._new_row(session_id, options, profile_name=profile_name, profile=profile)
         await anyio.to_thread.run_sync(self._store.create_session, row)
-        return Session(id=session_id, _client=self)
+        await anyio.to_thread.run_sync(self._store.sweep_stale_turns, session_id)
+        return Session(id=session_id, _client=self, _options=options)
 
     async def resume(self, session_id: str, options: SessionOptions | None = None) -> Session:
         _validate_session_id(session_id)
@@ -188,7 +257,12 @@ class Tradewind:
             _validate_tier(profile, options.tier)
             new_snapshot = cast("dict[str, object]", options.snapshot())
             await anyio.to_thread.run_sync(self._store.update_options, session_id, new_snapshot)
-        return Session(id=session_id, _client=self)
+        await anyio.to_thread.run_sync(self._store.sweep_stale_turns, session_id)
+        return Session(
+            id=session_id,
+            _client=self,
+            _options=options if options is not None else SessionOptions(),
+        )
 
     async def ensure(self, session_id: str, options: SessionOptions) -> Session:
         _validate_session_id(session_id)
@@ -196,7 +270,8 @@ class Tradewind:
         _validate_tier(profile, options.tier)
         row = self._new_row(session_id, options, profile_name=profile_name, profile=profile)
         await anyio.to_thread.run_sync(self._store.ensure_session, row)
-        return Session(id=session_id, _client=self)
+        await anyio.to_thread.run_sync(self._store.sweep_stale_turns, session_id)
+        return Session(id=session_id, _client=self, _options=options)
 
     async def fork(self, src_session_id: str, dst_session_id: str) -> Session:
         _validate_session_id(src_session_id)
@@ -224,3 +299,40 @@ class Tradewind:
                 session_id, include_children=include_children, include_raw=include_raw
             )
         )
+
+    async def _stop(self, session_id: str) -> None:
+        row = await anyio.to_thread.run_sync(self._store.get_session, session_id)
+        if row is None:
+            raise SessionNotFound(session_id)
+        _, profile = _resolve_profile(self._config, row.profile)
+        backend = self._resolve_backend(row.profile, profile)
+        await self._turn_runner.request_stop(session_id, backend)
+
+    async def _spawn(self, parent: Session, prompt: str, tier: TierName | None) -> Session:
+        parent_row = await anyio.to_thread.run_sync(self._store.get_session, parent.id)
+        if parent_row is None:
+            raise SessionNotFound(parent.id)
+        _, profile = _resolve_profile(self._config, parent_row.profile)
+        _validate_tier(profile, tier)
+        child_id = str(uuid.uuid4())
+        child_row = SessionRow(
+            session_id=child_id,
+            backend=parent_row.backend,
+            profile=parent_row.profile,
+            options_snapshot=cast("dict[str, object]", parent_row.options_snapshot),
+            parent_session_id=parent.id,
+            spawn_kind="subagent",
+            # Message-level spawn linkage (which assistant tool_use item
+            # triggered this child) has no id to attach yet -- `spawn()`
+            # is a plain method call, not itself driven by a tool call
+            # event -- documented deferral (task-9 brief), not an omission.
+            spawned_by_message_id=None,
+            cwd=parent_row.cwd,
+            system_prompt=parent_row.system_prompt,
+        )
+        await anyio.to_thread.run_sync(self._store.create_session, child_row)
+        await anyio.to_thread.run_sync(self._store.sweep_stale_turns, child_id)
+        child = Session(id=child_id, _client=self, _options=parent._options)
+        overrides: dict[str, object] = {"tier": tier} if tier is not None else {}
+        await child.run(prompt, **overrides)
+        return child
