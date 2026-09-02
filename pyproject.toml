@@ -64,6 +64,19 @@ module = "tradewind.domain.*"
 disallow_any_explicit = false
 disallow_any_expr = false
 
+[[tool.mypy.overrides]]
+# Same root cause as the domain override above, confirmed by minimal
+# repro: any `class Foo(pydantic.BaseModel): ...` subclass — even with
+# zero `Any` anywhere in its own body — trips disallow_any_explicit via
+# mypy's synthesized `__mypy-replace` member (pydantic's stubs mark
+# BaseModel `@dataclass_transform`). config.py's contract (task-6-brief.md)
+# mandates several BaseModel classes plus a `cursor_store: Any` field and a
+# `model_post_init(self, context: Any, /)` override matching pydantic's own
+# signature, so it hits this unconditionally. Narrowed to this module only.
+module = "tradewind.application.config"
+disallow_any_explicit = false
+disallow_any_expr = false
+
 [tool.ruff]
 line-length = 100
 target-version = "py313"
