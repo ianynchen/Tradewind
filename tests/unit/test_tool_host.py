@@ -269,3 +269,194 @@ async def test_non_ref_env_value_passed_through_without_calling_resolver(
 
     assert calls == []
     assert seen_env["PLAIN"] == "literal-value"
+
+
+# --- HTTP transport: mirrors the stdio coverage above (Fix round 1) ---
+#
+# Same rationale as the stdio tests: `_connect`'s http branch calls
+# `create_mcp_http_client(headers=...)` then `streamable_http_client(url,
+# http_client=...)` (both re-exported names on `tool_host`, patched here) to
+# get a `TransportStreams` pair; swapping that pair for an `InMemoryTransport`
+# wired to a real `MCPServer` exercises the same real `mcp.ClientSession`
+# machinery as the stdio tests, just entered through the http branch.
+
+
+class _FakeHttpClient:
+    """Stand-in for `httpx2.AsyncClient`: only needs to be usable as an async
+    context manager (`_connect` enters it via the exit stack) and to carry
+    the `headers` it was constructed with, for assertions."""
+
+    def __init__(self, headers: dict[str, str]) -> None:
+        self.headers = headers
+
+    async def __aenter__(self) -> _FakeHttpClient:
+        return self
+
+    async def __aexit__(self, *_exc_info: object) -> None:
+        return None
+
+
+def _patch_streamable_http_client(
+    monkeypatch: pytest.MonkeyPatch, server: MCPServer
+) -> dict[str, Any]:
+    """Patch both calls `_connect`'s http branch makes, returning a dict that
+    accumulates what each was called with (`headers`, `url`, `http_client`)
+    for assertions."""
+    captured: dict[str, Any] = {}
+
+    def fake_create_mcp_http_client(
+        headers: dict[str, str] | None = None, **_kwargs: object
+    ) -> _FakeHttpClient:
+        captured["headers"] = headers or {}
+        return _FakeHttpClient(headers or {})
+
+    def fake_streamable_http_client(
+        url: str, *, http_client: object = None, **_kwargs: object
+    ) -> AbstractAsyncContextManager[Any]:
+        captured["url"] = url
+        captured["http_client"] = http_client
+        return InMemoryTransport(server)
+
+    monkeypatch.setattr(
+        "tradewind.application.tool_host.create_mcp_http_client", fake_create_mcp_http_client
+    )
+    monkeypatch.setattr(
+        "tradewind.application.tool_host.streamable_http_client", fake_streamable_http_client
+    )
+    return captured
+
+
+def _http_server_def(name: str = "fake-http") -> McpServerDef:
+    return McpServerDef(name=name, transport="http", url="http://fake-mcp.invalid/mcp")
+
+
+async def test_http_tool_round_trip_lists_and_calls_namespaced_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_streamable_http_client(monkeypatch, _fake_mcp_server())
+    host = ToolHost([], [_http_server_def()], _resolve_ref_raises)
+
+    async with host:
+        assert host.schemas() == [
+            {
+                "name": "mcp__fake-http__echo",
+                "description": "Echo `text` back, prefixed.",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {"text": {"title": "Text", "type": "string"}},
+                    "required": ["text"],
+                    "title": "echoArguments",
+                },
+            }
+        ]
+
+        outcome = await host.call("mcp__fake-http__echo", {"text": "hi"})
+
+    assert outcome == ToolOutcome(content="echo:hi", is_error=False)
+
+
+async def test_http_resolve_ref_is_called_for_ref_prefixed_header_and_reaches_http_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def resolve_ref(ref: str) -> str:
+        calls.append(ref)
+        return "super-secret-value"
+
+    server_def = McpServerDef(
+        name="fake-http",
+        transport="http",
+        url="http://fake-mcp.invalid/mcp",
+        headers={"Authorization": "ref:api_key"},
+    )
+    captured = _patch_streamable_http_client(monkeypatch, _fake_mcp_server())
+
+    host = ToolHost([], [server_def], resolve_ref)
+    async with host:
+        pass
+
+    assert calls == ["ref:api_key"]
+    # (c) the resolved header value reaches the http-client constructor.
+    assert captured["headers"] == {"Authorization": "super-secret-value"}
+
+
+async def test_http_resolved_ref_value_never_appears_in_schemas(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def resolve_ref(_ref: str) -> str:
+        return "super-secret-value"
+
+    server_def = McpServerDef(
+        name="fake-http",
+        transport="http",
+        url="http://fake-mcp.invalid/mcp",
+        headers={"Authorization": "ref:api_key"},
+    )
+    _patch_streamable_http_client(monkeypatch, _fake_mcp_server())
+
+    host = ToolHost([], [server_def], resolve_ref)
+    async with host:
+        schemas_repr = repr(host.schemas())
+
+    assert "super-secret-value" not in schemas_repr
+
+
+async def test_http_non_ref_header_value_passed_through_without_calling_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    def resolve_ref(ref: str) -> str:
+        calls.append(ref)
+        return "should-not-be-used"
+
+    server_def = McpServerDef(
+        name="fake-http",
+        transport="http",
+        url="http://fake-mcp.invalid/mcp",
+        headers={"X-Plain": "literal-value"},
+    )
+    captured = _patch_streamable_http_client(monkeypatch, _fake_mcp_server())
+
+    host = ToolHost([], [server_def], resolve_ref)
+    async with host:
+        pass
+
+    assert calls == []
+    assert captured["headers"] == {"X-Plain": "literal-value"}
+
+
+# --- __aenter__ partial-failure cleanup (Fix round 1, Minor) ---
+
+
+async def test_aenter_failure_on_second_server_leaves_host_with_no_mcp_tools(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_stdio_client(monkeypatch, _fake_mcp_server())
+
+    def fake_streamable_http_client_raises(
+        _url: str,
+        *,
+        http_client: object = None,  # noqa: ARG001 -- kept to match the real call's `http_client=` kwarg
+        **_kwargs: object,
+    ) -> AbstractAsyncContextManager[Any]:
+        raise ConnectionError("second server unreachable")
+
+    monkeypatch.setattr(
+        "tradewind.application.tool_host.create_mcp_http_client",
+        lambda headers=None, **_kwargs: _FakeHttpClient(headers or {}),
+    )
+    monkeypatch.setattr(
+        "tradewind.application.tool_host.streamable_http_client",
+        fake_streamable_http_client_raises,
+    )
+
+    host = ToolHost([], [_mcp_server_def("ok"), _http_server_def("broken")], _resolve_ref_raises)
+
+    with pytest.raises(ConnectionError):
+        await host.__aenter__()
+
+    assert host.schemas() == []
+    outcome = await host.call("mcp__ok__echo", {"text": "hi"})
+    assert outcome.is_error is True

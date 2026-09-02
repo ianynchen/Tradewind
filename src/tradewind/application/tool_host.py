@@ -90,6 +90,9 @@ class ToolHost:
         except BaseException:
             await exit_stack.aclose()
             self._exit_stack = None
+            self._sessions.clear()
+            self._mcp_schemas.clear()
+            self._mcp_targets.clear()
             raise
         return self
 
