@@ -10,6 +10,7 @@ requires-python = ">=3.13"
 dependencies = [
     "pydantic>=2.9",
     "anyio>=4",
+    "mcp==2.1.1",
 ]
 
 [dependency-groups]
@@ -75,6 +76,26 @@ disallow_any_expr = false
 # signature, so it hits this unconditionally. Narrowed to this module only.
 module = "tradewind.application.config"
 disallow_any_explicit = false
+disallow_any_expr = false
+
+[[tool.mypy.overrides]]
+# `ToolHost` is the first application-layer code to actually *invoke* two
+# Any-tainted third-party contracts rather than merely store them:
+# (1) domain `Tool.handler: Callable[..., Awaitable[Any]]` (task-2-brief.md
+#     "Known friction" — same root cause as the domain override above;
+#     awaiting it here is unavoidable, ToolHost's whole job is calling it);
+# (2) the `mcp` package's own `SessionMessage.metadata` carries
+#     `ServerMessageMetadata.request_context: Any` by the SDK's own design
+#     ("Typed as Any because the server layer is transport-agnostic",
+#     mcp/shared/message.py), which taints every transport stream tuple
+#     (`TransportStreams`, `stdio_client`/`streamable_http_client`'s return
+#     type) that ToolHost must unpack to open an MCP client session.
+# Confirmed by minimal repro: no rewrite of ToolHost's own code (explicit
+# annotations, `cast()`) suppresses `disallow_any_expr` here, because the
+# flagged sub-expressions are the third-party call/await nodes themselves,
+# not anything this module writes. `disallow_any_explicit` stays on — this
+# module never spells `Any` itself. Narrowed to this module only.
+module = "tradewind.application.tool_host"
 disallow_any_expr = false
 
 [tool.ruff]
