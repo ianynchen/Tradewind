@@ -27,6 +27,7 @@ packages = ["src/tradewind"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+asyncio_mode = "auto"
 markers = [
     "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
 ]
@@ -51,6 +52,16 @@ warn_unused_ignores = true
 warn_return_any = true
 warn_unreachable = true
 strict_equality = true
+
+[[tool.mypy.overrides]]
+# Domain models legitimately carry `dict[str, Any]` fields (tool schemas,
+# MCP passthrough, snapshot output) — pydantic v2 models for these. The
+# repo-wide disallow_any_explicit/disallow_any_expr flags go beyond mypy
+# --strict and can't be satisfied here without contorting the models
+# (see task-2-brief.md "Known friction"). Narrowed to this module only.
+module = "tradewind.domain.*"
+disallow_any_explicit = false
+disallow_any_expr = false
 
 [tool.ruff]
 line-length = 100
@@ -78,6 +89,12 @@ ignore = [
 
 [tool.ruff.lint.isort]
 known-first-party = ["tradewind"]
+
+[tool.ruff.lint.per-file-ignores]
+# Domain error names are a fixed interface every later task consumes verbatim
+# (task-2-brief.md); several are exceptions without an "Error" suffix
+# (SessionExists, SessionNotFound, TurnInProgress, Unsupported, ToolMismatch).
+"src/tradewind/domain/errors.py" = ["N818"]
 
 [tool.importlinter]
 root_package = "tradewind"
