@@ -29,6 +29,7 @@ must stay leaf since it runs inside engine sandboxes), so no cycle results.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import sys
@@ -42,7 +43,7 @@ from types import TracebackType
 from typing import cast
 
 import anyio
-from anyio.abc import SocketListener, SocketStream, TaskGroup
+from anyio.abc import SocketListener, SocketStream
 from anyio.streams.buffered import BufferedByteReceiveStream
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
@@ -99,7 +100,13 @@ class ToolHost:
         self._socket_dir = socket_dir
         self._socket_path: Path | None = None
         self._socket_listener: SocketListener | None = None
-        self._socket_task_group: TaskGroup | None = None
+        self._socket_keeper: asyncio.Task[None] | None = None
+        self._socket_stop: anyio.Event | None = None
+        # Guards `serve_socket`'s create-if-absent section (fix round 1,
+        # Important): without it, two concurrent first callers could both
+        # pass the `self._socket_path is None` check and each start a
+        # listener, leaking one.
+        self._socket_lock = anyio.Lock()
 
     async def __aenter__(self) -> ToolHost:
         exit_stack = AsyncExitStack()
@@ -170,55 +177,128 @@ class ToolHost:
         out-of-process caller) connects to, returning the socket path.
 
         Idempotent: a second call while a socket server is already running
-        returns the existing path without starting another listener. Usable
-        with or without `async with host:` -- it only touches the local
-        `_tools`/`_mcp_targets` registry (via `schemas()`/`call()`), not the
-        MCP client sessions `__aenter__` connects. `stop_socket()` (which
+        returns the existing path without starting another listener; this
+        holds even for concurrent callers racing the first call (`_socket_
+        lock` serializes the create-if-absent section, so only one of them
+        actually starts a listener -- the rest see `_socket_path` already
+        set once they get the lock and return that). Usable with or without
+        `async with host:` -- it only touches the local `_tools`/
+        `_mcp_targets` registry (via `schemas()`/`call()`), not the MCP
+        client sessions `__aenter__` connects. `stop_socket()` (which
         `__aexit__` also calls) stops the server and removes the socket
         file.
+
+        Security: the socket is a bare unix domain socket with no
+        authentication of its own -- anyone who can connect to it can call
+        every tool this `ToolHost` exposes. A directory `serve_socket`
+        creates (no `socket_dir` given, or a `socket_dir` that doesn't yet
+        exist) is always created `0o700` (owner-only), regardless of umask,
+        so the socket inside it is only reachable by the current user. A
+        caller-supplied `socket_dir` that already exists is left exactly as
+        the caller made it -- `serve_socket` does not alter permissions on a
+        directory it did not create; callers are responsible for that dir's
+        own permissions.
         """
-        if self._socket_path is not None:
-            return self._socket_path
-        socket_dir = (
-            self._socket_dir
-            if self._socket_dir is not None
-            else Path(tempfile.mkdtemp(prefix="tradewind-tp-"))
-        )
-        socket_dir.mkdir(parents=True, exist_ok=True)
-        # Short, unique filename: unix socket paths are capped at ~104-108
-        # bytes (`sockaddr_un.sun_path`), and a caller-supplied `socket_dir`
-        # can already be deep (e.g. a system tempdir).
-        socket_path = socket_dir / f"{uuid.uuid4().hex[:8]}.sock"
-        listener = await anyio.create_unix_listener(socket_path)
-        task_group = anyio.create_task_group()
-        await task_group.__aenter__()
-        task_group.start_soon(self._serve_socket_forever, listener)
-        self._socket_listener = listener
-        self._socket_task_group = task_group
-        self._socket_path = socket_path
-        return socket_path
+        already_serving = self._socket_path
+        if already_serving is not None:
+            return already_serving
+        async with self._socket_lock:
+            started_while_waiting = self._socket_path
+            if started_while_waiting is not None:
+                return started_while_waiting
+            if self._socket_dir is not None:
+                socket_dir = self._socket_dir
+                created_by_us = not socket_dir.exists()
+            else:
+                # `tempfile.mkdtemp()` already creates its directory `0o700`.
+                socket_dir = Path(tempfile.mkdtemp(prefix="tradewind-tp-"))
+                created_by_us = True
+            socket_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if created_by_us:
+                # `mkdir`'s `mode` is masked by umask, so force it: a
+                # world/group-readable dir would make the socket inside it
+                # connectable (and every registered tool callable) by any
+                # local user.
+                socket_dir.chmod(0o700)
+            # Short, unique filename: unix socket paths are capped at
+            # ~104-108 bytes (`sockaddr_un.sun_path`), and a caller-supplied
+            # `socket_dir` can already be deep (e.g. a system tempdir).
+            socket_path = socket_dir / f"{uuid.uuid4().hex[:8]}.sock"
+            listener = await anyio.create_unix_listener(socket_path)
+            ready = anyio.Event()
+            stop = anyio.Event()
+            # A plain `asyncio.Task` running `_socket_keeper_run`, not a
+            # `TaskGroup`/`CancelScope` entered directly here, is deliberate:
+            # `stop_socket()` must be callable from a *different* task than
+            # whichever task called `serve_socket()` -- e.g. `__aexit__`
+            # running in a task other than the one that started the socket,
+            # or (fix round 1) N concurrent callers racing this method under
+            # `_socket_lock`, only one of which reaches this line. anyio's
+            # `TaskGroup`/`CancelScope.__aexit__` hard-requires the exiting
+            # task to be the same one that entered it
+            # (`current_task() is not self._host_task` -> `RuntimeError`,
+            # confirmed against `anyio/_backends/_asyncio.py`) -- and even
+            # cancelling that scope from a different task, then leaving it
+            # unexited, corrupts that *caller's own* cancel-scope stack once
+            # the caller task finishes (confirmed empirically: a real
+            # `RuntimeError` from anyio's own per-task scope bookkeeping).
+            # `_socket_keeper_run` sidesteps this by owning its inner
+            # `TaskGroup` entirely itself -- entered and exited by the same
+            # (keeper) task, so no cross-task rule is ever bent -- while
+            # being *reachable* from any task via the plain `asyncio.Task`
+            # wrapping it: `.cancel()`/`await` a bare `asyncio.Task` has no
+            # entering-task restriction. (A bare `asyncio.Task` running
+            # `listener.serve()` *directly*, with no inner `TaskGroup`
+            # wrapping it, was tried and rejected: `anyio`'s own
+            # `UNIXSocketListener.accept()` -- reached via `listener.serve`
+            # -- never wakes from `aclose()` when its enclosing task isn't
+            # one `anyio` created itself, confirmed by a minimal repro. It
+            # works fine once `_serve_socket_forever` is spawned through a
+            # real `TaskGroup.start_soon`, which `_socket_keeper_run` does.)
+            keeper = asyncio.ensure_future(self._socket_keeper_run(listener, ready, stop))
+            await ready.wait()
+            self._socket_listener = listener
+            self._socket_keeper = keeper
+            self._socket_stop = stop
+            self._socket_path = socket_path
+            return socket_path
+
+    async def _socket_keeper_run(
+        self, listener: SocketListener, ready: anyio.Event, stop: anyio.Event
+    ) -> None:
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(self._serve_socket_forever, listener)
+            ready.set()
+            await stop.wait()
+            tg.cancel_scope.cancel()
 
     async def _serve_socket_forever(self, listener: SocketListener) -> None:
         # `listener.aclose()` (from `stop_socket`) unblocks the pending
-        # `accept()` inside `serve()` with `ClosedResourceError` -- expected
-        # shutdown, not a crash.
+        # `accept()` inside `serve()` with `ClosedResourceError`; the
+        # `_socket_keeper_run` cancel scope closing unblocks it with a plain
+        # cancellation instead -- both are expected shutdown, not a crash.
         with contextlib.suppress(anyio.ClosedResourceError):
             await listener.serve(self._handle_socket_connection)
 
     async def stop_socket(self) -> None:
         """Stop the socket server started by `serve_socket` and remove the
-        socket file. A no-op if no socket server is running."""
+        socket file. A no-op if no socket server is running. Safe to call
+        from a different task than the one that called `serve_socket()`
+        (see the comment in `serve_socket` on why the keeper task is a
+        plain `asyncio.Task` running its own self-contained `TaskGroup`)."""
         listener = self._socket_listener
-        task_group = self._socket_task_group
+        keeper = self._socket_keeper
+        stop = self._socket_stop
         socket_path = self._socket_path
-        if listener is None or task_group is None or socket_path is None:
+        if listener is None or keeper is None or stop is None or socket_path is None:
             return
-        task_group.cancel_scope.cancel()
+        stop.set()
         await listener.aclose()
-        await task_group.__aexit__(None, None, None)
+        await keeper  # waits for the keeper's own TaskGroup to fully wind down
         socket_path.unlink(missing_ok=True)
         self._socket_listener = None
-        self._socket_task_group = None
+        self._socket_keeper = None
+        self._socket_stop = None
         self._socket_path = None
 
     async def _handle_socket_connection(self, stream: SocketStream) -> None:
@@ -227,7 +307,17 @@ class ToolHost:
             while True:
                 try:
                     line = await buffered.receive_until(b"\n", protocol.MAX_LINE_BYTES)
-                except (anyio.IncompleteRead, anyio.DelimiterNotFound):
+                except anyio.IncompleteRead:
+                    return
+                except anyio.DelimiterNotFound:
+                    # Oversized line: an error response, not a silent close
+                    # (fix round 1, Minor). The oversized bytes stay stuck at
+                    # the front of `buffered`'s internal buffer with no safe
+                    # resync point, so this connection still ends here -- but
+                    # the caller sees why, and the *server* (other
+                    # connections, and new ones after this) is unaffected.
+                    error = protocol.ErrorResponse(error="line too long")
+                    await stream.send((protocol.encode_response(error) + "\n").encode("utf-8"))
                     return
                 response = await self._handle_socket_line(line)
                 await stream.send((protocol.encode_response(response) + "\n").encode("utf-8"))

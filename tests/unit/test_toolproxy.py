@@ -7,6 +7,7 @@ socket server ToolHost.serve_socket adds to `ToolHost`, and the real
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 from pathlib import Path
@@ -141,6 +142,43 @@ async def test_serve_socket_returns_a_path_and_is_idempotent() -> None:
         await host.stop_socket()
 
 
+async def test_serve_socket_concurrent_first_callers_start_only_one_listener(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fix round 1, Minor: two callers racing the very first `serve_socket()`
+    (before `_socket_path` is set) must not each start their own listener --
+    `_socket_lock` should serialize the create-if-absent section so only one
+    `anyio.create_unix_listener` call happens, and every racing caller gets
+    back the same path."""
+    host = ToolHost([_echo_tool()], [], _resolve_ref_raises)
+    real_create_unix_listener = anyio.create_unix_listener
+    call_count = 0
+
+    async def counting_create_unix_listener(*args: object, **kwargs: object) -> object:
+        nonlocal call_count
+        call_count += 1
+        await anyio.sleep(0.01)  # widen the race window
+        return await real_create_unix_listener(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(anyio, "create_unix_listener", counting_create_unix_listener)
+
+    results: list[Path] = []
+    try:
+        async with anyio.create_task_group() as tg:
+
+            async def _call() -> None:
+                results.append(await host.serve_socket())
+
+            for _ in range(10):
+                tg.start_soon(_call)
+    finally:
+        await host.stop_socket()
+
+    assert call_count == 1
+    assert len(results) == 10
+    assert len(set(results)) == 1
+
+
 async def test_socket_list_lists_registered_tools_in_anthropic_format() -> None:
     host = ToolHost([_echo_tool()], [], _resolve_ref_raises)
     socket_path = await host.serve_socket()
@@ -215,6 +253,41 @@ async def test_socket_malformed_json_line_gets_an_error_response_and_server_stay
         await host.stop_socket()
 
 
+async def test_socket_oversized_line_gets_an_error_response_and_server_stays_up(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fix round 1, Minor: a line longer than `protocol.MAX_LINE_BYTES` must
+    still get an `ErrorResponse` on the wire, not just a silent disconnect.
+    `MAX_LINE_BYTES` is patched down so the test doesn't need to push tens
+    of megabytes over a socket -- both `tool_host.py` and this test read
+    `protocol.MAX_LINE_BYTES` as a live attribute lookup, so patching the
+    one shared module constant covers both sides consistently."""
+    monkeypatch.setattr(protocol, "MAX_LINE_BYTES", 64)
+    host = ToolHost([_echo_tool()], [], _resolve_ref_raises)
+    socket_path = await host.serve_socket()
+    try:
+        stream = await anyio.connect_unix(socket_path)
+        async with stream:
+            # No trailing `\n`: if it were appended here, a single local
+            # `receive()` can return the whole write (delimiter included)
+            # in one shot, and `receive_until` checks for the delimiter
+            # *before* checking the length cap -- so the line would be
+            # read successfully instead of tripping `DelimiterNotFound`.
+            # Withholding the delimiter forces the length cap to fire.
+            oversized = b"x" * 200
+            await stream.send(oversized)
+            buffered = BufferedByteReceiveStream(stream)
+            line = await buffered.receive_until(b"\n", 1024)
+            response = protocol.decode_response(line.decode("utf-8"))
+            assert response == protocol.ErrorResponse(error="line too long")
+
+        # The server itself is unaffected: a fresh connection still works.
+        follow_up = await _socket_call(socket_path, protocol.ListRequest())
+        assert isinstance(follow_up, protocol.ListResponse)
+    finally:
+        await host.stop_socket()
+
+
 async def test_socket_handles_concurrent_connections() -> None:
     host = ToolHost([_echo_tool()], [], _resolve_ref_raises)
     socket_path = await host.serve_socket()
@@ -270,6 +343,56 @@ async def test_serve_socket_uses_configured_socket_dir() -> None:
     socket_path = await host.serve_socket()
     try:
         assert socket_path.parent == socket_dir
+    finally:
+        await host.stop_socket()
+
+
+# --- serve_socket socket-dir permissions (fix round 1, Important) ---
+
+
+async def test_serve_socket_default_dir_is_mode_0o700() -> None:
+    """No `socket_dir` given: `tempfile.mkdtemp()` creates it, which is
+    already owner-only -- confirm `serve_socket` doesn't loosen that."""
+    host = ToolHost([_echo_tool()], [], _resolve_ref_raises)
+
+    socket_path = await host.serve_socket()
+    try:
+        assert (socket_path.parent.stat().st_mode & 0o777) == 0o700
+    finally:
+        await host.stop_socket()
+
+
+async def test_serve_socket_creates_missing_caller_dir_as_mode_0o700_regardless_of_umask() -> None:
+    """A caller-supplied `socket_dir` that doesn't exist yet must still end
+    up owner-only -- forced past a permissive umask, not just whatever
+    `mkdir`'s masked `mode` happens to leave behind."""
+    parent = Path(tempfile.mkdtemp(prefix="tw-parent-"))
+    socket_dir = parent / "sockets"
+    assert not socket_dir.exists()
+    host = ToolHost([_echo_tool()], [], _resolve_ref_raises, socket_dir=socket_dir)
+
+    old_umask = os.umask(0o022)  # permissive: proves 0o700 isn't just luck
+    try:
+        await host.serve_socket()
+    finally:
+        os.umask(old_umask)
+    try:
+        assert (socket_dir.stat().st_mode & 0o777) == 0o700
+    finally:
+        await host.stop_socket()
+
+
+async def test_serve_socket_does_not_touch_permissions_of_a_preexisting_caller_dir() -> None:
+    """A caller-supplied `socket_dir` that already exists keeps whatever
+    permissions the caller gave it -- `serve_socket` only forces `0o700` on
+    a directory it creates itself."""
+    socket_dir = Path(tempfile.mkdtemp(prefix="tw-existing-"))
+    socket_dir.chmod(0o755)
+    host = ToolHost([_echo_tool()], [], _resolve_ref_raises, socket_dir=socket_dir)
+
+    await host.serve_socket()
+    try:
+        assert (socket_dir.stat().st_mode & 0o777) == 0o755
     finally:
         await host.stop_socket()
 
