@@ -66,7 +66,7 @@ def _ctx(model_spec: ModelSpec, *, prompt: str) -> TurnContext:
     reason="requires a real ANTHROPIC_API_KEY (deferred, none available yet)",
 )
 async def test_run_against_real_anthropic_api_completes_with_final_text() -> None:
-    model_spec = ModelSpec(model="claude-3-5-haiku-20241022")
+    model_spec = ModelSpec(model="claude-haiku-4-5")
     profile = Profile(
         backend="langchain",
         auth=ApiKeyAuth(api_key=os.environ["ANTHROPIC_API_KEY"]),
