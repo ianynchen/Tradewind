@@ -1,12 +1,14 @@
 """SQLite adapter for `SessionStorePort` (ARCHITECTURE §4: session schema).
 
 Full schema (sessions/turns/messages, all indexes) lands in migration v1
-so `PRAGMA user_version = 1` denotes a complete store; `turns`/`messages`
-intent verbs land in later tasks (this task implements the session verbs
-only). One `sqlite3.Connection` is shared (`check_same_thread=False`) and
-every method serializes through a single `threading.Lock` so compound
-read-then-write sequences (e.g. `ensure_session`, `rehome_native`) stay
-atomic under concurrent callers.
+so `PRAGMA user_version = 1` denotes a complete store. Session verbs
+(`create_session`, `ensure_session`, `update_options`, `rehome_native`)
+and turn/message verbs (`begin_turn`, `append_message`, `finalize_turn`,
+`sweep_stale_turns`) both live here. One `sqlite3.Connection` is shared
+(`check_same_thread=False`) and every method serializes through a single
+`threading.Lock` so compound read-then-write sequences (e.g.
+`ensure_session`, `rehome_native`, `begin_turn`) stay atomic under
+concurrent callers.
 """
 
 from __future__ import annotations
@@ -19,8 +21,14 @@ from pathlib import Path
 from typing import cast
 
 from tradewind.application.ports import SessionStorePort
-from tradewind.domain.errors import SessionExists, SessionNotFound
-from tradewind.domain.models import BackendName, SessionRow, SpawnKind
+from tradewind.domain.errors import SessionExists, SessionNotFound, TurnInProgress
+from tradewind.domain.models import (
+    BackendName,
+    NormalizedMessage,
+    SessionRow,
+    SpawnKind,
+    TurnStatus,
+)
 
 _SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS sessions (
@@ -223,3 +231,112 @@ class SqliteSessionStore(SessionStorePort):
                 (backend, native_session_id, json.dumps(history), _now_iso(), session_id),
             )
             self._conn.commit()
+
+    def begin_turn(self, session_id: str, turn_id: str, native_turn_id: str | None) -> None:
+        with self._lock:
+            if self._select_session_row(session_id) is None:
+                raise SessionNotFound(session_id)
+            cur = self._conn.execute(
+                "SELECT 1 FROM turns WHERE session_id = ? AND status = 'in_progress' LIMIT 1",
+                (session_id,),
+            )
+            in_progress_row = cast("tuple[object, ...] | None", cur.fetchone())
+            if in_progress_row is not None:
+                raise TurnInProgress(session_id)
+            cur = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM turns WHERE session_id = ?",
+                (session_id,),
+            )
+            max_seq_row = cast("tuple[object, ...]", cur.fetchone())
+            seq = cast(int, max_seq_row[0]) + 1
+            self._conn.execute(
+                "INSERT INTO turns (turn_id, session_id, native_turn_id, seq, status, started_at) "
+                "VALUES (?, ?, ?, ?, 'in_progress', ?)",
+                (turn_id, session_id, native_turn_id, seq, _now_iso()),
+            )
+            self._conn.commit()
+
+    def append_message(self, session_id: str, turn_id: str | None, msg: NormalizedMessage) -> int:
+        with self._lock:
+            if turn_id is not None:
+                cur = self._conn.execute(
+                    "SELECT session_id FROM turns WHERE turn_id = ?", (turn_id,)
+                )
+                owner_row = cast("tuple[object, ...] | None", cur.fetchone())
+                if owner_row is not None and owner_row[0] != session_id:
+                    raise ValueError(
+                        f"turn {turn_id!r} belongs to session {owner_row[0]!r}, not {session_id!r}"
+                    )
+            cur = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE session_id = ?",
+                (session_id,),
+            )
+            max_seq_row = cast("tuple[object, ...]", cur.fetchone())
+            seq = cast(int, max_seq_row[0]) + 1
+            content = cast("dict[str, object]", msg.content)
+            raw = cast("dict[str, object] | None", msg.raw)
+            self._conn.execute(
+                "INSERT INTO messages (session_id, turn_id, seq, role, kind, content_json, "
+                "native_id, parent_native_id, agent_path, model, created_at, raw_json) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    turn_id,
+                    seq,
+                    msg.role,
+                    msg.kind,
+                    json.dumps(content),
+                    msg.native_id,
+                    msg.parent_native_id,
+                    msg.agent_path,
+                    msg.model,
+                    _now_iso(),
+                    json.dumps(raw) if raw is not None else None,
+                ),
+            )
+            self._conn.commit()
+            return seq
+
+    def finalize_turn(
+        self,
+        turn_id: str,
+        *,
+        status: TurnStatus,
+        final_text: str | None,
+        usage: dict[str, object] | None,
+        cost_usd: float | None,
+        error: str | None,
+    ) -> None:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE turns SET status = ?, final_text = ?, usage_json = ?, cost_usd = ?, "
+                "completed_at = ?, error_json = ? WHERE turn_id = ?",
+                (
+                    status,
+                    final_text,
+                    json.dumps(usage) if usage is not None else None,
+                    cost_usd,
+                    _now_iso(),
+                    json.dumps(error) if error is not None else None,
+                    turn_id,
+                ),
+            )
+            if cur.rowcount == 0:
+                self._conn.rollback()
+                raise ValueError(f"unknown turn_id: {turn_id!r}")
+            self._conn.commit()
+
+    def sweep_stale_turns(self, session_id: str) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                "UPDATE turns SET status = 'failed', completed_at = ?, error_json = ? "
+                "WHERE session_id = ? AND status = 'in_progress'",
+                (
+                    _now_iso(),
+                    json.dumps("swept: turn was in_progress at store startup"),
+                    session_id,
+                ),
+            )
+            count = cur.rowcount
+            self._conn.commit()
+            return count
