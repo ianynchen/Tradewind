@@ -5,13 +5,14 @@ Layering note (controller ruling): the application layer may not import
 adapters (import-linter `layers` contract; GUIDELINES §8 "dependencies
 flow inward"), but `StoreConfig.sqlite_path` needs a concrete
 `SessionStorePort` built from it. Rather than construct one here, this
-module exposes `set_default_store_factory` — a narrow, documented seam of
-module-level mutable state (GUIDELINES §8 permits mutation "as a
-deliberate choice with a stated reason") that the top-level `tradewind`
-package (outside the layers contract) populates at import time with a
-factory that builds `SqliteSessionStore`. `Tradewind.__init__` stays a
-single-argument constructor exactly as specified, with no knowledge of
-which adapter module backs it.
+module exposes `_set_default_store_factory` — a module-private, constant
+import-time seam (GUIDELINES §8 permits mutation "as a deliberate choice
+with a stated reason") assigned exactly once, at import time, by the
+top-level `tradewind` package (outside the layers contract) with a
+factory that builds `SqliteSessionStore`. It is not per-instance state:
+every `Tradewind` built from a `sqlite_path` in a process shares the same
+factory, and `Tradewind.__init__` stays a single-argument constructor
+exactly as specified, with no knowledge of which adapter module backs it.
 
 `run`/`stream`/`stop`/`spawn` raise `NotImplementedError`: the turn runner
 lands in a later task (task-6 brief, Step 3-5 note).
@@ -46,12 +47,16 @@ StoreFactory = Callable[[Path], SessionStorePort]
 _default_store_factory: StoreFactory | None = None
 
 
-def set_default_store_factory(factory: StoreFactory) -> None:
-    """Register the `SessionStorePort` constructor used when
-    `StoreConfig.sqlite_path` is given instead of `StoreConfig.store`.
+def _set_default_store_factory(factory: StoreFactory) -> None:
+    """Assign the constant, import-time `SessionStorePort` constructor used
+    when `StoreConfig.sqlite_path` is given instead of `StoreConfig.store`.
 
-    Called once by the top-level `tradewind` package at import time; see
-    the module docstring for why this indirection exists.
+    Module-private: not part of the public API, and callers never invoke
+    this directly. It is assigned exactly once, by `tradewind/__init__.py`
+    at package import time — it is a layering seam (see the module
+    docstring), not per-instance or per-call configuration. Every
+    `Tradewind` in the process that resolves a store from a `sqlite_path`
+    shares this one factory.
     """
     global _default_store_factory
     _default_store_factory = factory
@@ -67,7 +72,7 @@ def _resolve_store(config: TradewindConfig) -> SessionStorePort:
         raise ConfigError("StoreConfig has neither sqlite_path nor store set")
     if _default_store_factory is None:
         raise ConfigError(
-            "no sqlite store factory registered; `import tradewind` (not just "
+            "no sqlite store factory assigned; `import tradewind` (not just "
             "`tradewind.application.client`) before constructing Tradewind from a sqlite_path"
         )
     return _default_store_factory(sqlite_path)
@@ -213,6 +218,7 @@ class Tradewind:
     async def history(
         self, session_id: str, *, include_children: bool = False, include_raw: bool = False
     ) -> list[StoredMessage]:
+        _validate_session_id(session_id)
         return await anyio.to_thread.run_sync(
             lambda: self._store.history(
                 session_id, include_children=include_children, include_raw=include_raw

@@ -13,6 +13,7 @@ from pydantic import SecretStr
 from tradewind.adapters.sqlite_store import SqliteSessionStore
 from tradewind.application.client import Session, Tradewind
 from tradewind.application.config import StoreConfig, TradewindConfig
+from tradewind.application.ports import SessionStorePort
 from tradewind.domain.errors import ConfigError, SessionExists, SessionNotFound, ToolMismatch
 from tradewind.domain.models import ApiKeyAuth, ModelSpec, Profile, SessionOptions, Tool
 
@@ -38,6 +39,72 @@ def _config(tmp_path: Path, name: str = "sessions.db") -> TradewindConfig:
 
 async def _handler(**_: object) -> dict[str, object]:
     return {"ok": True}
+
+
+class _SpyStore(SessionStorePort):
+    """Minimal `SessionStorePort` stub that records `history()` calls; every
+    other verb is unused by the history() passthrough test and raises if
+    ever called."""
+
+    def __init__(self) -> None:
+        self.history_calls: list[dict[str, object]] = []
+
+    def migrate(self):
+        pass
+
+    def create_session(self, row):
+        raise NotImplementedError
+
+    def get_session(self, session_id):
+        raise NotImplementedError
+
+    def ensure_session(self, row):
+        raise NotImplementedError
+
+    def update_options(self, session_id, snapshot):
+        raise NotImplementedError
+
+    def rehome_native(self, session_id, backend, native_session_id):
+        raise NotImplementedError
+
+    def begin_turn(self, session_id, turn_id, native_turn_id):
+        raise NotImplementedError
+
+    def append_message(self, session_id, turn_id, msg):
+        raise NotImplementedError
+
+    def finalize_turn(self, turn_id, *, status, final_text, usage, cost_usd, error):
+        raise NotImplementedError
+
+    def sweep_stale_turns(self, session_id):
+        raise NotImplementedError
+
+    def history(
+        self,
+        session_id,
+        *,
+        include_children=False,
+        include_raw=False,
+        after_seq=None,  # noqa: ARG002 -- SessionStorePort.history() signature
+        limit=None,  # noqa: ARG002 -- SessionStorePort.history() signature
+    ):
+        self.history_calls.append(
+            {
+                "session_id": session_id,
+                "include_children": include_children,
+                "include_raw": include_raw,
+            }
+        )
+        return []
+
+    def copy_history(self, src_session_id, dst_row, up_to_seq=None):
+        raise NotImplementedError
+
+    def import_native_items(self, session_id, turn_id, items):
+        raise NotImplementedError
+
+    def last_native_id(self, session_id):
+        raise NotImplementedError
 
 
 def _tool(name: str = "search") -> Tool:
@@ -111,7 +178,9 @@ async def test_resume_with_mismatched_tool_names_raises_tool_mismatch(tmp_path: 
         await tw.resume(_VALID_ID_A, SessionOptions(tools=[_tool("other")]))
 
 
-async def test_resume_with_matching_tool_names_rebinds_handlers(tmp_path: Path) -> None:
+async def test_resume_with_matching_tool_names_does_not_raise(tmp_path: Path) -> None:
+    # Only tool-name equivalence is asserted here; actually rebinding live
+    # handlers onto a resumed session is Task 9's scope (turn runner).
     tw = Tradewind(_config(tmp_path))
     await tw.create(_VALID_ID_A, SessionOptions(tools=[_tool("search")]))
 
@@ -195,3 +264,49 @@ def test_stream_raises_not_implemented(tmp_path: Path) -> None:
     session = Session(id=_VALID_ID_A, _client=tw)
     with pytest.raises(NotImplementedError):
         session.stream("hello")
+
+
+# --- history: id validation, unknown session, kwarg passthrough (fix round 1) ---
+
+
+async def test_history_with_non_uuid_id_raises_value_error(tmp_path: Path) -> None:
+    tw = Tradewind(_config(tmp_path))
+    with pytest.raises(ValueError):
+        await tw.history("not-a-uuid")
+
+
+async def test_history_of_unknown_session_returns_empty_list(tmp_path: Path) -> None:
+    tw = Tradewind(_config(tmp_path))
+    assert await tw.history(_VALID_ID_A) == []
+
+
+async def test_history_passes_include_children_and_include_raw_through_to_store() -> None:
+    spy = _SpyStore()
+    config = TradewindConfig(
+        profiles={"default": _profile()},
+        default_profile="default",
+        store=StoreConfig(store=spy),
+    )
+    tw = Tradewind(config)
+
+    await tw.history(_VALID_ID_A, include_children=True, include_raw=True)
+
+    assert spy.history_calls == [
+        {"session_id": _VALID_ID_A, "include_children": True, "include_raw": True}
+    ]
+
+
+async def test_history_defaults_include_children_and_include_raw_to_false() -> None:
+    spy = _SpyStore()
+    config = TradewindConfig(
+        profiles={"default": _profile()},
+        default_profile="default",
+        store=StoreConfig(store=spy),
+    )
+    tw = Tradewind(config)
+
+    await tw.history(_VALID_ID_A)
+
+    assert spy.history_calls == [
+        {"session_id": _VALID_ID_A, "include_children": False, "include_raw": False}
+    ]

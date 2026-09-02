@@ -5,9 +5,10 @@ sub-models, and `Session`. This module sits outside the import-linter
 `layers` contract (which only covers `tradewind.adapters` /
 `tradewind.application` / `tradewind.domain`), so — unlike
 `tradewind.application.client` — it may import the adapter that backs
-`StoreConfig.sqlite_path` and hand the application layer a factory for it
-(see `tradewind.application.client` module docstring for the full
-rationale).
+`StoreConfig.sqlite_path` and, exactly once at import time, assign the
+application layer's private store-factory seam
+(`client._set_default_store_factory`) to build it (see
+`tradewind.application.client` module docstring for the full rationale).
 """
 
 from pathlib import Path
@@ -32,7 +33,7 @@ def _build_default_store(path: Path) -> SessionStorePort:
     return SqliteSessionStore(path)
 
 
-_client.set_default_store_factory(_build_default_store)
+_client._set_default_store_factory(_build_default_store)
 
 __all__ = [
     "EventHook",

@@ -68,7 +68,7 @@ Decisions:
 | Decision | Choice | Why |
 |---|---|---|
 | Config transport | one object, constructor-injected | Library rule (NFR-5): host owns acquisition; Tradewind owns validation. No `tradewind.toml`, no env reads, no singletons. |
-| Multiple instances | supported | Two `Tradewind(config)` instances with different stores/profiles may coexist in one process (tests, migrations). No module-level state permits otherwise. |
+| Multiple instances | supported | Two `Tradewind(config)` instances with different stores/profiles may coexist in one process (tests, migrations). No per-instance module-level state; a constant import-time store-factory seam (set once by the package root for layering) is permitted. |
 | Secrets | `SecretStr` / provider callable | Keys never repr into logs; callable supports rotation without reconstructing the client. |
 | Backend-specific knobs | `Profile.backend_options` passthrough | Keeps `TradewindConfig` backend-agnostic; the adapter validates its own dict at startup, not at first turn. |
 | Observability | `on_event` tap | Host logging/metrics without subclassing; the tap observes the normalized stream and cannot alter it. |
