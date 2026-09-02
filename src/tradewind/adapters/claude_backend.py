@@ -459,13 +459,33 @@ class ClaudeBackend(Backend):
     def __init__(self, profile: Profile, native_config: NativeStoreConfig) -> None:
         super().__init__(profile, native_config)
         self._clients: dict[str, ClaudeSDKClient] = {}
-        # Set during `run()`'s `ResultMessage` handling (task-10 brief's
-        # literal ruling: a single instance attribute, not a per-session
-        # map). Concurrent turns on different sessions racing this one
-        # attribute -- and wiring it into `SessionStorePort.rehome_native` at
-        # all -- is Task 11's reconcile concern, not this adapter's; see the
-        # task-10 report.
-        self.last_native_session_id: str | None = None
+        # Keyed by tradewind session_id, mirroring `_clients` (task-11
+        # review, fix round 1): one `ClaudeBackend` instance is cached and
+        # reused across every session on its profile
+        # (`Tradewind._resolve_backend`), so the earlier single shared
+        # attribute let one session's native id rehome ANOTHER session
+        # sharing the profile -- e.g. session A completes
+        # (`last_native_session_id = "native-A"`), session B's turn fails
+        # before its own `ResultMessage` ever arrives, and `TurnRunner`
+        # would read the stale "native-A" value and rehome B onto A's
+        # transcript. Per-session scoping is deliberate; see
+        # `take_native_session_id`'s docstring for why it also pops rather
+        # than just reads.
+        self._native_ids: dict[str, str] = {}
+
+    def take_native_session_id(self, session_id: str) -> str | None:
+        """Pop and return the native session id `session_id`'s most recent
+        turn recorded (its `ResultMessage.session_id`, set in
+        `_drive_client`), or None if no turn has recorded one since the
+        last call.
+
+        Popping -- not just reading -- means a value can never be attributed
+        to more than one turn: once `TurnRunner` consumes it for the turn
+        that produced it, a later turn (on this or, before this fix, even
+        another session) that didn't itself get a `ResultMessage` reads
+        None rather than that stale value.
+        """
+        return self._native_ids.pop(session_id, None)
 
     def capabilities(self) -> Capabilities:
         # Exactly the table in the task-10 brief. `supports_structured_
@@ -598,7 +618,7 @@ class ClaudeBackend(Backend):
                 for item in user_message_items(message):
                     yield ItemCompleted(message=item)
             elif isinstance(message, ResultMessage):
-                self.last_native_session_id = message.session_id
+                self._native_ids[ctx.session.session_id] = message.session_id
                 if is_aborted_result(message):
                     # `Backend.run`'s contract (ports.py): an interrupted
                     # turn ends with neither `TurnCompleted` nor

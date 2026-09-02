@@ -305,19 +305,35 @@ class TurnRunner:
                     self._tap(synthesized, turn_id)
                     yield synthesized
 
-                # Native-id rehome (task-11 brief): a backend that exposes
-                # `last_native_session_id` (claude; not part of the `Backend`
-                # ABC -- `getattr` default handles every backend that
-                # doesn't) records the native id its own SDK actually used
-                # for this turn as soon as it has one, regardless of how the
-                # turn ended (completed/failed/interrupted -- see
+                # Native-id rehome (task-11 brief; scoped per-session, fix
+                # round 1 post-review): a backend that exposes
+                # `take_native_session_id` (claude; not part of the
+                # `Backend` ABC -- `getattr` default handles every backend
+                # that doesn't) records, per tradewind session_id, the
+                # native id its own SDK actually used for this turn as soon
+                # as it has one, regardless of how the turn ended
+                # (completed/failed/interrupted -- see
                 # `ClaudeBackend._drive_client`'s `ResultMessage` handling).
-                # When that differs from what the session row already has
-                # (first native turn, or the CLI minted a new native id on
-                # this resume), re-home the row so the next turn's
-                # `reconcile()`/`resume=` both target the current one.
-                new_native_session_id = cast(
-                    "str | None", getattr(backend, "last_native_session_id", None)
+                # `take_native_session_id` POPS that entry -- a backend
+                # instance is cached and reused across every session on its
+                # profile (`Tradewind._resolve_backend`), so a value must
+                # never be read by more than the one turn that produced it
+                # (fix round 1: a shared, un-scoped attribute let one
+                # session's native id rehome a DIFFERENT session sharing the
+                # same profile when that other session's turn ended without
+                # ever recording its own). When the popped value differs
+                # from what the session row already has (first native turn,
+                # or the CLI minted a new native id on this resume),
+                # re-home the row so the next turn's `reconcile()`/`resume=`
+                # both target the current one.
+                take_native_session_id = cast(
+                    "Callable[[str], str | None] | None",
+                    getattr(backend, "take_native_session_id", None),
+                )
+                new_native_session_id = (
+                    take_native_session_id(session_id)
+                    if take_native_session_id is not None
+                    else None
                 )
                 if new_native_session_id is not None and (
                     new_native_session_id != session_row.native_session_id

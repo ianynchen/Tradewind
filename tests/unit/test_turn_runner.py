@@ -39,6 +39,7 @@ from tradewind.domain.events import (
     Event,
     ItemCompleted,
     TurnCompleted,
+    TurnFailed,
     TurnStarted,
 )
 from tradewind.domain.models import (
@@ -496,24 +497,42 @@ async def test_execute_skips_reconcile_when_session_has_no_native_session_id(
 
 
 # --- (6) native-id rehome: TurnRunner re-homes the session row when a
-# backend's `last_native_session_id` differs from what's stored (task-11
-# brief) ---
+# backend's `take_native_session_id(session_id)` differs from what's stored
+# (task-11 brief; scoped per-session, task-11 review fix round 1) ---
 
 
 class _RehomingBackend(Backend):
-    """Sets `last_native_session_id` (an attribute outside the `Backend`
-    ABC -- `ClaudeBackend`'s own literal shape, task-10 brief) partway
-    through the turn, mirroring `ClaudeBackend._drive_client`'s
-    `ResultMessage` handling."""
+    """Mirrors `ClaudeBackend`'s own fix (task-11 review, fix round 1): a
+    per-session_id `_native_ids` dict plus a popping
+    `take_native_session_id`, NOT a single shared attribute -- so a test can
+    drive multiple tradewind sessions through ONE backend instance (exactly
+    how `Tradewind._resolve_backend` caches a backend per *profile*, not per
+    session) and prove they don't cross-contaminate each other's rehome.
+
+    `script_result(session_id, native_session_id)` arranges for that
+    session's next `run()` to record a native id, mirroring
+    `ClaudeBackend._drive_client`'s `ResultMessage` handling.
+    `script_failure(session_id)` arranges for that session's next `run()` to
+    fail *before* ever recording one -- mirroring a turn that errors before
+    its `ResultMessage` arrives (the reviewer's own failure scenario).
+    """
 
     name: ClassVar[BackendName] = "claude"
 
-    def __init__(
-        self, profile: Profile, native_config: NativeStoreConfig, new_native_session_id: str
-    ) -> None:
+    def __init__(self, profile: Profile, native_config: NativeStoreConfig) -> None:
         super().__init__(profile, native_config)
-        self.last_native_session_id: str | None = None
-        self._new_native_session_id = new_native_session_id
+        self._native_ids: dict[str, str] = {}
+        self._scripted_results: dict[str, str] = {}
+        self._scripted_failures: set[str] = set()
+
+    def script_result(self, session_id: str, native_session_id: str) -> None:
+        self._scripted_results[session_id] = native_session_id
+
+    def script_failure(self, session_id: str) -> None:
+        self._scripted_failures.add(session_id)
+
+    def take_native_session_id(self, session_id: str) -> str | None:
+        return self._native_ids.pop(session_id, None)
 
     def capabilities(self) -> Capabilities:
         return Capabilities(
@@ -528,7 +547,13 @@ class _RehomingBackend(Backend):
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
         yield TurnStarted(turn_id=ctx.turn_id)
-        self.last_native_session_id = self._new_native_session_id
+        session_id = ctx.session.session_id
+        if session_id in self._scripted_failures:
+            yield TurnFailed(turn_id=ctx.turn_id, error="boom before any ResultMessage")
+            return
+        native_session_id = self._scripted_results.get(session_id)
+        if native_session_id is not None:
+            self._native_ids[session_id] = native_session_id
         yield _completed("done")
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -550,7 +575,9 @@ async def test_execute_rehomes_native_session_id_when_backend_reports_a_new_one(
 ) -> None:
     profile = _profile(backend="claude")
     tw = Tradewind(_config(tmp_path, profile))
-    tw._backends["default"] = _RehomingBackend(profile, NativeStoreConfig(), "native-new")
+    fake = _RehomingBackend(profile, NativeStoreConfig())
+    fake.script_result(_VALID_ID, "native-new")
+    tw._backends["default"] = fake
     session = await tw.create(_VALID_ID, SessionOptions())
 
     result = await session.run("hi")
@@ -571,7 +598,9 @@ async def test_execute_does_not_rehome_when_backend_reports_the_same_native_sess
 ) -> None:
     profile = _profile(backend="claude")
     tw = Tradewind(_config(tmp_path, profile))
-    tw._backends["default"] = _RehomingBackend(profile, NativeStoreConfig(), "native-same")
+    fake = _RehomingBackend(profile, NativeStoreConfig())
+    fake.script_result(_VALID_ID, "native-same")
+    tw._backends["default"] = fake
     session = await tw.create(_VALID_ID, SessionOptions())
     await anyio.to_thread.run_sync(tw._store.rehome_native, _VALID_ID, "claude", "native-same")
 
@@ -582,6 +611,56 @@ async def test_execute_does_not_rehome_when_backend_reports_the_same_native_sess
     # Still just the one rehome from setup above -- execute() must not have
     # appended a second, no-op entry when the backend's id already matched.
     assert row.native_history == [{"backend": "claude", "native_session_id": None}]
+
+
+async def test_execute_scopes_rehome_per_session_on_one_shared_backend_instance(
+    tmp_path: Path,
+) -> None:
+    # The reviewer's own failure scenario (task-11 review, fix round 1):
+    # session A completes and records a native id; session B is fresh, on
+    # the SAME cached backend instance (`Tradewind._resolve_backend` caches
+    # one backend per *profile*, shared across every session on it), and
+    # B's turn fails before it ever gets its own `ResultMessage`. B must NOT
+    # be rehomed onto A's native id -- confirming the earlier bug (a single
+    # shared `last_native_session_id` attribute) is gone.
+    #
+    # B is driven via `session.stream()` fully drained, not `session.run()`:
+    # `Session.run()` raises `TurnExecutionFailed` the instant it sees the
+    # `TurnFailed` event (client.py) and never resumes `execute()`'s
+    # generator again, so the code after the event loop -- including the
+    # rehome check this test exists to exercise -- would only run later, on
+    # whatever schedule the abandoned async generator happens to get
+    # garbage-collected and `aclose()`d on. Draining `stream()` directly
+    # lets `execute()` run to its own natural end deterministically, so this
+    # test actually exercises the rehome code path for B's failure, not just
+    # its (trivially true either way) end state.
+    profile = _profile(backend="claude")
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _RehomingBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = fake
+
+    session_a_id = "44444444-4444-4444-4444-444444444444"
+    session_b_id = "55555555-5555-5555-5555-555555555555"
+    session_a = await tw.create(session_a_id, SessionOptions())
+    session_b = await tw.create(session_b_id, SessionOptions())
+
+    fake.script_result(session_a_id, "native-a")
+    fake.script_failure(session_b_id)
+
+    result_a = await session_a.run("hi")
+    events_b = [event async for event in session_b.stream("hi")]
+
+    assert any(isinstance(e, TurnFailed) for e in events_b)
+    row_a = await anyio.to_thread.run_sync(tw._store.get_session, session_a_id)
+    row_b = await anyio.to_thread.run_sync(tw._store.get_session, session_b_id)
+    assert row_a is not None
+    assert row_b is not None
+    assert result_a.status == "completed"
+    assert row_a.native_session_id == "native-a"
+    # The bug this test guards against: B's row must stay unrehomed --
+    # NOT "native-a" -- even though it shares a backend instance with A.
+    assert row_b.native_session_id is None
+    assert row_b.native_history == []
 
 
 def _turn_statuses(store: object, session_id: str) -> list[str]:
