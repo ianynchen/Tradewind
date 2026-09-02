@@ -334,8 +334,9 @@ already mirrored stays.
 - ~~**P-1** Exact unified event taxonomy (working set: FR-7.1) — finalize against
   the first two adapters implemented, not on paper.~~ **RESOLVED (task 11)**:
   see §3.2 "Event taxonomy (frozen)".
-- **P-2** Broker mapping for Codex approval events (OQ-2) — spike before the Codex
-  adapter is declared done.
+- ~~**P-2** Broker mapping for Codex approval events (OQ-2) — spike before the
+  Codex adapter is declared done.~~ **RESOLVED (task 13)**: see
+  `docs/research/2026-09-02-codex-approvals-spike.md`.
 - **P-3** `spawn_agent` tool scheduling/limits (OQ-3, FR-9.2) — after first
   meridian embedding.
 - **P-4** Postgres store adapter timing — when meridian centralizes storage.
