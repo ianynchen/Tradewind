@@ -82,35 +82,45 @@ replacing a backend touches only `adapters/` plus the profile registry.
 class Backend(ABC):
     """One adapter per provider. Constructed by the profile registry."""
 
-    name: BackendName                      # 'claude' | 'codex' | 'cursor' | 'langchain'
+    name: BackendName  # 'claude' | 'codex' | 'cursor' | 'langchain'
 
     @abstractmethod
-    def capabilities(self) -> Capabilities: ...
+    def capabilities(self) -> Capabilities:
+        ...
         # supports_system_prompt, supports_structured_output,
         # supports_interactive_permissions, supports_in_process_tools,
         # supports_native_resume, supports_fork, supports_transcript_read (FR-8)
 
     @abstractmethod
     async def run(
-        self, session: SessionHandle, prompt: Prompt, options: TurnOptions,
-        tools: ToolHost, broker: PermissionBroker,
-    ) -> AsyncIterator[Event]: ...
+        self,
+        session: SessionHandle,
+        prompt: Prompt,
+        options: TurnOptions,
+        tools: ToolHost,
+        broker: PermissionBroker,
+    ) -> AsyncIterator[Event]:
+        ...
         # one call = one turn; yields normalized events (FR-7); the engine may
         # make many model requests underneath
 
     @abstractmethod
-    async def probe_native(self, session: SessionHandle) -> bool: ...
+    async def probe_native(self, session: SessionHandle) -> bool:
+        ...
         # can this session's native id still be resumed? (Resume Planner, §5.2)
 
     @abstractmethod
     async def read_native_transcript(
-        self, session: SessionHandle, after_native_id: str | None,
-    ) -> list[NativeItem]: ...
+        self,
+        session: SessionHandle,
+        after_native_id: str | None,
+    ) -> list[NativeItem]:
+        ...
         # reconciliation/backfill source (FR-6.4); raises Unsupported where
         # capabilities().supports_transcript_read is False (Cursor)
 
     @abstractmethod
-    async def interrupt(self, session: SessionHandle) -> None: ...   # FR-6.2
+    async def interrupt(self, session: SessionHandle) -> None: ...  # FR-6.2
 ```
 
 Rules:
