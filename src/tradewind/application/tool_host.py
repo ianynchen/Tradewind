@@ -13,17 +13,37 @@ every client session and forgets the MCP tool schemas.
 into live secrets at connect time only (I-2): the resolved values are used
 to build the transport and are never stored on `ToolHost` or exposed
 through `schemas()` — only the declared `Tool`/`McpServerDef` metadata is.
+
+`serve_socket`/`stop_socket`/`shim_server_def` (task-12 brief) are the other
+half of the same registry: a unix-socket server, speaking the
+newline-delimited JSON protocol in `tradewind.toolproxy.protocol`, that lets
+`python -m tradewind.toolproxy` -- a stdio MCP shim spawned inside engines
+with no in-process tool support (Codex) -- proxy `tools/list`/`tools/call`
+back to this same `_tools`/`_mcp_targets` registry. `tradewind.toolproxy` is
+not one of the layers named in the import-linter `layers` contract
+(pyproject.toml `[tool.importlinter]`), so `tradewind.application` importing
+from it is unconstrained by that contract, and `tradewind.toolproxy` itself
+never imports `tradewind.application` (verified by `lint-imports`; the shim
+must stay leaf since it runs inside engine sandboxes), so no cycle results.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
+import sys
+import tempfile
+import uuid
 from collections.abc import Callable
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
+from pathlib import Path
 from types import TracebackType
 from typing import cast
 
+import anyio
+from anyio.abc import SocketListener, SocketStream, TaskGroup
+from anyio.streams.buffered import BufferedByteReceiveStream
 from mcp import ClientSession
 from mcp.client.stdio import StdioServerParameters, stdio_client
 from mcp.client.streamable_http import streamable_http_client
@@ -31,6 +51,7 @@ from mcp.shared._httpx_utils import create_mcp_http_client
 from mcp_types import TextContent
 
 from tradewind.domain.models import McpServerDef, Tool
+from tradewind.toolproxy import protocol
 
 
 @dataclass
@@ -62,6 +83,7 @@ class ToolHost:
         tools: list[Tool],
         mcp_servers: list[McpServerDef],
         resolve_ref: Callable[[str], str],
+        socket_dir: Path | None = None,
     ) -> None:
         self._tools = {tool.name: tool for tool in tools}
         self._mcp_servers = mcp_servers
@@ -70,6 +92,14 @@ class ToolHost:
         self._mcp_schemas: dict[str, dict[str, object]] = {}
         self._mcp_targets: dict[str, tuple[str, str]] = {}
         self._exit_stack: AsyncExitStack | None = None
+        # `serve_socket` state (task-12 brief): `socket_dir` is where the
+        # socket file is created (`ToolHostConfig.socket_dir`, passed
+        # through by the caller); `None` falls back to a fresh
+        # `tempfile.mkdtemp()` per `serve_socket` call.
+        self._socket_dir = socket_dir
+        self._socket_path: Path | None = None
+        self._socket_listener: SocketListener | None = None
+        self._socket_task_group: TaskGroup | None = None
 
     async def __aenter__(self) -> ToolHost:
         exit_stack = AsyncExitStack()
@@ -108,6 +138,7 @@ class ToolHost:
         self._sessions.clear()
         self._mcp_schemas.clear()
         self._mcp_targets.clear()
+        await self.stop_socket()
 
     async def _connect(self, server: McpServerDef, exit_stack: AsyncExitStack) -> ClientSession:
         if server.transport == "stdio":
@@ -133,6 +164,99 @@ class ToolHost:
 
     def _resolve(self, value: str) -> str:
         return self._resolve_ref(value) if value.startswith("ref:") else value
+
+    async def serve_socket(self) -> Path:
+        """Start the unix-socket server the toolproxy shim (and any other
+        out-of-process caller) connects to, returning the socket path.
+
+        Idempotent: a second call while a socket server is already running
+        returns the existing path without starting another listener. Usable
+        with or without `async with host:` -- it only touches the local
+        `_tools`/`_mcp_targets` registry (via `schemas()`/`call()`), not the
+        MCP client sessions `__aenter__` connects. `stop_socket()` (which
+        `__aexit__` also calls) stops the server and removes the socket
+        file.
+        """
+        if self._socket_path is not None:
+            return self._socket_path
+        socket_dir = (
+            self._socket_dir
+            if self._socket_dir is not None
+            else Path(tempfile.mkdtemp(prefix="tradewind-tp-"))
+        )
+        socket_dir.mkdir(parents=True, exist_ok=True)
+        # Short, unique filename: unix socket paths are capped at ~104-108
+        # bytes (`sockaddr_un.sun_path`), and a caller-supplied `socket_dir`
+        # can already be deep (e.g. a system tempdir).
+        socket_path = socket_dir / f"{uuid.uuid4().hex[:8]}.sock"
+        listener = await anyio.create_unix_listener(socket_path)
+        task_group = anyio.create_task_group()
+        await task_group.__aenter__()
+        task_group.start_soon(self._serve_socket_forever, listener)
+        self._socket_listener = listener
+        self._socket_task_group = task_group
+        self._socket_path = socket_path
+        return socket_path
+
+    async def _serve_socket_forever(self, listener: SocketListener) -> None:
+        # `listener.aclose()` (from `stop_socket`) unblocks the pending
+        # `accept()` inside `serve()` with `ClosedResourceError` -- expected
+        # shutdown, not a crash.
+        with contextlib.suppress(anyio.ClosedResourceError):
+            await listener.serve(self._handle_socket_connection)
+
+    async def stop_socket(self) -> None:
+        """Stop the socket server started by `serve_socket` and remove the
+        socket file. A no-op if no socket server is running."""
+        listener = self._socket_listener
+        task_group = self._socket_task_group
+        socket_path = self._socket_path
+        if listener is None or task_group is None or socket_path is None:
+            return
+        task_group.cancel_scope.cancel()
+        await listener.aclose()
+        await task_group.__aexit__(None, None, None)
+        socket_path.unlink(missing_ok=True)
+        self._socket_listener = None
+        self._socket_task_group = None
+        self._socket_path = None
+
+    async def _handle_socket_connection(self, stream: SocketStream) -> None:
+        buffered = BufferedByteReceiveStream(stream)
+        async with stream:
+            while True:
+                try:
+                    line = await buffered.receive_until(b"\n", protocol.MAX_LINE_BYTES)
+                except (anyio.IncompleteRead, anyio.DelimiterNotFound):
+                    return
+                response = await self._handle_socket_line(line)
+                await stream.send((protocol.encode_response(response) + "\n").encode("utf-8"))
+
+    async def _handle_socket_line(self, line: bytes) -> protocol.Response:
+        try:
+            request = protocol.decode_request(line.decode("utf-8"))
+        except (protocol.ProtocolError, UnicodeDecodeError) as exc:
+            # Malformed request: an error response, never a crash (brief) --
+            # the connection stays open for the caller's next line.
+            return protocol.ErrorResponse(error=str(exc))
+        if isinstance(request, protocol.ListRequest):
+            return protocol.ListResponse(tools=self.schemas())
+        outcome = await self.call(request.name, request.arguments)
+        return protocol.CallResponse(content=outcome.content, is_error=outcome.is_error)
+
+    async def shim_server_def(self) -> McpServerDef:
+        """The `McpServerDef` for `python -m tradewind.toolproxy`, wired to
+        this host's socket (starting `serve_socket` first if it isn't
+        running yet). Adding the result to a caller's `mcp_servers` -- e.g.
+        an engine with no in-process tool support -- gets it live access to
+        every tool this `ToolHost` exposes, local and MCP-proxied alike."""
+        socket_path = await self.serve_socket()
+        return McpServerDef(
+            name="toolproxy",
+            transport="stdio",
+            command=[sys.executable, "-m", "tradewind.toolproxy"],
+            env={protocol.SOCKET_ENV_VAR: str(socket_path)},
+        )
 
     def schemas(self) -> list[dict[str, object]]:
         local = [_local_schema(tool) for tool in self._tools.values()]

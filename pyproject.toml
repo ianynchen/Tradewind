@@ -163,6 +163,41 @@ module = "tradewind.adapters.claude_backend"
 disallow_any_explicit = false
 disallow_any_expr = false
 
+[[tool.mypy.overrides]]
+# `tradewind.toolproxy.__main__` (task-12 brief) is a leaf module by design
+# -- it must not import `tradewind.application`, so it talks to the `mcp`
+# package's own low-level server API (`mcp.server.lowlevel.Server`,
+# `mcp.server.context.ServerRequestContext`, `mcp_types.Tool` et al.)
+# directly, rather than through `tool_host.py`'s already-relaxed module.
+# Two root causes, both third-party, confirmed by minimal repro:
+# (1) `mcp_types.Tool`/`ListToolsResult`/`CallToolResult`/
+#     `CallToolRequestParams` are pydantic v2 models with `Any`-typed
+#     fields (`Tool.input_schema: dict[str, Any]`,
+#     `CallToolRequestParams.arguments: dict[str, Any] | None`,
+#     `CallToolResult.structured_content: Any`) -- same root cause as the
+#     `tradewind.domain` override ("every subclass trips
+#     `disallow_any_explicit` via mypy's synthesized `__mypy-replace`
+#     member"): constructing or reading one of these taints the expression
+#     regardless of how this module casts the value going in or coming out.
+# (2) `mcp.server.context.ServerRequestContext[LifespanResultT]`'s second
+#     type parameter (`RequestT`) defaults to `Any` -- the SDK's own
+#     `server.py` uses this identical single-argument form throughout its
+#     own handler type aliases (`RequestHandler`, `on_list_tools`,
+#     `on_call_tool`, ...), so matching the library's own handler
+#     signatures for `Server(on_list_tools=..., on_call_tool=...)` requires
+#     writing the same form here. Relatedly, an `async def` handler
+#     assigned to `on_list_tools=`/`on_call_tool=` types as
+#     `Coroutine[Any, Any, T]` per Python's own typing for coroutine
+#     functions -- same root cause as the `tradewind.domain`
+#     `Callable[..., Awaitable[Any]]` friction.
+# `tradewind.toolproxy.protocol` (the wire-format module the shim and
+# `tool_host.py` both import) needs no override and stays fully strict --
+# only this module, which touches the third-party SDK surface directly, is
+# narrowed.
+module = "tradewind.toolproxy.__main__"
+disallow_any_explicit = false
+disallow_any_expr = false
+
 [tool.ruff]
 line-length = 100
 target-version = "py313"
