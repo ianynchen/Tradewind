@@ -342,7 +342,23 @@ already mirrored stays.
 - **P-4** Postgres store adapter timing — when meridian centralizes storage.
 - **P-5** Cursor CLI ↔ SDK store sharing: whether `cursor-agent` can resume agents
   created via the SDK's default local store is undocumented — verify by experiment
-  before relying on FR-6.4 for Cursor.
+  before relying on FR-6.4 for Cursor. **BLOCKED (task 15, phase-1 close-out)**: no
+  Cursor subscription exists on this machine, so the spike cannot run; the `cursor`
+  adapter ships `EXPERIMENTAL` (never live-verified) and stays open until a
+  subscription is available.
+- **P-6** Codex native item-id scheme mismatch (FR-6.4 follow-up, found task 14):
+  live-streamed `item/completed` ids and `thread_read(includeTurns=true)` ids are
+  different, unstable schemes for the same logical item, so
+  `ResumePlanner.reconcile()`'s cursor (`store.last_native_id`) can never match a
+  `thread_read` id past a session's first turn — `CodexBackend.thread_read_items`
+  was made to return nothing rather than everything on a cursor miss (favoring
+  mirror correctness over completeness), which means Codex's DR-3 backfill of
+  out-of-band CLI activity is effectively inert today. `supports_transcript_read`/
+  `supports_native_resume` stay `True` (every other consumer of those flags works
+  correctly) — this is a data-completeness gap in one reconcile path, not a broken
+  capability. Needs a follow-up spike on stable cross-representation item ids (or an
+  architecture change to how `import_native_items`/`reconcile` dedupe) before Codex's
+  FR-6.4 backfill can be relied on. See `docs/RUNBOOK.md` for the confirmed evidence.
 
 ## 8. References
 

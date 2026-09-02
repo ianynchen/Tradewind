@@ -102,6 +102,6 @@ with honest capability reporting and durable, backend-neutral session history.
 
 ## 6. Open Questions
 
-- **OQ-1** Splice ordering for tree retrieval (children inline at spawn points) — schema supports it via `spawned_by_message_id`; rendering deferred until a UI needs it.
-- **OQ-2** Codex approval-event round-trip fidelity (approvals reviewer protocol) — verified as protocol events; the exact broker mapping needs a spike.
-- **OQ-3** Whether the `spawn_agent` tool (FR-9.2) ships in v1 or after the first embedding in meridian.
+- **OQ-1** Splice ordering for tree retrieval (children inline at spawn points) — schema supports it via `spawned_by_message_id`; rendering still deferred until a UI needs it. Status unchanged at phase-1 close-out.
+- ~~**OQ-2** Codex approval-event round-trip fidelity (approvals reviewer protocol) — verified as protocol events; the exact broker mapping needs a spike.~~ **RESOLVED (task 13 spike)**: see `docs/research/2026-09-02-codex-approvals-spike.md` and `docs/ARCHITECTURE.md` §7 P-2.
+- **OQ-3** Whether the `spawn_agent` tool (FR-9.2) ships in v1 or after the first embedding in meridian — still open; no meridian embedding has happened yet.

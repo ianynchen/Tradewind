@@ -48,7 +48,7 @@ scripts/check.sh
 **Interfaces:**
 - Produces: importable `tradewind` package; `scripts/check.sh` running `ruff format --check`, `ruff check`, `mypy src`, `lint-imports`, `pytest`.
 
-- [ ] **Step 1: Write pyproject** — hatchling build; deps: `pydantic>=2.9`, `anyio>=4`; dev group: `pytest`, `pytest-asyncio` (or anyio pytest plugin), `mypy`, `ruff`, `import-linter`. Provider SDKs are NOT deps yet (added per-adapter task, pinned then). Import-linter contracts:
+- [x] **Step 1: Write pyproject** — hatchling build; deps: `pydantic>=2.9`, `anyio>=4`; dev group: `pytest`, `pytest-asyncio` (or anyio pytest plugin), `mypy`, `ruff`, `import-linter`. Provider SDKs are NOT deps yet (added per-adapter task, pinned then). Import-linter contracts:
 ```toml
 [tool.importlinter]
 root_package = "tradewind"
@@ -62,9 +62,9 @@ type = "forbidden"
 source_modules = ["tradewind.domain"]
 forbidden_modules = ["sqlite3", "langchain_anthropic", "claude_agent_sdk", "openai_codex", "cursor_sdk"]
 ```
-- [ ] **Step 2: Write `tests/architecture/test_layering.py`** — subprocess-runs `lint-imports`, asserts exit 0.
-- [ ] **Step 3: Write `scripts/check.sh`** (set -euo pipefail; the five gates above) and run it — expect PASS on empty package.
-- [ ] **Step 4: Commit** `chore: scaffold tradewind package with layering gates`
+- [x] **Step 2: Write `tests/architecture/test_layering.py`** — subprocess-runs `lint-imports`, asserts exit 0.
+- [x] **Step 3: Write `scripts/check.sh`** (set -euo pipefail; the five gates above) and run it — expect PASS on empty package.
+- [x] **Step 4: Commit** `chore: scaffold tradewind package with layering gates`
 
 ### Task 2: Domain — models, events, errors
 
@@ -161,10 +161,10 @@ class SessionOptions(BaseModel):
 Event = TurnStarted | TextDelta | ThinkingDelta | ItemCompleted | PermissionRequested | TurnCompleted | TurnFailed
 ```
 
-- [ ] **Step 1: Write failing tests** — `SessionOptions.snapshot()` excludes handlers/broker, includes tool names+schemas, redacts `McpServerDef.env` values not prefixed `ref:` → replaced with `"ref:!redacted"` is WRONG; correct rule: values are stored verbatim ONLY when already `ref:`-prefixed, else replaced by `"ref:missing"` and snapshot flagged `{"has_unrefed_secrets": true}`; `Tool` accepts async handler; invalid `Capabilities` missing a flag fails.
-- [ ] **Step 2: Run, verify FAIL** (`pytest tests/unit/test_domain_models.py -v`).
-- [ ] **Step 3: Implement models exactly as above; run to PASS.**
-- [ ] **Step 4: `scripts/check.sh`; commit** `feat(domain): models, events, errors`
+- [x] **Step 1: Write failing tests** — `SessionOptions.snapshot()` excludes handlers/broker, includes tool names+schemas, redacts `McpServerDef.env` values not prefixed `ref:` → replaced with `"ref:!redacted"` is WRONG; correct rule: values are stored verbatim ONLY when already `ref:`-prefixed, else replaced by `"ref:missing"` and snapshot flagged `{"has_unrefed_secrets": true}`; `Tool` accepts async handler; invalid `Capabilities` missing a flag fails.
+- [x] **Step 2: Run, verify FAIL** (`pytest tests/unit/test_domain_models.py -v`).
+- [x] **Step 3: Implement models exactly as above; run to PASS.**
+- [x] **Step 4: `scripts/check.sh`; commit** `feat(domain): models, events, errors`
 
 ### Task 3: SQLite store — schema, migrations, intent verbs
 
@@ -187,8 +187,8 @@ class SessionStorePort(ABC):
 ```
 - Schema: verbatim from ARCHITECTURE §4 (sessions incl. `native_history_json`; turns with UUID PK + `native_turn_id` + unique `(session_id, native_turn_id)`; messages; three indexes). `PRAGMA user_version=1`, WAL, `foreign_keys=ON`, `busy_timeout=5000`.
 
-- [ ] **Step 1: Failing tests** — migrate on fresh file sets user_version 1 and is idempotent; `create_session` then `create_session` same id raises `SessionExists`; `ensure_session` returns existing row unchanged (get-or-create in one transaction); `get_session` unknown → None; `rehome_native` appends `{"backend": old, "native_session_id": old}` to `native_history` and sets new pair.
-- [ ] **Step 2: Run FAIL. Step 3: Implement (single `sqlite3.Connection`, `check_same_thread=False`, one lock). Step 4: Run PASS. Step 5: check.sh; commit** `feat(store): schema, migrations, session intent verbs`
+- [x] **Step 1: Failing tests** — migrate on fresh file sets user_version 1 and is idempotent; `create_session` then `create_session` same id raises `SessionExists`; `ensure_session` returns existing row unchanged (get-or-create in one transaction); `get_session` unknown → None; `rehome_native` appends `{"backend": old, "native_session_id": old}` to `native_history` and sets new pair.
+- [x] **Step 2: Run FAIL. Step 3: Implement (single `sqlite3.Connection`, `check_same_thread=False`, one lock). Step 4: Run PASS. Step 5: check.sh; commit** `feat(store): schema, migrations, session intent verbs`
 
 ### Task 4: SQLite store — turns, mirror writer, I-5
 
@@ -208,8 +208,8 @@ class SessionStorePort(ABC):
 @abstractmethod def sweep_stale_turns(self, session_id: str) -> int: ...    # in_progress → failed
 ```
 
-- [ ] **Step 1: Failing tests** — `begin_turn` twice without finalize raises `TurnInProgress` (I-5); `append_message` assigns 1,2,3… per session across turns; message with mismatched session/turn rejected (`ValueError`); crash sim: begin+append, new store object on same file → history readable, `sweep_stale_turns` returns 1 and turn reads `failed`; `finalize_turn` persists status/usage/cost/final_text.
-- [ ] **Step 2–5: FAIL → implement (seq = `1 + COALESCE(MAX(seq),0)` inside the write transaction) → PASS → check.sh → commit** `feat(store): turns and mirror writer with single-flight invariant`
+- [x] **Step 1: Failing tests** — `begin_turn` twice without finalize raises `TurnInProgress` (I-5); `append_message` assigns 1,2,3… per session across turns; message with mismatched session/turn rejected (`ValueError`); crash sim: begin+append, new store object on same file → history readable, `sweep_stale_turns` returns 1 and turn reads `failed`; `finalize_turn` persists status/usage/cost/final_text.
+- [x] **Step 2–5: FAIL → implement (seq = `1 + COALESCE(MAX(seq),0)` inside the write transaction) → PASS → check.sh → commit** `feat(store): turns and mirror writer with single-flight invariant`
 
 ### Task 5: SQLite store — history, fork copy, native import
 
@@ -229,8 +229,8 @@ class SessionStorePort(ABC):
 @abstractmethod def last_native_id(self, session_id: str) -> str | None: ...
 ```
 
-- [ ] **Step 1: Failing tests** — build lineage root→A→B (B child of A, `spawned_by_message_id` set) plus sibling C: flat(root) has zero A/B/C messages; tree(root) = recursive-CTE ID set ordered `(session_id, seq)`; `include_raw=False` returns `raw=None` even when stored; pagination `after_seq`/`limit`; `copy_history` creates fork row with lineage and copies ≤ `up_to_seq`; `import_native_items` twice → second returns 0; 10k-message flat read (no raw) < 10 ms (mark `@pytest.mark.perf`, assert generously < 50 ms in CI).
-- [ ] **Step 2–5: FAIL → implement (tree via `WITH RECURSIVE` exactly as ARCHITECTURE §4.2) → PASS → check.sh → commit** `feat(store): history retrieval, fork copy, native import`
+- [x] **Step 1: Failing tests** — build lineage root→A→B (B child of A, `spawned_by_message_id` set) plus sibling C: flat(root) has zero A/B/C messages; tree(root) = recursive-CTE ID set ordered `(session_id, seq)`; `include_raw=False` returns `raw=None` even when stored; pagination `after_seq`/`limit`; `copy_history` creates fork row with lineage and copies ≤ `up_to_seq`; `import_native_items` twice → second returns 0; 10k-message flat read (no raw) < 10 ms (mark `@pytest.mark.perf`, assert generously < 50 ms in CI).
+- [x] **Step 2–5: FAIL → implement (tree via `WITH RECURSIVE` exactly as ARCHITECTURE §4.2) → PASS → check.sh → commit** `feat(store): history retrieval, fork copy, native import`
 
 ### Task 6: Config validation and client shell
 
@@ -283,9 +283,9 @@ class Tradewind:
                       include_raw=False) -> list[StoredMessage]: ...
 ```
 
-- [ ] **Step 1: Failing tests (config)** — missing default_profile key → `ConfigError`; profiles with differing tier sets → `ConfigError`; both/neither store options → `ConfigError`; two `Tradewind` instances on two sqlite files coexist.
-- [ ] **Step 2: Failing tests (sessions)** — non-UUID id → `ValueError`; `create` twice → `SessionExists`; `resume` missing → `SessionNotFound`; `ensure` idempotent; resume with options whose tool NAMES mismatch snapshot → `ToolMismatch`; resume with matching names rebinds handlers; unknown tier at call time → `ConfigError`; `fork` uses `copy_history` and returns a session with `spawn_kind="fork"`.
-- [ ] **Step 3–5: FAIL → implement (store calls via `anyio.to_thread.run_sync`; adapters lazily constructed in a later task — `run/stream` raise `NotImplementedError` for now) → PASS → check.sh → commit** `feat(client): config validation and session lifecycle`
+- [x] **Step 1: Failing tests (config)** — missing default_profile key → `ConfigError`; profiles with differing tier sets → `ConfigError`; both/neither store options → `ConfigError`; two `Tradewind` instances on two sqlite files coexist.
+- [x] **Step 2: Failing tests (sessions)** — non-UUID id → `ValueError`; `create` twice → `SessionExists`; `resume` missing → `SessionNotFound`; `ensure` idempotent; resume with options whose tool NAMES mismatch snapshot → `ToolMismatch`; resume with matching names rebinds handlers; unknown tier at call time → `ConfigError`; `fork` uses `copy_history` and returns a session with `spawn_kind="fork"`.
+- [x] **Step 3–5: FAIL → implement (store calls via `anyio.to_thread.run_sync`; adapters lazily constructed in a later task — `run/stream` raise `NotImplementedError` for now) → PASS → check.sh → commit** `feat(client): config validation and session lifecycle`
 
 ### Task 7: Tool host (in-process + MCP client)
 
@@ -306,8 +306,8 @@ class ToolHost:
 ```
 - Behavior: local tools dispatch to `handler(**arguments)`; MCP-server tools are namespaced `mcp__<server>__<tool>` and proxied through the `mcp` client; `resolve_ref` expands `ref:` values from config at connect time (never persisted); unknown tool → `ToolOutcome(is_error=True)`.
 
-- [ ] **Step 1: Failing tests** — local tool round trip; handler exception → `is_error=True` with message, never raises; schemas list includes both local and (faked) MCP tools; `ref:` env resolved via injected resolver (assert the resolver was called, value never appears in `schemas()`).
-- [ ] **Step 2–5: FAIL → implement → PASS → check.sh → commit** `feat(tools): ToolHost with in-process dispatch and MCP client`
+- [x] **Step 1: Failing tests** — local tool round trip; handler exception → `is_error=True` with message, never raises; schemas list includes both local and (faked) MCP tools; `ref:` env resolved via injected resolver (assert the resolver was called, value never appears in `schemas()`).
+- [x] **Step 2–5: FAIL → implement → PASS → check.sh → commit** `feat(tools): ToolHost with in-process dispatch and MCP client`
 
 ### Task 8: LangChain adapter
 
@@ -336,8 +336,8 @@ class Backend(ABC):
 ```
 - Adapter behavior per `docs/components/03-langchain-adapter.md`: rebuild messages from `load_history()` (thinking kinds OMITTED; `tool_use`/`tool_result` → real content blocks), `system` param each request, loop with broker gate (`deny` → synthesized error tool_result + `PermissionRequested` event), max 25 iterations guard, interrupt via `anyio.CancelScope` registered per session id, capabilities exactly the table in the spec (`supports_fork=False`).
 
-- [ ] **Step 1: Failing unit tests with a scripted fake chat model** — (a) two-tool turn: model emits tool_calls A,B; broker allows A denies B; assert A executed, B got error tool_result, events contain `PermissionRequested(verdict="deny")`, final `TurnCompleted`; (b) rebuild: seed mirror with text+thinking+tool pair, assert request messages exclude thinking and include reconstructed tool blocks; (c) interrupt mid-loop → iterator ends, no exception escapes, last event `TurnFailed` NOT emitted (status handled by runner).
-- [ ] **Step 2–5: FAIL → implement → PASS.** The adapter constructs `ChatAnthropic` by default but accepts any injected `BaseChatModel` (this is also how the fake-model unit tests work). Integration tests, two variants: (a) `test_langchain_live.py` against the real Anthropic API — written now, skipped while no API key exists; (b) `test_langchain_free.py` — inject `ChatGroq(model="llama-3.3-70b-versatile")` (skip when `GROQ_API_KEY` unset) and run one real tool-loop turn free of charge; keep an `ChatOllama` fixture variant as the offline fallback (skip when daemon unreachable). Add dev-only deps `langchain-groq` and `langchain-ollama` (pinned). check.sh; commit `feat(adapter): langchain backend with broker-gated tool loop`
+- [x] **Step 1: Failing unit tests with a scripted fake chat model** — (a) two-tool turn: model emits tool_calls A,B; broker allows A denies B; assert A executed, B got error tool_result, events contain `PermissionRequested(verdict="deny")`, final `TurnCompleted`; (b) rebuild: seed mirror with text+thinking+tool pair, assert request messages exclude thinking and include reconstructed tool blocks; (c) interrupt mid-loop → iterator ends, no exception escapes, last event `TurnFailed` NOT emitted (status handled by runner).
+- [x] **Step 2–5: FAIL → implement → PASS.** The adapter constructs `ChatAnthropic` by default but accepts any injected `BaseChatModel` (this is also how the fake-model unit tests work). Integration tests, two variants: (a) `test_langchain_live.py` against the real Anthropic API — written now, skipped while no API key exists; (b) `test_langchain_free.py` — inject `ChatGroq(model="llama-3.3-70b-versatile")` (skip when `GROQ_API_KEY` unset) and run one real tool-loop turn free of charge; keep an `ChatOllama` fixture variant as the offline fallback (skip when daemon unreachable). Add dev-only deps `langchain-groq` and `langchain-ollama` (pinned). check.sh; commit `feat(adapter): langchain backend with broker-gated tool loop`
 
 ### Task 9: Turn runner + wiring + conformance baseline
 
@@ -349,10 +349,10 @@ class Backend(ABC):
 - Produces: `TurnRunner.execute(session, prompt, overrides) -> AsyncIterator[Event]` which: merges option layers (defaults < snapshot < overrides), resolves tier→`ModelSpec` via profile, `begin_turn` (UUID turn id), streams adapter events, mirrors every `ItemCompleted` via `append_message`, calls `on_event` tap, finalizes turn (status from termination cause), sweeps stale turns on session open. `ResumePlanner.plan(session) -> Literal["native","replay","fresh"]` — for langchain always `"replay"` (trivially: rebuild happens per-request anyway).
 - Conformance `matrix.py`: named scenario functions parameterized by backend fixture, each guarded by the capability flag it needs (`pytest.skip` when flag False): `single_turn_text`, `tool_allow_deny`, `interrupt_midturn`, `resume_continues_context`, `history_flat_and_tree`, `structured_output`, `system_prompt_respected`.
 
-- [ ] **Step 1: Failing conformance run for langchain (fake model fixture)** — all seven scenarios red.
-- [ ] **Step 2: Implement runner/resume/client wiring; scenarios green.**
-- [ ] **Step 3: End-to-end embedding test** (spec 01 acceptance): build `TradewindConfig` from a plain dict, `ensure` → `run` → `history`, assert no env/file access (monkeypatch `os.environ` access counter is overkill — assert no config file exists and store path was the only path touched).
-- [ ] **Step 4: check.sh; commit** `feat(runner): turn execution, mirroring, conformance baseline`
+- [x] **Step 1: Failing conformance run for langchain (fake model fixture)** — all seven scenarios red.
+- [x] **Step 2: Implement runner/resume/client wiring; scenarios green.**
+- [x] **Step 3: End-to-end embedding test** (spec 01 acceptance): build `TradewindConfig` from a plain dict, `ensure` → `run` → `history`, assert no env/file access (monkeypatch `os.environ` access counter is overkill — assert no config file exists and store path was the only path touched).
+- [x] **Step 4: check.sh; commit** `feat(runner): turn execution, mirroring, conformance baseline`
 
 **Stage-1 exit:** meridian could embed tradewind on the `langchain` profile today.
 
@@ -372,10 +372,10 @@ class Backend(ABC):
 - Produces: `ClaudeBackend(Backend)` — `run()` uses `claude_agent_sdk.query()` with `ClaudeAgentOptions(resume=native_id or None, system_prompt={"type":"preset","preset":"claude_code","append": ctx.system_prompt} if ctx.system_prompt else None, can_use_tool=<broker bridge>, mcp_servers=<ToolHost as in-process SDK MCP server + caller defs>, model=ctx.model_spec.model, cwd=...)`; captures `session_id` from init/`ResultMessage` → `rehome_native` on first turn; maps SDK message stream → events (AssistantMessage blocks → `ItemCompleted` per block; ResultMessage → usage/cost/final_text). `interrupt()` via held `ClaudeSDKClient.interrupt()`. `probe_native` = attempt `get_session_info`; `read_native_transcript` via `get_session_messages()` mapped to `NormalizedMessage` (sidechain records split out per I-1 — child splitting itself deferred to `spawn()` implementation note; sidechain rows tagged via `agent_path`).
 - Capabilities: all True except none — exactly: system_prompt T, structured_output F (no output_schema param; runner emulates via instruction only when asked → actually declare F and let conformance skip), interactive_permissions T, in_process_tools T, native_resume T, fork T, transcript_read T.
 
-- [ ] **Step 1: Failing mapping unit tests** — fixture SDK-message objects → expected `NormalizedMessage` kinds (text/thinking/tool_use/tool_result), usage extraction from ResultMessage.
-- [ ] **Step 2: Implement mapping + adapter; unit PASS.**
-- [ ] **Step 3: Conformance vs live SDK (`@integration`, subscription on the mini):** scenarios green or capability-skipped; verify `claude --resume <native id>` manually once and record in RUNBOOK (FR-6.4 evidence).
-- [ ] **Step 4: check.sh; commit** `feat(adapter): claude backend over claude-agent-sdk`
+- [x] **Step 1: Failing mapping unit tests** — fixture SDK-message objects → expected `NormalizedMessage` kinds (text/thinking/tool_use/tool_result), usage extraction from ResultMessage.
+- [x] **Step 2: Implement mapping + adapter; unit PASS.**
+- [x] **Step 3: Conformance vs live SDK (`@integration`, subscription on the mini):** scenarios green or capability-skipped; verify `claude --resume <native id>` manually once and record in RUNBOOK (FR-6.4 evidence).
+- [x] **Step 4: check.sh; commit** `feat(adapter): claude backend over claude-agent-sdk`
 
 ### Task 11: Reconciliation + freeze the event taxonomy (P-1)
 
@@ -386,10 +386,10 @@ class Backend(ABC):
 **Interfaces:**
 - Produces: `ResumePlanner.reconcile(session) -> int` — when `capabilities().supports_transcript_read`: `read_native_transcript(after=store.last_native_id(sid))` → `import_native_items`; called before every native resume (§5.2).
 
-- [ ] **Step 1: Failing test** — mirror has items ≤ native_id N; fake backend returns items N+1..N+3; reconcile imports 3; second call imports 0.
-- [ ] **Step 2: Implement; PASS.**
-- [ ] **Step 3: Review both adapters' event usage; remove/adjust any draft event nobody emits; update ARCHITECTURE (P-1 resolved, taxonomy listed) — docs commit in same change.**
-- [ ] **Step 4: check.sh; commit** `feat(resume): native reconciliation; freeze event taxonomy`
+- [x] **Step 1: Failing test** — mirror has items ≤ native_id N; fake backend returns items N+1..N+3; reconcile imports 3; second call imports 0.
+- [x] **Step 2: Implement; PASS.**
+- [x] **Step 3: Review both adapters' event usage; remove/adjust any draft event nobody emits; update ARCHITECTURE (P-1 resolved, taxonomy listed) — docs commit in same change.**
+- [x] **Step 4: check.sh; commit** `feat(resume): native reconciliation; freeze event taxonomy`
 
 ---
 
@@ -404,16 +404,16 @@ class Backend(ABC):
 **Interfaces:**
 - Produces: `ToolHost.serve_socket() -> Path` (unix socket; newline-delimited JSON: `{"op":"list"} → {"tools":[schemas]}`, `{"op":"call","name":…,"arguments":…} → {"content":…,"is_error":…}`); `python -m tradewind.toolproxy` = stdio MCP server (via `mcp` package) reading `TRADEWIND_TOOL_SOCKET` env, forwarding `tools/list`/`tools/call` to the socket; `ToolHost.shim_server_def() -> McpServerDef` (stdio, command `[sys.executable, "-m", "tradewind.toolproxy"]`, env carrying the socket path).
 
-- [ ] **Step 1: Failing test** — start `serve_socket`; spawn the shim as a real subprocess speaking MCP over stdio via the `mcp` client; `tools/list` shows registered tool; `tools/call` executes the live closure in THIS process (assert on a mutated local variable — proves the proxy pattern).
-- [ ] **Step 2–4: FAIL → implement → PASS → check.sh; commit** `feat(toolproxy): stdio MCP shim proxying to live tool registry`
+- [x] **Step 1: Failing test** — start `serve_socket`; spawn the shim as a real subprocess speaking MCP over stdio via the `mcp` client; `tools/list` shows registered tool; `tools/call` executes the live closure in THIS process (assert on a mutated local variable — proves the proxy pattern).
+- [x] **Step 2–4: FAIL → implement → PASS → check.sh; commit** `feat(toolproxy): stdio MCP shim proxying to live tool registry`
 
 ### Task 13: Spike — Codex approval events (P-2, timeboxed 0.5 day)
 
 **Files:**
 - Create: `docs/research/2026-09-XX-codex-approvals-spike.md`
 
-- [ ] **Step 1:** Against the pinned `openai-codex`, run a real turn with `approval_mode` requiring approval; capture how approval requests surface (server-request routing in the client) and answer them programmatically.
-- [ ] **Step 2:** Record in the spike doc: exact hook point, request/response shapes, and the chosen broker mapping (`allow`→approve, `deny`→reject). Update ARCHITECTURE P-2 → resolved. Commit `docs: codex approvals spike (P-2)`.
+- [x] **Step 1:** Against the pinned `openai-codex`, run a real turn with `approval_mode` requiring approval; capture how approval requests surface (server-request routing in the client) and answer them programmatically.
+- [x] **Step 2:** Record in the spike doc: exact hook point, request/response shapes, and the chosen broker mapping (`allow`→approve, `deny`→reject). Update ARCHITECTURE P-2 → resolved. Commit `docs: codex approvals spike (P-2)`.
 
 ### Task 14: Codex adapter
 
@@ -424,7 +424,7 @@ class Backend(ABC):
 
 **Interfaces:**
 - Produces: `CodexBackend(Backend)` — `run()`: `Codex(CodexConfig(config_overrides=<mcp_servers incl. ToolHost.shim_server_def()>))`; `thread_start()`/`thread_resume(native_id)`; capture `thread.id` → `rehome_native`; per-turn `thread.turn(prompt, approval_mode=…, sandbox=…, model=ctx.model_spec.model, effort=ctx.model_spec.effort, output_schema=ctx.output_schema)`; stream via `turn.stream()` mapped to events (thread items → kinds incl. `command_execution`/`file_change` native fits); broker wired per Task 13 findings; `interrupt()` via held `TurnHandle.interrupt()`; `read_native_transcript` via `thread_read(include_turns=True)`; `probe_native` via `thread_read` success. Capabilities: system_prompt T (base_instructions), structured_output T, interactive_permissions T (approval granularity), in_process_tools F, native_resume T, fork T (`thread_fork`), transcript_read T. Isolation mode: set `CODEX_HOME` in the spawned client env ONLY when `native_stores.isolation_mode` (DR-3).
-- [ ] **Steps: mapping unit tests (fixture ThreadItems → NormalizedMessage) FAIL → implement → PASS; conformance `@integration` green/skipped; manual `codex resume <thread-id>` evidence in RUNBOOK; check.sh; commit** `feat(adapter): codex backend with MCP shim tools`
+- [x] **Steps: mapping unit tests (fixture ThreadItems → NormalizedMessage) FAIL → implement → PASS; conformance `@integration` green/skipped; manual `codex resume <thread-id>` evidence in RUNBOOK; check.sh; commit** `feat(adapter): codex backend with MCP shim tools`
 
 ### Task 15: Spike + Cursor adapter — **PARTIALLY BLOCKED (no Cursor subscription)**
 
@@ -440,10 +440,10 @@ class Backend(ABC):
 - Modify: `pyproject.toml` (pin `cursor-sdk`)
 - Test: `tests/unit/test_cursor_mapping.py`, `tests/conformance/test_cursor.py` (`@integration`)
 
-- [ ] **Step 1 (spike, P-5):** create an agent via SDK default store, attempt resume from `cursor-agent` CLI; record verdict in spike doc; ARCHITECTURE P-5 → resolved (adjust FR-6.4 note if negative).
-- [ ] **Step 2: Failing mapping tests** (SDK message stream → NormalizedMessage; the combined call/result record splits into two rows per research §4.2).
-- [ ] **Step 3: Implement** — `Agent.create(LocalAgentOptions(custom_tools=<ToolHost handlers>, mcp=<caller defs>))` / `Agent.resume(agent_id)` with tools re-passed (FR-3.2); capture agent id → `rehome_native`; `run.cancel()` for interrupt; capabilities: system_prompt F, structured_output F, interactive_permissions F, in_process_tools T, native_resume T, fork F, transcript_read F. Turn-runner emulation (driven by flags, §3.1 R-1): system prompt → write `.cursor/rules/tradewind-session.mdc` (namespaced; never `AGENTS.md`; fallback = prepend `[Instructions]…` to first prompt), removed on session archive.
-- [ ] **Step 4: conformance `@integration` (skips reflect the flags — this validates skip machinery too); check.sh; commit** `feat(adapter): cursor backend with rules-file emulation`
+- [ ] **Step 1 (spike, P-5): `BLOCKED: cursor subscription`** — no Cursor account/subscription exists on this machine; `docs/research/2026-09-XX-cursor-cli-resume-spike.md` was not created (fabricating spike findings without running the experiment would be dishonest research). ARCHITECTURE P-5 stays open.
+- [x] **Step 2: Failing mapping tests** (SDK message stream → NormalizedMessage; the combined call/result record splits into two rows per research §4.2).
+- [x] **Step 3: Implement** — `Agent.create(LocalAgentOptions(custom_tools=<ToolHost handlers>, mcp=<caller defs>))` / `Agent.resume(agent_id)` with tools re-passed (FR-3.2); capture agent id → `rehome_native`; `run.cancel()` for interrupt; capabilities: system_prompt F, structured_output F, interactive_permissions F, in_process_tools T, native_resume T, fork F, transcript_read F. Turn-runner emulation (driven by flags, §3.1 R-1): system prompt → write `.cursor/rules/tradewind-session.mdc` (namespaced; never `AGENTS.md`; fallback = prepend `[Instructions]…` to first prompt), removed on session archive.
+- [ ] **Step 4: `BLOCKED: cursor subscription`** — `tests/conformance/test_cursor.py` exists, is fully wired against the real `Tradewind`/`Session`/`TurnRunner` stack, and is collected by pytest, but self-skips unconditionally (no subscription to run it against). `check.sh` green; commit `feat(adapter): cursor backend with rules-file emulation` landed for the credential-free portions (Steps 2–3).
 
 ### Task 16: Close-out
 
@@ -451,9 +451,9 @@ class Backend(ABC):
 - Create: `README.md`, `docs/RUNBOOK.md`
 - Modify: `docs/ARCHITECTURE.md` (pending list), `docs/REQUIREMENTS.md` (OQ status)
 
-- [ ] **Step 1:** Full `scripts/check.sh` + conformance matrix across the three testable adapters on the mini — claude (subscription), codex (subscription), langchain (Groq free tier) — with cursor rows recorded as `BLOCKED: no subscription`; paste the matrix result table into RUNBOOK, including the blocked rows so the gap is visible.
-- [ ] **Step 2:** README: install, 20-line embedding example (config → ensure → run → history), capability matrix table.
-- [ ] **Step 3:** Update pending/OQ statuses; commit `docs: close out phase; conformance evidence`.
+- [x] **Step 1:** Full `scripts/check.sh` (306 passed, 7 skipped) + live conformance matrix for claude (subscription, 6/7 passed + 1 capability-skip, `interrupt_midturn` flaky across runs, see RUNBOOK) and codex (subscription, 7/7 passed clean) — no `GROQ_API_KEY`/`ANTHROPIC_API_KEY` on this machine, so langchain rows are `DEFERRED: free-tier key pending` (per Global Constraints above) rather than live-run, backed by the fake-model conformance suite that runs in `check.sh`; cursor rows recorded `BLOCKED: no cursor subscription`. Full matrix table in `docs/RUNBOOK.md`.
+- [x] **Step 2:** README: install, 20-line embedding example (config → ensure → run → history), capability matrix table.
+- [x] **Step 3:** Update pending/OQ statuses; commit `docs: close out phase; conformance evidence`.
 
 ## Self-Review (performed)
 
