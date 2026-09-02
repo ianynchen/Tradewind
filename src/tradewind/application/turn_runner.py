@@ -22,6 +22,7 @@ import logging
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
 from contextlib import aclosing
+from pathlib import Path
 from typing import cast
 
 import anyio
@@ -118,6 +119,71 @@ def _effective_output_schema(
     return cast("dict[str, object] | None", snapshot.get("output_schema"))
 
 
+# --- R-1 system-prompt emulation (ARCHITECTURE §3.1: "performed above the
+# port by the Turn Runner / client, driven by the flags") -----------------
+
+# Namespaced, never `AGENTS.md` or any other existing file (R-1) -- the one
+# path this emulation is ever allowed to write.
+_CURSOR_RULES_RELATIVE_PATH = Path(".cursor", "rules", "tradewind-session.mdc")
+
+
+def _rules_file_content(system_prompt: str) -> str:
+    header = (
+        "<!-- tradewind: generated system-prompt emulation (ARCHITECTURE §3.1 R-1). "
+        "Safe to delete; rewritten idempotently at the start of every turn on a "
+        "backend with no native system prompt. -->\n"
+    )
+    return header + system_prompt + "\n"
+
+
+def _write_rules_file(cwd: str, system_prompt: str) -> bool:
+    """Best-effort write of `.cursor/rules/tradewind-session.mdc` under
+    `cwd` (R-1). Returns whether the write succeeded -- an `OSError`
+    (unwritable/missing/non-directory `cwd`, ...) is caught here and treated
+    as "not writable", the trigger for `_emulate_system_prompt`'s
+    first-message-folding fallback, rather than failing the turn.
+
+    Written idempotently on every turn (overwriting whatever was there) and
+    never removed by this function: cleanup on session archive isn't wired
+    (controller ruling, task-15) -- a documented follow-up, not a silent gap.
+    """
+    try:
+        rules_path = Path(cwd) / _CURSOR_RULES_RELATIVE_PATH
+        rules_path.parent.mkdir(parents=True, exist_ok=True)
+        rules_path.write_text(_rules_file_content(system_prompt), encoding="utf-8")
+    except OSError:
+        return False
+    return True
+
+
+def _fold_system_prompt(system_prompt: str, prompt: str) -> str:
+    return f"[Instructions]\n{system_prompt}\n[Task]\n{prompt}"
+
+
+def _emulate_system_prompt(
+    backend: Backend, session_row: SessionRow, system_prompt: str | None, prompt: str
+) -> str:
+    """R-1: a backend whose `capabilities().supports_system_prompt` is False
+    never silently drops a caller's `system_prompt` -- this emulates it
+    above the port instead, driven by the flag (any such backend, not just
+    Cursor, though Cursor is the only one today).
+
+    Preferred: write the rules file into `session_row.cwd` (untouched,
+    idempotent rewrite on every turn) and return `prompt` unchanged -- the
+    backend's own request already reads the caller's workspace files.
+    Fallback (no `cwd`, or the write failed): fold `system_prompt` into the
+    returned prompt text itself (`[Instructions]\\n...\\n[Task]\\n...`).
+
+    A backend that natively supports a system prompt, or a turn with no
+    `system_prompt` at all, returns `prompt` verbatim -- nothing to emulate.
+    """
+    if system_prompt is None or backend.capabilities().supports_system_prompt:
+        return prompt
+    if session_row.cwd is not None and _write_rules_file(session_row.cwd, system_prompt):
+        return prompt
+    return _fold_system_prompt(system_prompt, prompt)
+
+
 class TurnRunner:
     """Orchestrates one turn per `execute()` call (see module docstring)."""
 
@@ -205,6 +271,14 @@ class TurnRunner:
         # the next `sweep_stale_turns` (session open).
         try:
             backend = self._resolve_backend(session_row.profile, profile)
+            effective_system_prompt = _effective_system_prompt(session_row, overrides)
+            # R-1 emulation (ARCHITECTURE §3.1): a backend that can't natively
+            # honor `effective_system_prompt` (e.g. Cursor,
+            # `supports_system_prompt=False`) never silently drops it --
+            # `prompt` is rewritten here, above the port, before it's ever
+            # mirrored or handed to the backend (`_emulate_system_prompt`'s
+            # own docstring has the full rules-file/fold-fallback contract).
+            prompt = _emulate_system_prompt(backend, session_row, effective_system_prompt, prompt)
             if (
                 session_row.native_session_id is not None
                 and backend.capabilities().supports_transcript_read
@@ -262,7 +336,7 @@ class TurnRunner:
                     turn_id=turn_id,
                     prompt=prompt,
                     model_spec=model_spec,
-                    system_prompt=_effective_system_prompt(session_row, overrides),
+                    system_prompt=effective_system_prompt,
                     output_schema=_effective_output_schema(snapshot, overrides),
                     tools=tool_host,
                     broker=broker,

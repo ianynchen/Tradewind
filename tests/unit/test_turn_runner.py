@@ -12,6 +12,12 @@ error-path tests in test_client_sessions.py (task-9 fix round 1):
 4. abandoning `session.stream()` early (no `stop()`) closes the backend's
    own generator deterministically (`contextlib.aclosing`) and still
    finalizes the turn -- no dangling `in_progress` row, no warnings.
+5. R-1 system-prompt emulation (task-15 brief): a backend flagging
+   `supports_system_prompt=False` gets the rules-file/prompt-folding
+   emulation `_emulate_system_prompt` implements, driven purely by the
+   capability flag (Cursor is the first backend this applies to, but the
+   emulation itself is backend-agnostic -- see that function's own
+   docstring).
 """
 
 from __future__ import annotations
@@ -34,6 +40,11 @@ from tradewind.application import client as _client
 from tradewind.application.client import Tradewind
 from tradewind.application.config import NativeStoreConfig, StoreConfig, TradewindConfig
 from tradewind.application.ports import Backend, TurnContext
+from tradewind.application.turn_runner import (
+    _emulate_system_prompt,
+    _fold_system_prompt,
+    _write_rules_file,
+)
 from tradewind.domain.errors import ConfigError, Unsupported
 from tradewind.domain.events import (
     Event,
@@ -78,13 +89,25 @@ def _config(tmp_path: Path, profile: Profile, **kwargs: object) -> TradewindConf
 # --- (1a) unregistered backend -> ConfigError via the REAL registry path ---
 
 
-async def test_unregistered_backend_raises_config_error_via_real_registry(tmp_path: Path) -> None:
-    # "cursor" is a valid BackendName but tradewind/__init__.py has no
-    # adapter for it yet (task-14 registered "codex" alongside "langchain"/
-    # "claude", so "codex" is no longer a usable stand-in here) -- no
-    # monkeypatching, no seeded `_backends`: this goes through `Tradewind.
-    # _resolve_backend` -> the real module-level `_backend_factories` dict
-    # exactly as production code populates it.
+async def test_unregistered_backend_raises_config_error_via_real_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # "cursor" used to be a valid-but-unregistered `BackendName` stand-in for
+    # this test; task-15 registered it too (alongside claude/codex/langchain),
+    # so every `BackendName` now has a real factory in the module-level
+    # registry and there is no naturally-unregistered name left to reuse.
+    # Rather than reach for another fictional name that a future task might
+    # also register out from under this test, delete just the "cursor" key
+    # from the REAL registry `tradewind/__init__.py` populates -- this still
+    # exercises the real `Tradewind._resolve_backend` -> `_backend_factories.
+    # get()` -> ConfigError path (no seeded `_backends`, no fake factory
+    # dict standing in for the whole registry), only synthetically missing
+    # the one entry this test needs missing.
+    monkeypatch.setattr(
+        _client,
+        "_backend_factories",
+        {name: factory for name, factory in _client._backend_factories.items() if name != "cursor"},
+    )
     profile = _profile(backend="cursor")
     tw = Tradewind(_config(tmp_path, profile))
     session = await tw.create(_VALID_ID, SessionOptions())
@@ -674,3 +697,211 @@ def _turn_statuses(store: object, session_id: str) -> list[str]:
     conn = cast(Any, store)._conn  # SqliteSessionStore's one sqlite3.Connection
     cur = conn.execute("SELECT status FROM turns WHERE session_id = ? ORDER BY seq", (session_id,))
     return [cast(str, row[0]) for row in cur.fetchall()]
+
+
+# --- (5) R-1 system-prompt emulation (task-15 brief) ---------------------
+
+
+class _NoSystemPromptBackend(Backend):
+    """Reports `supports_system_prompt=False` -- the trigger `_emulate_
+    system_prompt` gates on -- and records the exact `ctx.prompt` string it
+    was handed each turn, so the end-to-end test below can prove
+    `TurnRunner.execute` actually rewrites it before the backend sees it."""
+
+    name: ClassVar[BackendName] = "langchain"
+
+    def __init__(self, profile: Profile, native_config: NativeStoreConfig) -> None:
+        super().__init__(profile, native_config)
+        self.received_prompts: list[str] = []
+
+    def capabilities(self) -> Capabilities:
+        return Capabilities(
+            supports_system_prompt=False,
+            supports_structured_output=False,
+            supports_interactive_permissions=True,
+            supports_in_process_tools=True,
+            supports_native_resume=False,
+            supports_fork=False,
+            supports_transcript_read=False,
+        )
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        self.received_prompts.append(ctx.prompt)
+        yield TurnStarted(turn_id=ctx.turn_id)
+        yield _completed("ok")
+
+    async def probe_native(self, session: SessionRow) -> bool:  # noqa: ARG002
+        return False
+
+    async def read_native_transcript(
+        self,
+        session: SessionRow,  # noqa: ARG002
+        after_native_id: str | None,  # noqa: ARG002
+    ) -> list[NormalizedMessage]:
+        raise Unsupported("fake backend has no native transcript")
+
+    async def interrupt(self, session_id: str) -> None:
+        pass
+
+
+# --- pure-function tests: _emulate_system_prompt / _write_rules_file ----
+
+
+def test_emulate_system_prompt_is_a_noop_when_the_backend_supports_it(tmp_path: Path) -> None:
+    class _SupportsIt:
+        def capabilities(self) -> Capabilities:
+            return Capabilities(
+                supports_system_prompt=True,
+                supports_structured_output=False,
+                supports_interactive_permissions=True,
+                supports_in_process_tools=True,
+                supports_native_resume=False,
+                supports_fork=False,
+                supports_transcript_read=False,
+            )
+
+    row = SessionRow(
+        session_id="s1", backend="claude", profile="default", options_snapshot={}, cwd=str(tmp_path)
+    )
+
+    prompt = _emulate_system_prompt(cast(Backend, _SupportsIt()), row, "be nice", "hi")
+
+    assert prompt == "hi"
+    assert not (tmp_path / ".cursor").exists()
+
+
+def test_emulate_system_prompt_is_a_noop_when_there_is_no_system_prompt(tmp_path: Path) -> None:
+    backend = _NoSystemPromptBackend(_profile(), NativeStoreConfig())
+    row = SessionRow(
+        session_id="s1",
+        backend="langchain",
+        profile="default",
+        options_snapshot={},
+        cwd=str(tmp_path),
+    )
+
+    prompt = _emulate_system_prompt(backend, row, None, "hi")
+
+    assert prompt == "hi"
+    assert not (tmp_path / ".cursor").exists()
+
+
+def test_emulate_system_prompt_writes_the_rules_file_when_cwd_is_writable(tmp_path: Path) -> None:
+    backend = _NoSystemPromptBackend(_profile(), NativeStoreConfig())
+    row = SessionRow(
+        session_id="s1",
+        backend="langchain",
+        profile="default",
+        options_snapshot={},
+        cwd=str(tmp_path),
+    )
+
+    prompt = _emulate_system_prompt(backend, row, "be nice", "hi")
+
+    # The rules file, never AGENTS.md or any other existing file (R-1).
+    assert prompt == "hi"
+    rules_path = tmp_path / ".cursor" / "rules" / "tradewind-session.mdc"
+    assert rules_path.is_file()
+    assert "be nice" in rules_path.read_text()
+    assert not (tmp_path / "AGENTS.md").exists()
+
+
+def test_emulate_system_prompt_is_idempotent_across_turns(tmp_path: Path) -> None:
+    backend = _NoSystemPromptBackend(_profile(), NativeStoreConfig())
+    row = SessionRow(
+        session_id="s1",
+        backend="langchain",
+        profile="default",
+        options_snapshot={},
+        cwd=str(tmp_path),
+    )
+    rules_path = tmp_path / ".cursor" / "rules" / "tradewind-session.mdc"
+
+    _emulate_system_prompt(backend, row, "first prompt", "hi")
+    first_content = rules_path.read_text()
+    _emulate_system_prompt(backend, row, "second prompt", "hi again")
+    second_content = rules_path.read_text()
+
+    assert "first prompt" in first_content
+    assert "second prompt" in second_content
+    assert "first prompt" not in second_content  # overwritten, not appended
+
+
+def test_emulate_system_prompt_folds_into_prompt_when_cwd_is_unwritable(tmp_path: Path) -> None:
+    # A file sitting exactly where the rules file's own directory would
+    # need to be created forces `mkdir(parents=True)` to fail with a real
+    # `OSError` (`NotADirectoryError`) -- no permission-bit trickery needed,
+    # portable across platforms/CI users.
+    blocked_cwd = tmp_path / "blocked"
+    blocked_cwd.write_text("not a directory")
+    backend = _NoSystemPromptBackend(_profile(), NativeStoreConfig())
+    row = SessionRow(
+        session_id="s1",
+        backend="langchain",
+        profile="default",
+        options_snapshot={},
+        cwd=str(blocked_cwd),
+    )
+
+    prompt = _emulate_system_prompt(backend, row, "be nice", "hi")
+
+    assert prompt == "[Instructions]\nbe nice\n[Task]\nhi"
+
+
+def test_emulate_system_prompt_folds_when_session_has_no_cwd_at_all() -> None:
+    backend = _NoSystemPromptBackend(_profile(), NativeStoreConfig())
+    row = SessionRow(session_id="s1", backend="langchain", profile="default", options_snapshot={})
+
+    prompt = _emulate_system_prompt(backend, row, "be nice", "hi")
+
+    assert prompt == "[Instructions]\nbe nice\n[Task]\nhi"
+
+
+def test_write_rules_file_returns_false_on_oserror(tmp_path: Path) -> None:
+    blocked_cwd = tmp_path / "blocked"
+    blocked_cwd.write_text("not a directory")
+
+    assert _write_rules_file(str(blocked_cwd), "be nice") is False
+
+
+def test_fold_system_prompt_shape() -> None:
+    assert _fold_system_prompt("be nice", "hi") == "[Instructions]\nbe nice\n[Task]\nhi"
+
+
+# --- end-to-end through TurnRunner.execute: the backend actually sees it -
+
+
+async def test_execute_folds_system_prompt_into_prompt_for_a_no_cwd_session(
+    tmp_path: Path,
+) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _NoSystemPromptBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = fake
+    # No `cwd` on the session -> the fallback path is the only one reachable.
+    session = await tw.create(_VALID_ID, SessionOptions(system_prompt="be nice"))
+
+    result = await session.run("hi")
+
+    assert result.status == "completed"
+    assert fake.received_prompts == ["[Instructions]\nbe nice\n[Task]\nhi"]
+
+
+async def test_execute_writes_rules_file_and_leaves_prompt_untouched_for_a_writable_cwd(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _NoSystemPromptBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions(system_prompt="be nice", cwd=workspace))
+
+    result = await session.run("hi")
+
+    assert result.status == "completed"
+    assert fake.received_prompts == ["hi"]
+    rules_path = workspace / ".cursor" / "rules" / "tradewind-session.mdc"
+    assert rules_path.is_file()
+    assert "be nice" in rules_path.read_text()

@@ -15,6 +15,7 @@ dependencies = [
     "langchain-core==1.6.1",
     "claude-agent-sdk==0.2.151",
     "openai-codex==0.147.0",
+    "cursor-sdk==1.0.30",
 ]
 
 [dependency-groups]
@@ -226,6 +227,30 @@ disallow_any_expr = false
 # narrower type to give either without inventing one the SDK itself doesn't
 # have. Narrowed to this module only.
 module = "tradewind.adapters.codex_backend"
+disallow_any_explicit = false
+disallow_any_expr = false
+
+[[tool.mypy.overrides]]
+# `cursor_backend` is the third adapter (after `claude_backend`/
+# `codex_backend`) to consume a third-party SDK whose own typing is
+# pervasively `Any`-tainted, for the same reasons as those two modules' own
+# overrides: `cursor_sdk.types` carries `Any`-typed fields directly
+# (`SDKToolUseMessage.args: Any`, `SDKToolUseMessage.result: Any`,
+# `ToolUseBlock.input: Any`, `RunStreamEvent.result: Mapping[str, Any] |
+# None`, `RunStreamEvent.done: Mapping[str, Any] | None`), and its own
+# `CustomTool.execute` is typed `Callable[[Mapping[str, Any],
+# CustomToolContext], Any]` (`CustomToolExecute`) -- the tool-call bridge
+# (`_build_custom_tools`) must spell that shape back at the SDK verbatim,
+# there is no narrower type to give it without inventing one the SDK itself
+# doesn't have. Confirmed by minimal repro, same root cause and same
+# resolution as the `claude_backend`/`codex_backend` overrides: every read
+# of one of these fields, or construction of a `CustomTool`, is "Expression
+# type contains Any" under `disallow_any_expr` regardless of how this module
+# annotates or casts the result. `disallow_any_explicit` is ALSO relaxed
+# here (same as `claude_backend`/`codex_backend`), for the same
+# `CustomTool.execute`/`Mapping[str, Any]` spelling reason. Narrowed to this
+# module only.
+module = "tradewind.adapters.cursor_backend"
 disallow_any_explicit = false
 disallow_any_expr = false
 

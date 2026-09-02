@@ -404,6 +404,22 @@ wheels = [
 ]
 
 [[package]]
+name = "cursor-sdk"
+version = "1.0.30"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/53/3f/5f3cd42cb51cd916a7abed6c918b20da338c7a8d57a99f06457987719be3/cursor_sdk-1.0.30.tar.gz", hash = "sha256:f699bb9e72f95ebbdbc94ecfda0958323437c155baf6c4e623699e8caef4dfa2", size = 1177, upload-time = "2026-08-27T15:32:30.763Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/74/cc/eb1ed72c0d6845470f30fda1693c57ea378f688ef42cdbd8162a451519f7/cursor_sdk-1.0.30-py3-none-macosx_11_0_arm64.whl", hash = "sha256:3b317a73fca0f67355edc5069946a8ed9e7e213354330e10be9cde98c77d26f5", size = 49451848, upload-time = "2026-08-27T15:32:14.7Z" },
+    { url = "https://files.pythonhosted.org/packages/4c/fb/dcaaf1399b8bce2cd56c153b5f44c8777bd60debe501c4cd2acdf059ef72/cursor_sdk-1.0.30-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:4f1a4ac1cf5d900a55226acf6862f2e345cc55e72c45947247d045f6842f7ad7", size = 50962294, upload-time = "2026-08-27T15:32:17.99Z" },
+    { url = "https://files.pythonhosted.org/packages/72/59/3e1e2466ffb8268782db070f4f023d6856e26978b91575a3a4baded32b70/cursor_sdk-1.0.30-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:5892ef9ad915b63bdd065b8d3f8e5000c38eba1683db45704cd33c2be779dcee", size = 58558462, upload-time = "2026-08-27T15:32:20.9Z" },
+    { url = "https://files.pythonhosted.org/packages/c5/d0/0d41179fc676351173b3be99bb3289daa39d4511b1412eb2641afe6d07d8/cursor_sdk-1.0.30-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:d9f914ad13091fbc50e39b74edfb3ce03d294a2c5aa7eb30aac22bda68ac5ad3", size = 59249308, upload-time = "2026-08-27T15:32:25.753Z" },
+    { url = "https://files.pythonhosted.org/packages/0d/41/323944370bb2496f4645b747be8409ffd98a4bb7264b8210819093321ec2/cursor_sdk-1.0.30-py3-none-win_amd64.whl", hash = "sha256:8c679403fd1044be47253353f3c69e9b6ccc48464219b5f25c8797b117ee91e9", size = 45545656, upload-time = "2026-08-27T15:32:28.53Z" },
+]
+
+[[package]]
 name = "distro"
 version = "1.9.0"
 source = { registry = "https://pypi.org/simple" }
@@ -1473,6 +1489,7 @@ source = { editable = "." }
 dependencies = [
     { name = "anyio" },
     { name = "claude-agent-sdk" },
+    { name = "cursor-sdk" },
     { name = "langchain-anthropic" },
     { name = "langchain-core" },
     { name = "mcp" },
@@ -1493,6 +1510,7 @@ dev = [
 requires-dist = [
     { name = "anyio", specifier = ">=4" },
     { name = "claude-agent-sdk", specifier = "==0.2.151" },
+    { name = "cursor-sdk", specifier = "==1.0.30" },
     { name = "langchain-anthropic", specifier = "==1.7.0" },
     { name = "langchain-core", specifier = "==1.6.1" },
     { name = "mcp", specifier = "==2.1.1" },
