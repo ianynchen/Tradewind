@@ -62,6 +62,7 @@ from tradewind.domain.models import (
     Profile,
     SessionOptions,
     SessionRow,
+    StoredMessage,
     Tool,
     TurnResult,
 )
@@ -764,7 +765,9 @@ def test_emulate_system_prompt_is_a_noop_when_the_backend_supports_it(tmp_path: 
         session_id="s1", backend="claude", profile="default", options_snapshot={}, cwd=str(tmp_path)
     )
 
-    prompt = _emulate_system_prompt(cast(Backend, _SupportsIt()), row, "be nice", "hi")
+    prompt = _emulate_system_prompt(
+        cast(Backend, _SupportsIt()), row, "be nice", "hi", is_first_turn=True
+    )
 
     assert prompt == "hi"
     assert not (tmp_path / ".cursor").exists()
@@ -780,7 +783,7 @@ def test_emulate_system_prompt_is_a_noop_when_there_is_no_system_prompt(tmp_path
         cwd=str(tmp_path),
     )
 
-    prompt = _emulate_system_prompt(backend, row, None, "hi")
+    prompt = _emulate_system_prompt(backend, row, None, "hi", is_first_turn=True)
 
     assert prompt == "hi"
     assert not (tmp_path / ".cursor").exists()
@@ -796,7 +799,7 @@ def test_emulate_system_prompt_writes_the_rules_file_when_cwd_is_writable(tmp_pa
         cwd=str(tmp_path),
     )
 
-    prompt = _emulate_system_prompt(backend, row, "be nice", "hi")
+    prompt = _emulate_system_prompt(backend, row, "be nice", "hi", is_first_turn=True)
 
     # The rules file, never AGENTS.md or any other existing file (R-1).
     assert prompt == "hi"
@@ -804,6 +807,28 @@ def test_emulate_system_prompt_writes_the_rules_file_when_cwd_is_writable(tmp_pa
     assert rules_path.is_file()
     assert "be nice" in rules_path.read_text()
     assert not (tmp_path / "AGENTS.md").exists()
+
+
+def test_emulate_system_prompt_rewrites_the_rules_file_on_a_later_turn_too(
+    tmp_path: Path,
+) -> None:
+    # Unlike the fold fallback (below), the rules-file path is NOT gated on
+    # `is_first_turn` -- rewriting the live workspace file every turn is
+    # idempotent and never duplicates anything (module docstring).
+    backend = _NoSystemPromptBackend(_profile(), NativeStoreConfig())
+    row = SessionRow(
+        session_id="s1",
+        backend="langchain",
+        profile="default",
+        options_snapshot={},
+        cwd=str(tmp_path),
+    )
+
+    prompt = _emulate_system_prompt(backend, row, "be nice", "hi again", is_first_turn=False)
+
+    assert prompt == "hi again"
+    rules_path = tmp_path / ".cursor" / "rules" / "tradewind-session.mdc"
+    assert "be nice" in rules_path.read_text()
 
 
 def test_emulate_system_prompt_is_idempotent_across_turns(tmp_path: Path) -> None:
@@ -817,9 +842,9 @@ def test_emulate_system_prompt_is_idempotent_across_turns(tmp_path: Path) -> Non
     )
     rules_path = tmp_path / ".cursor" / "rules" / "tradewind-session.mdc"
 
-    _emulate_system_prompt(backend, row, "first prompt", "hi")
+    _emulate_system_prompt(backend, row, "first prompt", "hi", is_first_turn=True)
     first_content = rules_path.read_text()
-    _emulate_system_prompt(backend, row, "second prompt", "hi again")
+    _emulate_system_prompt(backend, row, "second prompt", "hi again", is_first_turn=False)
     second_content = rules_path.read_text()
 
     assert "first prompt" in first_content
@@ -827,7 +852,9 @@ def test_emulate_system_prompt_is_idempotent_across_turns(tmp_path: Path) -> Non
     assert "first prompt" not in second_content  # overwritten, not appended
 
 
-def test_emulate_system_prompt_folds_into_prompt_when_cwd_is_unwritable(tmp_path: Path) -> None:
+def test_emulate_system_prompt_folds_into_prompt_on_the_first_turn_when_cwd_is_unwritable(
+    tmp_path: Path,
+) -> None:
     # A file sitting exactly where the rules file's own directory would
     # need to be created forces `mkdir(parents=True)` to fail with a real
     # `OSError` (`NotADirectoryError`) -- no permission-bit trickery needed,
@@ -843,18 +870,53 @@ def test_emulate_system_prompt_folds_into_prompt_when_cwd_is_unwritable(tmp_path
         cwd=str(blocked_cwd),
     )
 
-    prompt = _emulate_system_prompt(backend, row, "be nice", "hi")
+    prompt = _emulate_system_prompt(backend, row, "be nice", "hi", is_first_turn=True)
 
     assert prompt == "[Instructions]\nbe nice\n[Task]\nhi"
+
+
+def test_emulate_system_prompt_does_not_fold_on_a_later_turn_even_when_cwd_is_unwritable(
+    tmp_path: Path,
+) -> None:
+    # Controller ruling (fix round 1): the fold plants the instructions in
+    # the backend's own NATIVE conversation history on turn one; a backend
+    # without a native system prompt can still carry that native history
+    # forward on its own (e.g. Cursor's `Agent.resume()`), so re-folding on
+    # every later turn would re-inject and duplicate the instructions in
+    # that native history turn after turn -- gated on `is_first_turn`
+    # regardless of whether the rules-file write keeps failing.
+    blocked_cwd = tmp_path / "blocked"
+    blocked_cwd.write_text("not a directory")
+    backend = _NoSystemPromptBackend(_profile(), NativeStoreConfig())
+    row = SessionRow(
+        session_id="s1",
+        backend="langchain",
+        profile="default",
+        options_snapshot={},
+        cwd=str(blocked_cwd),
+    )
+
+    prompt = _emulate_system_prompt(backend, row, "be nice", "hi again", is_first_turn=False)
+
+    assert prompt == "hi again"
 
 
 def test_emulate_system_prompt_folds_when_session_has_no_cwd_at_all() -> None:
     backend = _NoSystemPromptBackend(_profile(), NativeStoreConfig())
     row = SessionRow(session_id="s1", backend="langchain", profile="default", options_snapshot={})
 
-    prompt = _emulate_system_prompt(backend, row, "be nice", "hi")
+    prompt = _emulate_system_prompt(backend, row, "be nice", "hi", is_first_turn=True)
 
     assert prompt == "[Instructions]\nbe nice\n[Task]\nhi"
+
+
+def test_emulate_system_prompt_does_not_fold_when_no_cwd_on_a_later_turn() -> None:
+    backend = _NoSystemPromptBackend(_profile(), NativeStoreConfig())
+    row = SessionRow(session_id="s1", backend="langchain", profile="default", options_snapshot={})
+
+    prompt = _emulate_system_prompt(backend, row, "be nice", "hi again", is_first_turn=False)
+
+    assert prompt == "hi again"
 
 
 def test_write_rules_file_returns_false_on_oserror(tmp_path: Path) -> None:
@@ -868,26 +930,53 @@ def test_fold_system_prompt_shape() -> None:
     assert _fold_system_prompt("be nice", "hi") == "[Instructions]\nbe nice\n[Task]\nhi"
 
 
-# --- end-to-end through TurnRunner.execute: the backend actually sees it -
+# --- end-to-end through TurnRunner.execute: the backend actually sees it,
+# and the mirror only ever stores the caller's ORIGINAL prompt (fix round 1:
+# the earlier shape persisted the fold itself into store.history(), and
+# re-applied it on every turn -- both fixed together, both asserted here
+# across two turns) --------------------------------------------------------
 
 
-async def test_execute_folds_system_prompt_into_prompt_for_a_no_cwd_session(
+def _prompt_texts(messages: list[StoredMessage]) -> list[str]:
+    return [
+        cast(str, m.content.get("text", ""))
+        for m in messages
+        if m.role == "user" and m.kind == "text"
+    ]
+
+
+async def test_execute_folds_system_prompt_only_on_the_first_turn_and_never_persists_the_fold(
     tmp_path: Path,
 ) -> None:
     profile = _profile()
     tw = Tradewind(_config(tmp_path, profile))
     fake = _NoSystemPromptBackend(profile, NativeStoreConfig())
     tw._backends["default"] = fake
-    # No `cwd` on the session -> the fallback path is the only one reachable.
+    # No `cwd` on the session -> the fallback (fold) path is the only one
+    # reachable on every turn where it applies at all.
     session = await tw.create(_VALID_ID, SessionOptions(system_prompt="be nice"))
 
-    result = await session.run("hi")
+    first = await session.run("hi one")
+    second = await session.run("hi two")
 
-    assert result.status == "completed"
-    assert fake.received_prompts == ["[Instructions]\nbe nice\n[Task]\nhi"]
+    assert first.status == "completed"
+    assert second.status == "completed"
+    # The backend sees the fold ONLY on turn one; turn two is unfolded --
+    # the instructions are assumed already part of the backend's own turn-
+    # one exchange (module docstring's "native history" reasoning).
+    assert fake.received_prompts == [
+        "[Instructions]\nbe nice\n[Task]\nhi one",
+        "hi two",
+    ]
+    # The mirror stores the CALLER's original text, never the fold, on
+    # EITHER turn -- this is the bug fix round 1 exists for.
+    history = await tw.history(_VALID_ID)
+    assert _prompt_texts(history) == ["hi one", "hi two"]
+    assert all("[Instructions]" not in text for text in _prompt_texts(history))
+    assert all("[Task]" not in text for text in _prompt_texts(history))
 
 
-async def test_execute_writes_rules_file_and_leaves_prompt_untouched_for_a_writable_cwd(
+async def test_execute_writes_rules_file_every_turn_and_always_persists_originals(
     tmp_path: Path,
 ) -> None:
     workspace = tmp_path / "workspace"
@@ -898,10 +987,18 @@ async def test_execute_writes_rules_file_and_leaves_prompt_untouched_for_a_writa
     tw._backends["default"] = fake
     session = await tw.create(_VALID_ID, SessionOptions(system_prompt="be nice", cwd=workspace))
 
-    result = await session.run("hi")
+    first = await session.run("hi one")
+    second = await session.run("hi two")
 
-    assert result.status == "completed"
-    assert fake.received_prompts == ["hi"]
+    assert first.status == "completed"
+    assert second.status == "completed"
+    # The rules-file path never folds, on either turn.
+    assert fake.received_prompts == ["hi one", "hi two"]
     rules_path = workspace / ".cursor" / "rules" / "tradewind-session.mdc"
     assert rules_path.is_file()
     assert "be nice" in rules_path.read_text()
+    # And the mirror always stores exactly what the caller sent, on this
+    # path too (regression coverage the reviewer specifically asked for --
+    # this path was never buggy, but was previously unasserted here).
+    history = await tw.history(_VALID_ID)
+    assert _prompt_texts(history) == ["hi one", "hi two"]

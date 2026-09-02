@@ -161,18 +161,40 @@ def _fold_system_prompt(system_prompt: str, prompt: str) -> str:
 
 
 def _emulate_system_prompt(
-    backend: Backend, session_row: SessionRow, system_prompt: str | None, prompt: str
+    backend: Backend,
+    session_row: SessionRow,
+    system_prompt: str | None,
+    prompt: str,
+    *,
+    is_first_turn: bool,
 ) -> str:
     """R-1: a backend whose `capabilities().supports_system_prompt` is False
     never silently drops a caller's `system_prompt` -- this emulates it
     above the port instead, driven by the flag (any such backend, not just
     Cursor, though Cursor is the only one today).
 
-    Preferred: write the rules file into `session_row.cwd` (untouched,
-    idempotent rewrite on every turn) and return `prompt` unchanged -- the
-    backend's own request already reads the caller's workspace files.
+    Preferred: (re)write the rules file into `session_row.cwd` -- idempotent
+    overwrite on EVERY turn, regardless of `is_first_turn` -- and return
+    `prompt` unchanged: the backend's own request reads the caller's
+    workspace files fresh each turn, so there is nothing to duplicate by
+    rewriting it repeatedly.
+
     Fallback (no `cwd`, or the write failed): fold `system_prompt` into the
-    returned prompt text itself (`[Instructions]\\n...\\n[Task]\\n...`).
+    returned prompt text (`[Instructions]\\n...\\n[Task]\\n...`) -- but ONLY
+    when `is_first_turn` is True (controller ruling, task-15 fix round 1).
+    A backend without a native system prompt can still keep its OWN native
+    conversation history across turns (e.g. Cursor's `Agent.resume()`); the
+    fold on turn one is what plants the instructions in that native
+    history, and they stay there on their own from then on -- folding again
+    on every later turn would re-inject them into the backend's own context
+    on every single turn, duplicating them turn after turn. (This is
+    independent of, and does not fix on its own, `TurnRunner.execute`'s own
+    obligation to persist the CALLER's original prompt, not this fold, into
+    the mirror -- see its own comment for that half.) A turn after the
+    first returns `prompt` unchanged even if the rules-file write is still
+    failing: the caller gets no repeated emulation attempt past turn one on
+    this path, an accepted limitation of the "first turn only" rule as
+    specified.
 
     A backend that natively supports a system prompt, or a turn with no
     `system_prompt` at all, returns `prompt` verbatim -- nothing to emulate.
@@ -180,6 +202,8 @@ def _emulate_system_prompt(
     if system_prompt is None or backend.capabilities().supports_system_prompt:
         return prompt
     if session_row.cwd is not None and _write_rules_file(session_row.cwd, system_prompt):
+        return prompt
+    if not is_first_turn:
         return prompt
     return _fold_system_prompt(system_prompt, prompt)
 
@@ -272,13 +296,6 @@ class TurnRunner:
         try:
             backend = self._resolve_backend(session_row.profile, profile)
             effective_system_prompt = _effective_system_prompt(session_row, overrides)
-            # R-1 emulation (ARCHITECTURE §3.1): a backend that can't natively
-            # honor `effective_system_prompt` (e.g. Cursor,
-            # `supports_system_prompt=False`) never silently drops it --
-            # `prompt` is rewritten here, above the port, before it's ever
-            # mirrored or handed to the backend (`_emulate_system_prompt`'s
-            # own docstring has the full rules-file/fold-fallback contract).
-            prompt = _emulate_system_prompt(backend, session_row, effective_system_prompt, prompt)
             if (
                 session_row.native_session_id is not None
                 and backend.capabilities().supports_transcript_read
@@ -318,11 +335,36 @@ class TurnRunner:
                         session_id, include_children=False, include_raw=False
                     )
                 )
+                # R-1 emulation (ARCHITECTURE §3.1), computed here -- after
+                # `history` loads, before anything is persisted -- for two
+                # reasons: (1) the fold-fallback path needs to know whether
+                # this is genuinely the session's first turn (`history`
+                # empty), per the controller ruling in `_emulate_system_
+                # prompt`'s own docstring; (2) `backend_prompt` (the
+                # possibly-emulated text) is deliberately kept SEPARATE from
+                # `prompt` (the caller's own, untouched text) from this
+                # point on -- `backend_prompt` is what reaches `ctx`/the
+                # backend, `prompt` is what gets persisted below. Folding
+                # `prompt` itself (the earlier, buggy shape -- fix round 1)
+                # both re-applied the fold on every turn AND wrote the
+                # `[Instructions]\n...\n[Task]\n...` wrapper into the mirror
+                # as if the caller had typed it, corrupting `store.
+                # history()` for good.
+                backend_prompt = _emulate_system_prompt(
+                    backend,
+                    session_row,
+                    effective_system_prompt,
+                    prompt,
+                    is_first_turn=not history,
+                )
                 # The prompt is this turn's own input, not something a
                 # backend "completes" as an `ItemCompleted` event, so
                 # nothing else mirrors it -- the runner writes it directly.
-                # After `history` above so this turn's own prompt doesn't
-                # also show up in `ctx.load_history()` (the backend appends
+                # Always the CALLER's original `prompt`, never `backend_
+                # prompt` (see above): the mirror records what the caller
+                # actually said, not tradewind's own request-shaping. After
+                # `history` above so this turn's own prompt doesn't also
+                # show up in `ctx.load_history()` (the backend appends
                 # `ctx.prompt` itself when building its request).
                 prompt_content: dict[str, object] = {"text": prompt}
                 await anyio.to_thread.run_sync(
@@ -334,7 +376,7 @@ class TurnRunner:
                 ctx = TurnContext(
                     session=session_row,
                     turn_id=turn_id,
-                    prompt=prompt,
+                    prompt=backend_prompt,
                     model_spec=model_spec,
                     system_prompt=effective_system_prompt,
                     output_schema=_effective_output_schema(snapshot, overrides),

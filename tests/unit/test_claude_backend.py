@@ -1,8 +1,10 @@
 """Tests for `ClaudeBackend` instance behaviour that isn't a pure mapping
 function -- `interrupt()`'s handling of a client registered before
-`ClaudeSDKClient.connect()` finishes (task-10 fix round 1), and
+`ClaudeSDKClient.connect()` finishes (task-10 fix round 1),
 `take_native_session_id()`'s per-session pop semantics (task-11 review, fix
-round 1). Pure event mapping lives in `tests/unit/test_claude_mapping.py`;
+round 1), and `run()`'s `output_schema` capability guard (task-15 fix
+round 1: previously untested here, though the guard itself dates to
+task-10). Pure event mapping lives in `tests/unit/test_claude_mapping.py`;
 a real live session is `tests/conformance/test_claude.py` /
 `tests/integration/test_claude_live.py` (`@pytest.mark.integration`).
 """
@@ -11,11 +13,15 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+import pytest
 from claude_agent_sdk import CLIConnectionError
 
 from tradewind.adapters.claude_backend import ClaudeBackend
 from tradewind.application.config import NativeStoreConfig
-from tradewind.domain.models import ModelSpec, Profile, SubscriptionAuth
+from tradewind.application.ports import TurnContext
+from tradewind.application.tool_host import ToolHost
+from tradewind.domain.errors import Unsupported
+from tradewind.domain.models import ModelSpec, Profile, SessionRow, SubscriptionAuth, Verdict
 
 
 def _profile() -> Profile:
@@ -24,6 +30,48 @@ def _profile() -> Profile:
         auth=SubscriptionAuth(),
         models={"standard": ModelSpec(model="claude-sonnet-4-5")},
     )
+
+
+class _NoBroker:
+    """Satisfies `PermissionBroker` but must never be called -- the
+    `output_schema` guard raises before `ctx.broker` is ever touched."""
+
+    async def decide(self, tool_name: str, _tool_input: dict[str, object]) -> Verdict:
+        raise AssertionError(f"broker.decide should not be called (got {tool_name!r})")
+
+
+def _make_ctx(*, output_schema: dict[str, object] | None) -> TurnContext:
+    return TurnContext(
+        session=SessionRow(
+            session_id="s1", backend="claude", profile="default", options_snapshot={}
+        ),
+        turn_id="turn-1",
+        prompt="hello",
+        model_spec=ModelSpec(model="claude-sonnet-4-5"),
+        system_prompt=None,
+        output_schema=output_schema,
+        tools=ToolHost([], [], lambda ref: ref),
+        broker=cast(Any, _NoBroker()),
+        load_history=lambda: [],
+    )
+
+
+# --- run(): output_schema capability guard (mirrors supports_structured_
+# output=False; same test shape as test_langchain_adapter.py's own) ------
+
+
+async def test_run_with_output_schema_raises_unsupported_before_turn_started() -> None:
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+    ctx = _make_ctx(output_schema={"type": "object", "properties": {}})
+
+    events: list[object] = []
+    with pytest.raises(Unsupported):
+        async for event in backend.run(ctx):
+            events.append(event)
+
+    # No TurnStarted (or anything else, and in particular no ClaudeSDKClient
+    # construction attempt) happened before the raise.
+    assert events == []
 
 
 class _RaisesConnectionErrorClient:

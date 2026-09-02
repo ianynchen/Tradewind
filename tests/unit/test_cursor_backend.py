@@ -1,27 +1,32 @@
 """Tests for `CursorBackend` instance behaviour that isn't a pure mapping
 function: `capabilities()`, `probe_native()`, `take_native_session_id()`'s
-per-session pop, `interrupt()`'s registry/no-op/swallow behaviour, and the
-`ToolHost` -> `CustomTool` bridge (`_build_custom_tools`) actually
-dispatching a call end to end with no network access. Pure event mapping
-lives in `tests/unit/test_cursor_mapping.py`; a real live session is
-`tests/conformance/test_cursor.py`, permanently skipped until P-5 is
-resolved (see that module's own docstring) -- there is no injectable fake
-"bridge subprocess" seam here the way `LangchainBackend` has a fake chat
-model, so `_run_turn`/`run()` themselves are not exercised in this file,
-mirroring exactly what `test_claude_backend.py`/`test_codex_backend.py` do
-for their own un-fakeable SDK client construction.
+per-session pop, `interrupt()`'s registry/no-op/swallow behaviour, `run()`'s
+`output_schema` capability guard, and the `ToolHost` -> `CustomTool` bridge
+(`_build_custom_tools`) actually dispatching a call end to end with no
+network access. Pure event mapping lives in `tests/unit/test_cursor_mapping.py`;
+a real live session is `tests/conformance/test_cursor.py`, permanently
+skipped until P-5 is resolved (see that module's own docstring) -- there is
+no injectable fake "bridge subprocess" seam here the way `LangchainBackend`
+has a fake chat model, so `_run_turn` (the actual bridge-driving body) is
+never exercised in this file, mirroring exactly what
+`test_claude_backend.py`/`test_codex_backend.py` do for their own
+un-fakeable SDK client construction. `run()`'s own capability guard (below)
+needs none of that -- it raises before `_run_turn` is ever reached.
 """
 
 from __future__ import annotations
+
+from typing import Any, cast
 
 import pytest
 from cursor_sdk import UnsupportedRunOperationError
 
 from tradewind.adapters.cursor_backend import CursorBackend, _build_custom_tools
 from tradewind.application.config import NativeStoreConfig
+from tradewind.application.ports import TurnContext
 from tradewind.application.tool_host import ToolHost
 from tradewind.domain.errors import Unsupported
-from tradewind.domain.models import ModelSpec, Profile, SessionRow, SubscriptionAuth, Tool
+from tradewind.domain.models import ModelSpec, Profile, SessionRow, SubscriptionAuth, Tool, Verdict
 
 
 def _profile() -> Profile:
@@ -29,6 +34,30 @@ def _profile() -> Profile:
         backend="cursor",
         auth=SubscriptionAuth(),
         models={"standard": ModelSpec(model="composer-2")},
+    )
+
+
+class _NoBroker:
+    """Satisfies `PermissionBroker` but must never be called -- the
+    `output_schema` guard raises before `ctx.broker` is ever touched."""
+
+    async def decide(self, tool_name: str, _tool_input: dict[str, object]) -> Verdict:
+        raise AssertionError(f"broker.decide should not be called (got {tool_name!r})")
+
+
+def _make_ctx(*, output_schema: dict[str, object] | None) -> TurnContext:
+    return TurnContext(
+        session=SessionRow(
+            session_id="s1", backend="cursor", profile="default", options_snapshot={}
+        ),
+        turn_id="turn-1",
+        prompt="hello",
+        model_spec=ModelSpec(model="composer-2"),
+        system_prompt=None,
+        output_schema=output_schema,
+        tools=ToolHost([], [], lambda ref: ref),
+        broker=cast(Any, _NoBroker()),
+        load_history=lambda: [],
     )
 
 
@@ -45,6 +74,25 @@ def test_capabilities_match_the_brief() -> None:
     assert caps.supports_native_resume is True
     assert caps.supports_fork is False
     assert caps.supports_transcript_read is False
+
+
+# --- run(): output_schema capability guard (mirrors supports_structured_
+# output=False; matches ClaudeBackend's/LangchainBackend's identical guard,
+# same test shape as test_langchain_adapter.py's own) --------------------
+
+
+async def test_run_with_output_schema_raises_unsupported_before_turn_started() -> None:
+    backend = CursorBackend(_profile(), NativeStoreConfig())
+    ctx = _make_ctx(output_schema={"type": "object", "properties": {}})
+
+    events: list[object] = []
+    with pytest.raises(Unsupported):
+        async for event in backend.run(ctx):
+            events.append(event)
+
+    # No TurnStarted (or anything else, and in particular no bridge
+    # subprocess spawn attempt) happened before the raise.
+    assert events == []
 
 
 # --- probe_native: cheap id-truthiness check ---------------------------
