@@ -81,6 +81,7 @@ from claude_agent_sdk import (
     CanUseTool,
     ClaudeAgentOptions,
     ClaudeSDKClient,
+    CLIConnectionError,
     McpSdkServerConfig,
     PermissionResult,
     PermissionResultAllow,
@@ -347,10 +348,52 @@ def native_transcript_items(
     return items
 
 
+def _normalize_input_schema(schema: dict[str, Any]) -> dict[str, Any]:
+    """Ensure `schema` reaches `create_sdk_mcp_server`'s literal-JSON-Schema
+    fast path instead of its `{param_name: python_type}` shorthand path
+    (`_build_input_schema`, `claude_agent_sdk/__init__.py` -- read directly
+    off the installed 0.2.151 package this session, fix-round-1 report):
+
+        if (
+            "type" in tool_def.input_schema
+            and "properties" in tool_def.input_schema
+            and isinstance(tool_def.input_schema["type"], str)
+        ):
+            return tool_def.input_schema  # literal pass-through
+        properties = {
+            param_name: _python_type_to_json_schema(param_type)
+            for param_name, param_type in tool_def.input_schema.items()
+        }
+        ...                                # shorthand: every top-level key,
+                                            # "type" included, becomes a
+                                            # bogus parameter name
+
+    A `Tool.input_schema` of `{"type": "object"}` (a legitimate, if
+    minimal, JSON Schema for "any object") has no `"properties"` key, so
+    without this normalization it silently falls into the shorthand branch
+    -- its own `"type": "object"` entry gets reinterpreted as a parameter
+    literally named `type` (confirmed empirically against the installed SDK
+    this session: `_build_input_schema` turned it into `{"properties":
+    {"type": {"type": "string"}}, "required": ["type"]}`), and the model
+    then correctly, faithfully calls the tool with that bogus shape
+    (`{"type": "x"}`) -- the task-10 report's `tool_allow_deny` root cause,
+    corrected here rather than in the report's own wording.
+
+    Only the exact gap in the SDK's own guard is patched (`"type"` present
+    and a `str`, `"properties"` absent) -- matched intentionally, not just
+    "close enough", so this never second-guesses a schema that was already
+    going to hit the literal path, or one that was always meant to use the
+    shorthand form (no `"type"` key at all).
+    """
+    if "type" in schema and isinstance(schema["type"], str) and "properties" not in schema:
+        return {**schema, "properties": {}}
+    return schema
+
+
 def _sdk_tool_from_schema(host: ToolHost, schema: dict[str, object]) -> SdkMcpTool[Any]:
     name = cast(str, schema["name"])
     description = cast(str, schema.get("description", ""))
-    input_schema = cast("dict[str, Any]", schema.get("input_schema", {}))
+    input_schema = _normalize_input_schema(cast("dict[str, Any]", schema.get("input_schema", {})))
 
     async def handler(args: dict[str, Any]) -> dict[str, Any]:
         outcome = await host.call(name, cast("dict[str, object]", args))
@@ -442,8 +485,31 @@ class ClaudeBackend(Backend):
 
     async def interrupt(self, session_id: str) -> None:
         client = self._clients.get(session_id)
-        if client is not None:
+        if client is None:
+            return
+        try:
             await client.interrupt()
+        except CLIConnectionError:
+            # `self._clients[session_id]` is set as soon as `_run_turn`
+            # constructs the client -- before `_drive_client` awaits
+            # `client.connect(...)` -- so a `stop()` landing in that window
+            # finds a registered-but-not-yet-connected client.
+            # `ClaudeSDKClient.interrupt()` raises `CLIConnectionError` in
+            # that state (`client.py`: "Not connected. Call connect()
+            # first.") rather than queuing the interrupt. `Backend.interrupt`'s
+            # contract (ports.py) is "a no-op when no turn is currently in
+            # flight" -- nothing is running yet to cancel either, so this is
+            # swallowed rather than propagated (fix round 1: caught here
+            # over a connected-flag+retry, which would need to reach back
+            # into `_drive_client` to honor a pending interrupt once
+            # `connect()` resolves -- undone work for what should be a very
+            # short window in practice). A `stop()` racing this tightly
+            # against a still-connecting `run()` simply won't interrupt that
+            # specific attempt; logged, not silently dropped.
+            _logger.info(
+                "ClaudeSDKClient.interrupt() called before connect() finished; treated as a no-op",
+                extra={"session_id": session_id},
+            )
 
     def _build_options(self, ctx: TurnContext, pending_events: list[Event]) -> ClaudeAgentOptions:
         system_prompt = (

@@ -7,9 +7,12 @@ itself is exercised live only by `tests/conformance/test_claude.py`
 
 from __future__ import annotations
 
+from typing import Any
+
 from claude_agent_sdk import (
     AssistantMessage,
     ResultMessage,
+    SdkMcpTool,
     SessionMessage,
     TextBlock,
     ThinkingBlock,
@@ -17,8 +20,10 @@ from claude_agent_sdk import (
     ToolUseBlock,
     UserMessage,
 )
+from claude_agent_sdk import _build_input_schema as sdk_build_input_schema
 
 from tradewind.adapters.claude_backend import (
+    _normalize_input_schema,
     assistant_message_items,
     is_aborted_result,
     native_transcript_items,
@@ -314,3 +319,68 @@ def test_native_transcript_empty_content_string_yields_nothing() -> None:
     entries = [_session_message("user", "u-1", {"role": "user", "content": ""})]
 
     assert native_transcript_items(entries, after_native_id=None) == []
+
+
+# --- _normalize_input_schema ---
+#
+# Regression coverage for fix round 1: `create_sdk_mcp_server`'s own
+# `_build_input_schema` (imported directly from the installed SDK below, not
+# reimplemented) only takes a `Tool.input_schema` dict literally when it has
+# both `"type"` (a str) and `"properties"`; missing `"properties"`, it
+# reinterprets the dict's own top-level keys as a `{param_name: python_type}`
+# shorthand instead -- silently corrupting a schema like `{"type": "object"}`
+# (see `_normalize_input_schema`'s docstring for the exact mechanism). These
+# tests assert against `_build_input_schema` itself, not a description of
+# it, so they break if a future SDK version changes that guard.
+
+
+async def _noop_handler(_args: dict[str, Any]) -> dict[str, Any]:
+    return {"content": []}
+
+
+def _built_schema(input_schema: dict[str, Any]) -> dict[str, Any]:
+    tool = SdkMcpTool(name="t", description="d", input_schema=input_schema, handler=_noop_handler)
+    return sdk_build_input_schema(tool)
+
+
+def test_normalize_input_schema_adds_empty_properties_when_missing() -> None:
+    normalized = _normalize_input_schema({"type": "object"})
+
+    assert normalized == {"type": "object", "properties": {}}
+
+
+def test_normalize_input_schema_object_without_properties_reaches_sdk_literal_path() -> None:
+    # The actual regression: unnormalized, the SDK's own `_build_input_schema`
+    # reinterprets `{"type": "object"}`'s `"type"` entry as a bogus parameter
+    # named `type` (confirmed empirically against claude-agent-sdk 0.2.151,
+    # task-10 fix-round-1 report) -- `sdk_build_input_schema({"type":
+    # "object"})` alone would return `{"type": "object", "properties":
+    # {"type": {"type": "string"}}, "required": ["type"]}`, not a schema with
+    # no declared parameters.
+    normalized = _normalize_input_schema({"type": "object"})
+
+    assert _built_schema(normalized) == {"type": "object", "properties": {}}
+
+
+def test_normalize_input_schema_with_properties_is_unchanged() -> None:
+    schema = {
+        "type": "object",
+        "properties": {"x": {"type": "integer"}},
+        "required": ["x"],
+    }
+
+    normalized = _normalize_input_schema(schema)
+
+    assert normalized == schema
+    assert normalized is schema  # untouched, not a defensive copy
+    assert _built_schema(normalized) == schema
+
+
+def test_normalize_input_schema_without_type_key_is_left_to_sdk_shorthand() -> None:
+    # No `"type"` key at all is the SDK's own, intentional shorthand form
+    # (`{param_name: python_type}`) -- not a schema this adapter's callers
+    # would confuse for JSON Schema, so it is left alone rather than forced
+    # through the literal path.
+    schema = {"text": str}
+
+    assert _normalize_input_schema(schema) is schema
