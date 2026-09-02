@@ -9,7 +9,7 @@ gate. When a key is later supplied:
 - `ANTHROPIC_API_KEY` set: exercises the default `chat_model_factory`
   (`ChatAnthropic`) end-to-end.
 - `GROQ_API_KEY` set: exercises the `chat_model_factory` injection seam
-  with a real `ChatGroq(model="llama-3.3-70b-versatile")` — free-tier,
+  with a real `ChatGroq(model="openai/gpt-oss-120b")` — free-tier,
   per the plan note. `langchain-groq` is intentionally NOT a dependency
   yet (deferred alongside the key, same plan note); this test imports it
   lazily inside its own body so its absence only matters once the key
@@ -90,7 +90,7 @@ async def test_run_against_real_anthropic_api_completes_with_final_text() -> Non
 async def test_run_against_real_groq_api_via_injected_chat_model() -> None:
     from langchain_groq import ChatGroq  # deferred dependency; see module docstring
 
-    model_spec = ModelSpec(model="llama-3.3-70b-versatile")
+    model_spec = ModelSpec(model="openai/gpt-oss-120b")
     profile = Profile(
         backend="langchain",
         # ChatGroq (injected below) reads GROQ_API_KEY itself; this profile's
