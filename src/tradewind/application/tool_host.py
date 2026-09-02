@@ -51,7 +51,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
 from mcp_types import TextContent
 
-from tradewind.domain.models import McpServerDef, Tool
+from tradewind.domain.models import McpServerDef, PermissionBroker, Tool
 from tradewind.toolproxy import protocol
 
 
@@ -85,10 +85,27 @@ class ToolHost:
         mcp_servers: list[McpServerDef],
         resolve_ref: Callable[[str], str],
         socket_dir: Path | None = None,
+        broker: PermissionBroker | None = None,
     ) -> None:
         self._tools = {tool.name: tool for tool in tools}
         self._mcp_servers = mcp_servers
         self._resolve_ref = resolve_ref
+        # `broker` (task-14 brief, codex adapter): when set, `call()` itself
+        # consults it before dispatching -- an AUTHORITATIVE gate, not just
+        # a courtesy. Default `None` preserves every existing caller's
+        # behavior unchanged (Claude/Langchain already consult their own
+        # `ctx.broker` *before* ever calling `ToolHost.call()`, so wiring one
+        # here too would ask the same broker twice per call -- harmless for
+        # a stateless allow/deny broker, but wrong for "ask" semantics,
+        # which blocks on a human and must not be asked the same question
+        # twice). It exists because `ToolHost.call()` is *also* reachable
+        # directly over `serve_socket()`'s unix socket (task-12) by an
+        # out-of-process engine (Codex, via `tradewind.toolproxy`) with no
+        # broker-aware layer of its own in front of that path -- for that
+        # caller, this is the only place a deny can be enforced no matter
+        # how the engine's own approval machinery decided. `turn_runner.py`
+        # wires this in only for backends that need it (currently: codex).
+        self._broker = broker
         self._sessions: dict[str, ClientSession] = {}
         self._mcp_schemas: dict[str, dict[str, object]] = {}
         self._mcp_targets: dict[str, tuple[str, str]] = {}
@@ -416,11 +433,15 @@ class ToolHost:
         return local + list(self._mcp_schemas.values())
 
     async def call(self, name: str, arguments: dict[str, object]) -> ToolOutcome:
+        if name not in self._tools and name not in self._mcp_targets:
+            return ToolOutcome(content=f"unknown tool: {name!r}", is_error=True)
+        if self._broker is not None:
+            verdict = await self._broker.decide(name, arguments)
+            if verdict == "deny":
+                return ToolOutcome(content="permission denied", is_error=True)
         if name in self._tools:
             return await self._call_local(self._tools[name], arguments)
-        if name in self._mcp_targets:
-            return await self._call_mcp(name, arguments)
-        return ToolOutcome(content=f"unknown tool: {name!r}", is_error=True)
+        return await self._call_mcp(name, arguments)
 
     async def _call_local(self, tool: Tool, arguments: dict[str, object]) -> ToolOutcome:
         try:

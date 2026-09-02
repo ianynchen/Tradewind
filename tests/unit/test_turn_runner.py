@@ -79,11 +79,13 @@ def _config(tmp_path: Path, profile: Profile, **kwargs: object) -> TradewindConf
 
 
 async def test_unregistered_backend_raises_config_error_via_real_registry(tmp_path: Path) -> None:
-    # "codex" is a valid BackendName but tradewind/__init__.py registers
-    # only "langchain" -- no monkeypatching, no seeded `_backends`: this
-    # goes through `Tradewind._resolve_backend` -> the real module-level
-    # `_backend_factories` dict exactly as production code populates it.
-    profile = _profile(backend="codex")
+    # "cursor" is a valid BackendName but tradewind/__init__.py has no
+    # adapter for it yet (task-14 registered "codex" alongside "langchain"/
+    # "claude", so "codex" is no longer a usable stand-in here) -- no
+    # monkeypatching, no seeded `_backends`: this goes through `Tradewind.
+    # _resolve_backend` -> the real module-level `_backend_factories` dict
+    # exactly as production code populates it.
+    profile = _profile(backend="cursor")
     tw = Tradewind(_config(tmp_path, profile))
     session = await tw.create(_VALID_ID, SessionOptions())
 

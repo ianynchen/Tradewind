@@ -217,7 +217,28 @@ class TurnRunner:
             broker = (
                 options.permission_broker or self._config.permission_broker or _AllowAllBroker()
             )
-            async with ToolHost(options.tools, options.mcp_servers, self._resolve_ref) as tool_host:
+            # `socket_dir` (task-12 brief, deferred wiring -- task-14 makes it
+            # live): `ToolHostConfig.socket_dir` threads through to
+            # `ToolHost.serve_socket()`'s socket location.
+            #
+            # `broker` is passed to `ToolHost` itself only for backends whose
+            # tools are reachable *without* going through this backend's own
+            # broker-consulting code first (currently: `codex`, whose tools
+            # are called by an out-of-process engine over
+            # `serve_socket()`'s unix socket -- see `ToolHost.__init__`'s
+            # docstring). Claude/Langchain already gate every call before it
+            # ever reaches `ToolHost.call()`, so passing the same broker in
+            # for them too would consult it twice per tool call -- harmless
+            # for a stateless allow/deny broker, but wrong for "ask"
+            # semantics (blocks on a human; must not be asked twice).
+            tool_host_broker = broker if backend.name == "codex" else None
+            async with ToolHost(
+                options.tools,
+                options.mcp_servers,
+                self._resolve_ref,
+                socket_dir=self._config.tool_host.socket_dir,
+                broker=tool_host_broker,
+            ) as tool_host:
                 history = await anyio.to_thread.run_sync(
                     lambda: self._store.history(
                         session_id, include_children=False, include_raw=False

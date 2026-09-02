@@ -14,6 +14,7 @@ dependencies = [
     "langchain-anthropic==1.7.0",
     "langchain-core==1.6.1",
     "claude-agent-sdk==0.2.151",
+    "openai-codex==0.147.0",
 ]
 
 [dependency-groups]
@@ -195,6 +196,36 @@ disallow_any_expr = false
 # only this module, which touches the third-party SDK surface directly, is
 # narrowed.
 module = "tradewind.toolproxy.__main__"
+disallow_any_explicit = false
+disallow_any_expr = false
+
+[[tool.mypy.overrides]]
+# `codex_backend` is the second adapter (after `claude_backend`) to consume
+# a third-party SDK whose own typing is pervasively `Any`-tainted, for the
+# same reasons as that module's own override: `openai_codex`'s generated
+# pydantic v2 models (`generated/v2_all.py`) carry `Any`-typed fields
+# directly (`McpToolCallThreadItem.arguments: Any`,
+# `DynamicToolCallThreadItem.arguments: Any`, `TurnStartParams.output_schema:
+# Any | None`, `McpToolCallResult.content: list` i.e. `list[Any]`,
+# `McpToolCallResult.structured_content: Any`), and -- same root cause as the
+# `tradewind.domain`/`claude_backend` overrides -- every subclass of a
+# pydantic `BaseModel` trips `disallow_any_explicit` via mypy's synthesized
+# `__mypy-replace` member regardless of whether that subclass's own body
+# spells `Any`, so constructing or reading any of `openai_codex`'s many
+# generated dataclasses (`ThreadStartParams`, `TurnStartParams`, `Thread`,
+# `Turn`, `ThreadItem`'s RootModel variants, ...) taints the expression this
+# module touches, not anything written here. Confirmed by minimal repro,
+# same shape as the `claude_backend` override's own confirmation.
+#
+# `disallow_any_explicit` is ALSO relaxed here (same as `claude_backend`,
+# unlike `tool_host`/`langchain_backend`): the sync-to-async approval bridge
+# (`_decide`, `make_approval_handler`) and the tool-call mapping
+# (`thread_item_to_messages`) must spell `dict[str, Any]` back at
+# `PermissionBroker.decide`'s own signature (`tradewind.domain.models`) and
+# at `openai_codex`'s own `arguments: Any` fields verbatim -- there is no
+# narrower type to give either without inventing one the SDK itself doesn't
+# have. Narrowed to this module only.
+module = "tradewind.adapters.codex_backend"
 disallow_any_explicit = false
 disallow_any_expr = false
 

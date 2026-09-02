@@ -331,7 +331,18 @@ async def history_flat_and_tree(harness: ConformanceHarness) -> None:
 async def structured_output(harness: ConformanceHarness) -> None:
     """A turn given `output_schema` completes with a final response shaped
     by it (FR-8, deferred per-backend via `Capabilities.
-    supports_structured_output` -- `langchain` skips this today)."""
+    supports_structured_output` -- `langchain`/`claude` skip this today, so
+    `CodexBackend` (task-14) is the first to actually exercise it live).
+
+    `additionalProperties: false` is required in the schema (module
+    docstring's own category of fix, same as `tool_allow_deny`'s): a bare
+    `{"type": "object", "properties": {...}}` -- valid JSON Schema in
+    general -- is REJECTED live by Codex's strict structured-output mode
+    (`invalid_json_schema: 'additionalProperties' is required to be
+    supplied and to be false`, confirmed against a real `codex app-server`,
+    task-14 report). Making the scripted schema fully specified rather than
+    Codex-specific keeps this scenario backend-agnostic.
+    """
     if not harness.capabilities.supports_structured_output:
         pytest.skip("backend does not support structured output")
     harness.script_text_response('{"answer": 42}')
@@ -339,7 +350,12 @@ async def structured_output(harness: ConformanceHarness) -> None:
     session = await harness.tradewind.create(
         session_id,
         SessionOptions(
-            output_schema={"type": "object", "properties": {"answer": {"type": "integer"}}}
+            output_schema={
+                "type": "object",
+                "properties": {"answer": {"type": "integer"}},
+                "required": ["answer"],
+                "additionalProperties": False,
+            }
         ),
     )
 
