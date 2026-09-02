@@ -6,7 +6,13 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 
-from tradewind.domain.models import BackendName, NormalizedMessage, SessionRow, TurnStatus
+from tradewind.domain.models import (
+    BackendName,
+    NormalizedMessage,
+    SessionRow,
+    StoredMessage,
+    TurnStatus,
+)
 
 
 class SessionStorePort(ABC):
@@ -139,5 +145,87 @@ class SessionStorePort(ABC):
 
         Returns:
             The number of turns swept.
+        """
+        ...
+
+    @abstractmethod
+    def history(
+        self,
+        session_id: str,
+        *,
+        include_children: bool = False,
+        include_raw: bool = False,
+        after_seq: int | None = None,
+        limit: int | None = None,
+    ) -> list[StoredMessage]:
+        """Read back a session's message log.
+
+        `include_children=False` (default): flat read of `session_id`'s own
+        messages only, ordered by `seq`; `after_seq`/`limit` apply here for
+        cursor pagination.
+
+        `include_children=True`: tree read — `session_id` plus every
+        descendant session (transitively, via `parent_session_id`, per I-1),
+        ordered `(session_id, seq)` (ARCHITECTURE §4.2). `after_seq` and
+        `limit` are ignored in this mode (not yet supported).
+
+        `include_raw=False` (default): `raw_json` is not selected at all
+        (NFR-1) and every returned `StoredMessage.raw` is `None`, even when
+        a row has raw content stored. `include_raw=True` selects and
+        decodes it.
+        """
+        ...
+
+    @abstractmethod
+    def copy_history(
+        self, src_session_id: str, dst_row: SessionRow, up_to_seq: int | None = None
+    ) -> SessionRow:
+        """Fork `src_session_id`'s message history into a new session.
+
+        Creates `dst_row.session_id` as a session row, forcing
+        `spawn_kind='fork'` and `parent_session_id=src_session_id`
+        regardless of what `dst_row` carries for those two fields. Copies
+        `src_session_id`'s messages with `seq <= up_to_seq` (all of them
+        when `up_to_seq` is None), preserving order, into the new session
+        with freshly assigned `seq` starting at 1 and `turn_id=None`.
+
+        Returns:
+            The created session row (reflecting the forced `spawn_kind` /
+            `parent_session_id`).
+
+        Failure modes:
+            SessionNotFound: `src_session_id` does not exist.
+            SessionExists: `dst_row.session_id` already exists.
+        """
+        ...
+
+    @abstractmethod
+    def import_native_items(
+        self, session_id: str, turn_id: str | None, items: list[NormalizedMessage]
+    ) -> int:
+        """Bulk-insert `items` into `session_id`'s message log, deduping on
+        `native_id`.
+
+        An item whose `native_id` already exists among `session_id`'s
+        messages is skipped; items with `native_id=None` are always
+        inserted. Inserted items are assigned `seq` after the session's
+        current tail, preserving `items` order.
+
+        Returns:
+            The number of items actually inserted.
+
+        Failure modes:
+            SessionNotFound: `session_id` does not exist.
+        """
+        ...
+
+    @abstractmethod
+    def last_native_id(self, session_id: str) -> str | None:
+        """The `native_id` of `session_id`'s highest-`seq` message that has
+        one.
+
+        Returns:
+            That `native_id`, or None when no message in the session has a
+            non-null `native_id` (including when `session_id` is unknown).
         """
         ...

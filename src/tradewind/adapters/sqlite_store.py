@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
@@ -24,9 +25,12 @@ from tradewind.application.ports import SessionStorePort
 from tradewind.domain.errors import SessionExists, SessionNotFound, TurnInProgress
 from tradewind.domain.models import (
     BackendName,
+    Kind,
     NormalizedMessage,
+    Role,
     SessionRow,
     SpawnKind,
+    StoredMessage,
     TurnStatus,
 )
 
@@ -92,6 +96,31 @@ _SESSION_COLUMNS = (
     "options_json, status, native_meta_json, native_history_json"
 )
 
+# `StoredMessage` column order (without `raw_json`); `include_raw=False`
+# omits `raw_json` from the SELECT entirely rather than post-filtering it
+# (NFR-1: don't pay to fetch and decode bytes the caller doesn't want).
+_MESSAGE_COLUMNS_NO_RAW = (
+    "session_id",
+    "turn_id",
+    "seq",
+    "role",
+    "kind",
+    "content_json",
+    "native_id",
+    "parent_native_id",
+    "agent_path",
+    "model",
+    "created_at",
+)
+_MESSAGE_COLUMNS_RAW = (*_MESSAGE_COLUMNS_NO_RAW, "raw_json")
+
+
+def _message_select_list(include_raw: bool, *, alias: str | None = None) -> str:
+    """Column list for a `messages` SELECT, honoring `include_raw` (NFR-1)."""
+    columns = _MESSAGE_COLUMNS_RAW if include_raw else _MESSAGE_COLUMNS_NO_RAW
+    prefix = f"{alias}." if alias is not None else ""
+    return ", ".join(f"{prefix}{column}" for column in columns)
+
 
 def _now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -118,6 +147,32 @@ def _row_to_session_row(row: tuple[object, ...]) -> SessionRow:
         status=cast(str, row[11]),
         native_meta=native_meta,
         native_history=cast("list[dict[str, object]]", json.loads(cast(str, row[13]))),
+    )
+
+
+def _row_to_stored_message(row: tuple[object, ...], *, include_raw: bool) -> StoredMessage:
+    """Map a `_MESSAGE_COLUMNS_(NO_RAW|RAW)`-ordered row tuple to a
+    `StoredMessage`. `raw` is `None` whenever `include_raw` is False,
+    matching that the SELECT never fetched `raw_json` in that case."""
+    raw: dict[str, object] | None = None
+    if include_raw:
+        raw_json = cast("str | None", row[11])
+        if raw_json is not None:
+            raw = cast("dict[str, object]", json.loads(raw_json))
+    created_at = cast("str | None", row[10])
+    return StoredMessage(
+        role=cast(Role, row[3]),
+        kind=cast(Kind, row[4]),
+        content=cast("dict[str, object]", json.loads(cast(str, row[5]))),
+        native_id=cast("str | None", row[6]),
+        parent_native_id=cast("str | None", row[7]),
+        agent_path=cast("str | None", row[8]),
+        model=cast("str | None", row[9]),
+        raw=raw,
+        seq=cast(int, row[2]),
+        session_id=cast(str, row[0]),
+        turn_id=cast("str | None", row[1]),
+        created_at=created_at if created_at is not None else "",
     )
 
 
@@ -340,3 +395,141 @@ class SqliteSessionStore(SessionStorePort):
             count = cur.rowcount
             self._conn.commit()
             return count
+
+    def history(
+        self,
+        session_id: str,
+        *,
+        include_children: bool = False,
+        include_raw: bool = False,
+        after_seq: int | None = None,
+        limit: int | None = None,
+    ) -> list[StoredMessage]:
+        with self._lock:
+            if include_children:
+                # Recursive CTE over sessions.parent_session_id, joined to
+                # messages, ordered (session_id, seq) (ARCHITECTURE §4.2).
+                # after_seq/limit are flat-mode-only for now (task-5 brief).
+                columns = _message_select_list(include_raw, alias="m")
+                sql = (
+                    "WITH RECURSIVE descendants(session_id) AS ("
+                    "SELECT ? "
+                    "UNION ALL "
+                    "SELECT s.session_id FROM sessions s "
+                    "JOIN descendants d ON s.parent_session_id = d.session_id"
+                    ") "
+                    f"SELECT {columns} FROM descendants d "
+                    "JOIN messages m ON m.session_id = d.session_id "
+                    "ORDER BY m.session_id, m.seq"
+                )
+                cur = self._conn.execute(sql, (session_id,))
+            else:
+                columns = _message_select_list(include_raw)
+                sql = f"SELECT {columns} FROM messages WHERE session_id = ?"
+                params: list[object] = [session_id]
+                if after_seq is not None:
+                    sql += " AND seq > ?"
+                    params.append(after_seq)
+                sql += " ORDER BY seq"
+                if limit is not None:
+                    sql += " LIMIT ?"
+                    params.append(limit)
+                cur = self._conn.execute(sql, tuple(params))
+            rows = cast("list[tuple[object, ...]]", cur.fetchall())
+        return [_row_to_stored_message(row, include_raw=include_raw) for row in rows]
+
+    def copy_history(
+        self, src_session_id: str, dst_row: SessionRow, up_to_seq: int | None = None
+    ) -> SessionRow:
+        with self._lock:
+            if self._select_session_row(src_session_id) is None:
+                raise SessionNotFound(src_session_id)
+            if self._select_session_row(dst_row.session_id) is not None:
+                raise SessionExists(dst_row.session_id)
+            # Fork lineage is forced regardless of what dst_row carries for
+            # these two fields (task-5 brief).
+            forked_row = replace(dst_row, spawn_kind="fork", parent_session_id=src_session_id)
+            self._insert_session(forked_row)
+
+            sql = (
+                "SELECT role, kind, content_json, native_id, parent_native_id, "
+                "agent_path, model, created_at, raw_json FROM messages WHERE session_id = ?"
+            )
+            params: list[object] = [src_session_id]
+            if up_to_seq is not None:
+                sql += " AND seq <= ?"
+                params.append(up_to_seq)
+            sql += " ORDER BY seq"
+            cur = self._conn.execute(sql, tuple(params))
+            rows = cast("list[tuple[object, ...]]", cur.fetchall())
+
+            for new_seq, row in enumerate(rows, start=1):
+                self._conn.execute(
+                    "INSERT INTO messages (session_id, turn_id, seq, role, kind, content_json, "
+                    "native_id, parent_native_id, agent_path, model, created_at, raw_json) "
+                    "VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (dst_row.session_id, new_seq, *row),
+                )
+            self._conn.commit()
+        return forked_row
+
+    def import_native_items(
+        self, session_id: str, turn_id: str | None, items: list[NormalizedMessage]
+    ) -> int:
+        with self._lock:
+            if self._select_session_row(session_id) is None:
+                raise SessionNotFound(session_id)
+            cur = self._conn.execute(
+                "SELECT native_id FROM messages WHERE session_id = ? AND native_id IS NOT NULL",
+                (session_id,),
+            )
+            existing_native_ids = {
+                cast(str, row[0]) for row in cast("list[tuple[object, ...]]", cur.fetchall())
+            }
+            cur = self._conn.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM messages WHERE session_id = ?",
+                (session_id,),
+            )
+            seq = cast(int, cast("tuple[object, ...]", cur.fetchone())[0])
+
+            inserted = 0
+            for item in items:
+                if item.native_id is not None and item.native_id in existing_native_ids:
+                    continue
+                seq += 1
+                content = cast("dict[str, object]", item.content)
+                raw = cast("dict[str, object] | None", item.raw)
+                self._conn.execute(
+                    "INSERT INTO messages (session_id, turn_id, seq, role, kind, content_json, "
+                    "native_id, parent_native_id, agent_path, model, created_at, raw_json) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        session_id,
+                        turn_id,
+                        seq,
+                        item.role,
+                        item.kind,
+                        json.dumps(content),
+                        item.native_id,
+                        item.parent_native_id,
+                        item.agent_path,
+                        item.model,
+                        _now_iso(),
+                        json.dumps(raw) if raw is not None else None,
+                    ),
+                )
+                if item.native_id is not None:
+                    existing_native_ids.add(item.native_id)
+                inserted += 1
+            self._conn.commit()
+            return inserted
+
+    def last_native_id(self, session_id: str) -> str | None:
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT native_id FROM messages WHERE session_id = ? AND native_id IS NOT NULL "
+                "ORDER BY seq DESC LIMIT 1",
+                (session_id,),
+            )
+            row = cast("tuple[object, ...] | None", cur.fetchone())
+        return cast(str, row[0]) if row is not None else None

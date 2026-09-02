@@ -30,6 +30,7 @@ addopts = "-q"
 asyncio_mode = "auto"
 markers = [
     "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+    "perf: marks tests as performance benchmarks (deselect with '-m \"not perf\"')",
 ]
 
 [tool.mypy]
