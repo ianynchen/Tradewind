@@ -13,6 +13,7 @@ dependencies = [
     "mcp==2.1.1",
     "langchain-anthropic==1.7.0",
     "langchain-core==1.6.1",
+    "claude-agent-sdk==0.2.151",
 ]
 
 [dependency-groups]
@@ -128,6 +129,38 @@ disallow_any_expr = false
 # stays on: this module never spells `Any` itself (`object`/`cast` are used
 # throughout instead). Narrowed to this module only.
 module = "tradewind.adapters.langchain_backend"
+disallow_any_expr = false
+
+[[tool.mypy.overrides]]
+# `claude_backend` is the first adapter to consume `claude-agent-sdk`'s own
+# typing, which is `Any`-tainted even more pervasively than `langchain-core`'s
+# (the override above): `ContentBlock`'s member dataclasses carry `dict[str,
+# Any]` fields directly (`ToolUseBlock.input`, `ToolResultBlock.content: str |
+# list[dict[str, Any]] | None`); `AssistantMessage.usage`/`ResultMessage.usage`
+# are `dict[str, Any] | None`; `SessionMessage.message` (the raw transcript
+# entry `read_native_transcript`/`native_transcript_items` map) is typed bare
+# `Any` by the SDK itself ("Raw Anthropic API message dict", `SessionMessage`'s
+# own docstring) since it is Anthropic wire JSON, not one of the SDK's own
+# dataclasses. Confirmed by minimal repro, same root cause as the
+# `langchain_backend` override: every read of one of these fields is
+# "Expression type contains Any" under `disallow_any_expr` regardless of how
+# this module annotates or casts the *result*, because the flagged expression
+# is the third-party field access itself.
+#
+# `disallow_any_explicit` is ALSO relaxed here (unlike `tool_host`/
+# `langchain_backend`, which keep it on): building the in-process SDK MCP
+# bridge (`_sdk_tool_from_schema`, `_build_mcp_servers`) and the `can_use_tool`
+# bridge (`_make_can_use_tool`) requires spelling the SDK's own `Any`-shaped
+# contracts back at it verbatim -- `SdkMcpTool[Any]` (the type parameter has no
+# narrower value once `input_schema` is a caller-declared JSON Schema dict,
+# same as `create_sdk_mcp_server`'s own examples), `SdkMcpTool.handler:
+# Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]`, and
+# `ClaudeAgentOptions.system_prompt: str | SystemPromptPreset | ... | None`
+# where `SystemPromptPreset` is a `TypedDict` mypy will not structurally match
+# from a plain dict literal without a `cast(Any, ...)` past it. Narrowed to
+# this module only.
+module = "tradewind.adapters.claude_backend"
+disallow_any_explicit = false
 disallow_any_expr = false
 
 [tool.ruff]
