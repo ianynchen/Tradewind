@@ -3,3 +3,7 @@
 !CLAUDE.md
 
 **/*.bak
+
+# local secrets — never tracked
+.env
+.serena/
