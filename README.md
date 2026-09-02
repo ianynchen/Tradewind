@@ -3,8 +3,8 @@
 A Python library that drives four LLM agent backends — the Anthropic API (via
 `langchain-anthropic`), the Claude Agent SDK, the OpenAI Codex SDK, and the Cursor SDK — behind
 one port interface, with a durable, backend-neutral session store and honest, machine-readable
-capability reporting. Embedded as a library (no daemon, no config files of its own); the caller
-supplies a single config object.
+capability reporting. Embedded as a library (no daemon, no config files of its own, no env
+reads); the caller supplies a single config object.
 
 - [docs/REQUIREMENTS.md](docs/REQUIREMENTS.md) — functional and non-functional requirements
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — components, session schema, key interactions
@@ -14,15 +14,14 @@ supplies a single config object.
 ## Install
 
 ```bash
-uv add "tradewind @ git+https://example.com/tradewind.git"
+uv add "tradewind @ git+https://github.com/ianynchen/Tradewind.git"
 # or
-pip install "tradewind @ git+https://example.com/tradewind.git"
+pip install "tradewind @ git+https://github.com/ianynchen/Tradewind.git"
 ```
 
-Requires Python ≥3.13. There is no PyPI release yet; install from the git source above (adjust
-the URL to wherever this repo is hosted).
+Requires Python ≥3.13. No PyPI release yet.
 
-## Embedding example
+## Quick start
 
 ```python
 import uuid
@@ -44,79 +43,279 @@ config = TradewindConfig.model_validate(
         "store": {"sqlite_path": Path("./sessions.db")},
     }
 )
-# Equivalently, build Profile/ModelSpec/ApiKeyAuth objects directly instead of a dict.
 
 async def main() -> None:
-    tw = Tradewind(config)
-    session_id = str(uuid.uuid4())  # caller mints the id (FR-5.6); UUIDv7 recommended
+    tw = Tradewind(config)          # opens/migrates the store; no network
+    session_id = str(uuid.uuid4())  # the CALLER mints session ids (UUIDv7 recommended)
     session = await tw.ensure(session_id, SessionOptions(system_prompt="Be concise."))
     result = await session.run("What's 2+2?")
     print(result.status, result.final_text)
 
     for msg in await tw.history(session_id):
         print(msg.role, msg.kind, msg.content)
+
+    await tw.aclose()
 ```
 
-`ensure` is get-or-create (idempotent); use `create`/`resume` for strict create-only/resume-only
-intent (FR-5.6). `session.stream(prompt)` yields the normalized event stream directly instead of
-collecting a `TurnResult`. See `docs/components/01-configuration-and-client.md` for the full
-config surface (permission brokers, tools, MCP servers, event hooks).
+## Core concepts
+
+- **Backend** — one adapter per provider: `langchain`, `claude`, `codex`, `cursor`. Selected by
+  profile, never by call-site code.
+- **Profile** — a named deployment configuration: backend + auth mode + model-tier mapping.
+  Typical setup: a `local` profile using subscription-authenticated SDKs and a `cloud` profile
+  using API keys. Same calling code either way.
+- **Tier** — a symbolic model name (`"ultra"`, `"strong"`, `"standard"`, `"light"` — the names
+  are yours). Call sites say `tier="standard"`; each profile maps every tier to a concrete
+  `ModelSpec(model=..., effort=...)`. All profiles must define the identical tier set
+  (validated at construction) so a session's recorded tier stays meaningful across profiles.
+- **Session** — one conversation, identified by a caller-minted UUID, holding many **turns**
+  (one prompt → final-response cycle each, tool calls included).
+- **Mirror** — Tradewind's own transcript copy in its SQLite store. For `langchain` it is the
+  system of record; for the SDK backends it is a durability floor beside their native stores.
+- **Capabilities** — every backend declares what it natively supports; unsupported requests
+  raise `Unsupported` loudly rather than degrading silently.
+
+## Configuration
+
+`TradewindConfig` is the single entry point. Tradewind never reads files, environment
+variables, or global state — the host owns configuration acquisition. Construction fails
+loudly on invalid config, never at first use. Multiple independently configured `Tradewind`
+instances may coexist in one process.
+
+```python
+from tradewind import Tradewind, TradewindConfig, NativeStoreConfig, TurnDefaults
+from tradewind.domain.models import (
+    ApiKeyAuth, ModelSpec, Profile, SubscriptionAuth,
+)
+
+config = TradewindConfig(
+    profiles={
+        "local": Profile(
+            backend="claude",
+            auth=SubscriptionAuth(),                # uses the machine's logged-in Claude Code
+            models={
+                "strong":   ModelSpec(model="claude-opus-5", effort="high"),
+                "standard": ModelSpec(model="claude-sonnet-5"),
+            },
+        ),
+        "cloud": Profile(
+            backend="langchain",
+            auth=ApiKeyAuth(api_key="sk-..."),      # SecretStr; never repr'd or stored
+            models={
+                "strong":   ModelSpec(model="claude-opus-5"),
+                "standard": ModelSpec(model="claude-sonnet-5"),
+            },
+        ),
+    },
+    default_profile="local",
+    store={"sqlite_path": "./tradewind.db"},        # or store=<your SessionStorePort impl>
+    permission_broker=my_broker,                    # optional default broker (see Tools)
+    native_stores=NativeStoreConfig(),              # isolation_mode=True to relocate native stores
+    defaults=TurnDefaults(tier="standard"),
+    on_event=lambda e: log.debug("event %r", e),    # observability tap; exceptions are swallowed
+    secret_refs={"github_token": "ghp_..."},        # resolves "ref:github_token" in MCP defs
+)
+```
+
+Key fields:
+
+| Field | Meaning |
+|---|---|
+| `profiles` / `default_profile` | Backend + auth + tier→model mapping; per-session override via `SessionOptions.profile`. |
+| `store` | `sqlite_path` for the built-in store, or a caller-built `SessionStorePort` (e.g. Postgres later). Exactly one. |
+| `permission_broker` | Default broker consulted before tool execution. **Absent broker = all caller-registered tools allowed.** |
+| `native_stores` | `isolation_mode=True` relocates Codex/Cursor native stores (cloud hosts); default off preserves vendor-CLI interop. |
+| `defaults` | Default tier and timeouts (option layering: defaults < session options < per-call overrides). |
+| `on_event` | Fire-and-forget tap on the normalized event stream for logging/metrics. Cannot alter control flow. |
+| `secret_refs` | Values substituted for `"ref:<key>"` placeholders in MCP server definitions at connect time — secrets never enter the store. |
+
+## Sessions
+
+The caller mints session ids and states its intent explicitly:
+
+```python
+s = await tw.create(sid, options)        # strict: raises SessionExists if it exists
+s = await tw.resume(sid, options=None)   # strict: raises SessionNotFound if missing
+s = await tw.ensure(sid, options)        # get-or-create (idempotent) — the common case
+dst = await tw.fork(src_sid, dst_sid)    # branch: copies history into a new session with lineage
+child = await s.spawn("summarize the findings", tier="light")   # subagent: fresh child session
+```
+
+- Declarative options (system prompt, tier, tool names/schemas, MCP definitions, cwd) are
+  snapshotted into the store; **live objects (tool handlers, the broker) cannot be serialized**
+  and must be re-supplied on `resume` — Tradewind validates re-supplied tool names against the
+  snapshot and raises `ToolMismatch` rather than silently running with different tools.
+- Child sessions (forks, subagents) are their own rows with `parent_session_id` lineage;
+  retrieve a whole tree with `tw.history(sid, include_children=True)`.
+- One in-flight turn per session: a concurrent `run()`/`stream()` raises `TurnInProgress`.
+
+## Running turns
+
+```python
+# Collected:
+result = await session.run("Refactor the parser", tier="strong")
+# result: TurnResult(turn_id, status, final_text, usage, cost_usd)
+
+# Streamed:
+async for event in session.stream("Refactor the parser"):
+    match event:
+        case TextDelta(text=t): print(t, end="")
+        case ItemCompleted(message=m): ...        # the item also lands in the mirror
+        case PermissionRequested(): ...           # a broker verdict happened
+        case TurnCompleted(result=r): ...
+        case TurnFailed(error=e): ...
+
+# Interrupt from another task:
+await session.stop()                              # turn finalizes with status "interrupted"
+```
+
+The frozen event taxonomy (`tradewind.domain.events`): `TurnStarted`, `TextDelta`,
+`ItemCompleted` (carries a `NormalizedMessage` — the unit the mirror stores), `PermissionRequested`
+(emitted on deny), `TurnCompleted`, `TurnFailed`. Per-call overrides accepted by
+`run`/`stream`: `tier`, `system_prompt`, `output_schema`.
+
+## Tools — plug in your own
+
+Applications register tools as **plain Python callables, per session, at runtime** — no
+registration files, no subclassing, no packaging step:
+
+```python
+from tradewind.domain.models import SessionOptions, Tool
+
+async def lookup_order(order_id: str) -> str:
+    return await my_db.fetch_order(order_id)
+
+tools = [
+    Tool(
+        name="lookup_order",
+        description="Fetch an order by id from the application database.",
+        input_schema={
+            "type": "object",
+            "properties": {"order_id": {"type": "string"}},
+            "required": ["order_id"],
+        },
+        handler=lookup_order,          # a live closure — may capture your app's state
+    )
+]
+
+session = await tw.ensure(sid, SessionOptions(tools=tools))
+```
+
+How the same `Tool` reaches each backend (you never care, but it's good to know):
+
+- **langchain / claude / cursor** — executed in-process; the handler runs directly in your
+  application's event loop.
+- **codex** — Codex has no in-process tool API, so Tradewind spawns a tiny stdio MCP shim
+  (`python -m tradewind.toolproxy`) that proxies every call back over a `0o700` unix socket
+  into the live registry in your process. Your handler still runs in *your* process with full
+  access to your application state; nothing is serialized or imported by the subprocess.
+
+### Permission broker
+
+Gate tool execution by supplying a broker — any object with an async
+`decide(tool_name, tool_input) -> "allow" | "deny"`:
+
+```python
+class ConfirmingBroker:
+    async def decide(self, tool_name: str, tool_input: dict) -> str:
+        if tool_name.startswith("read_"):
+            return "allow"
+        return "allow" if await ask_the_human(tool_name, tool_input) else "deny"
+```
+
+Set it per config (`TradewindConfig.permission_broker`) or per session
+(`SessionOptions.permission_broker`). "Ask the user" semantics live inside your broker — it may
+block as long as it needs; the turn waits. A deny produces a `PermissionRequested` event and an
+error tool-result the model sees. **With no broker configured, all caller-registered tools are
+allowed** (you registered them, after all) — see Security defaults below for what that means on
+each backend.
+
+### External MCP servers
+
+Beyond in-process tools, attach whole MCP servers (stdio or HTTP) per session:
+
+```python
+from tradewind.domain.models import McpServerDef
+
+SessionOptions(mcp_servers=[
+    McpServerDef(name="github", transport="stdio",
+                 command=["uvx", "mcp-server-github"],
+                 env={"GITHUB_TOKEN": "ref:github_token"}),   # resolved from config.secret_refs
+    McpServerDef(name="meridian", transport="http",
+                 url="https://mini.tailnet.ts.net/mcp",
+                 headers={"Authorization": "ref:meridian_token"}),
+])
+```
+
+Their tools appear to the model namespaced `mcp__<server>__<tool>`, pass through the same
+broker, and secret-bearing fields are redacted to `ref:` placeholders in the stored snapshot —
+resolved only at connect time from `secret_refs`.
+
+## History
+
+```python
+msgs = await tw.history(sid)                                   # flat, this conversation only
+tree = await tw.history(sid, include_children=True)            # + forks/subagents via lineage
+full = await tw.history(sid, include_raw=True)                 # + verbatim native payloads
+```
+
+Flat retrieval is one indexed query; `raw_json` (the verbatim native event payloads) is
+excluded by default and never fetched unless asked for.
+
+## Backend notes
+
+- **langchain** — the mirror is the system of record; every request rebuilds the messages
+  array from the store (thinking blocks omitted by design). Inject any `BaseChatModel` via the
+  adapter's `chat_model_factory` seam (how the test suite runs on fakes, and how Groq/Ollama
+  slot in without code changes).
+- **claude** — runs the real Claude Code engine; your `system_prompt` is *appended* to the
+  Claude Code preset persona, not a replacement. Sessions land in `~/.claude/projects/…` and
+  can be resumed from the CLI: `claude --resume <native id>` (the native id is on the session
+  row). Built-in CLI dev tools are disabled; only tools you register exist. CLI-added turns are
+  reconciled back into the mirror on next contact.
+- **codex** — threads land in `~/.codex/sessions/…`; `codex resume <thread id>` works.
+  Reasoning `effort` from the tier's `ModelSpec` is honored; `output_schema` (structured
+  output) is supported. Known limitation (ARCHITECTURE P-6): out-of-band CLI turns are not
+  backfilled into the mirror after first contact.
+- **cursor** — EXPERIMENTAL, never live-verified (no subscription; P-5). System prompt is
+  emulated one layer up via a namespaced `.cursor/rules/tradewind-session.mdc` in the session
+  `cwd` (first-turn prompt folding as fallback); your original prompts are always what the
+  store records.
 
 ## Capability matrix
 
-Each backend declares what it actually supports (`Backend.capabilities()`); Tradewind never
-emulates a capability silently — an unsupported call raises `Unsupported` (R-1, honest
-capabilities over false uniformity). Read directly from the four adapters:
+Each backend declares what it natively supports (`Backend.capabilities()`); Tradewind never
+emulates silently — an unsupported call raises `Unsupported`.
 
 | Capability | langchain | claude | codex | cursor (EXPERIMENTAL) |
 |---|---|---|---|---|
-| `supports_system_prompt` | yes | yes | yes | no |
+| `supports_system_prompt` | yes | yes | yes | no (emulated above the port) |
 | `supports_structured_output` | no | no | yes | no |
 | `supports_interactive_permissions` | yes | yes | yes | no |
-| `supports_in_process_tools` | yes | yes | no | yes |
-| `supports_native_resume` | no | yes | yes | yes |
-| `supports_fork` | no | yes | yes | no |
+| `supports_in_process_tools` | yes | yes | no (MCP shim) | yes |
+| `supports_native_resume` | no (mirror rebuild) | yes | yes | yes |
+| `supports_fork` | no (`tw.fork` covers it) | yes | yes | no |
 | `supports_transcript_read` | no | yes | yes | no |
 
-Notes:
-
-- **langchain** is the only backend where Tradewind's own SQLite mirror is the system of
-  record (FR-5.1); the other three treat it as a mirror of their native store.
-- **codex** has no in-process tool bridge — every tool reaches it through the stdio MCP shim
-  (`ToolHost.shim_server_def()`), never as a direct in-process call.
-- **cursor** ships marked `EXPERIMENTAL` (module docstring: `EXPERIMENTAL — never
-  live-verified (no Cursor subscription; P-5 open)`). It has full unit-test coverage and is
-  wired end to end, but has never run against a live Cursor session — see
-  [docs/RUNBOOK.md](docs/RUNBOOK.md#cursor--p-5-blocked-task-15). Cursor's missing
-  `supports_system_prompt` is emulated one layer up (never inside the adapter, per R-1): the
-  Turn Runner writes `.cursor/rules/tradewind-session.mdc` under the session's `cwd`, falling
-  back to folding the instructions into the first prompt.
-- **NATIVE→REPLAY degrade is not implemented** (`docs/ARCHITECTURE.md` §5.2/§7 P-7): a reaped
-  or expired native session on `claude`/`codex`/`cursor` surfaces to the caller as a plain
-  `TurnFailed` today rather than degrading to a REPLAY turn.
+**NATIVE→REPLAY degrade is not implemented** (ARCHITECTURE §7 P-7): a reaped or expired native
+session on `claude`/`codex`/`cursor` currently surfaces as `TurnFailed` rather than degrading
+to a mirror-replay turn.
 
 ## Security defaults
 
-What "no configuration" actually means, so a caller never gets more access than they intended:
+What "no configuration" actually means:
 
-- **No broker configured anywhere** — neither `SessionOptions.permission_broker` nor
-  `TradewindConfig.permission_broker` set — means every caller-registered tool call is
-  *allowed*, not silently inert (`turn_runner.py`'s `_AllowAllBroker` fallback). Configure a
-  broker if you want tool calls gated at all.
-- **Built-in provider tools, per backend**: `claude` disables the Claude Code CLI's own
-  built-in dev tools entirely (`ClaudeAgentOptions.tools=[]`) — only tools Tradewind itself
-  registers are ever reachable. `codex` leaves Codex's own built-in shell/`apply_patch` tools
-  enabled but broker-gated; when no broker is configured anywhere (see above), `codex` also
-  defaults its `sandbox` to `read-only` instead of `workspace-write`, so an unconfigured caller
-  never gets unrestricted filesystem writes with nothing gating them. Either default is
-  overridden by an explicit `Profile.backend_options["sandbox"]`, broker configured or not.
-- **The toolproxy unix socket** (`codex`'s out-of-process tool-call bridge) has no
-  authentication of its own — filesystem permissions (a `0o700` socket directory) and the
-  same-machine, same-OS-user assumption are the only boundary.
+- **No broker configured anywhere** means every caller-registered tool call is *allowed*.
+  Configure a broker if you want tool calls gated at all.
+- **Built-in provider tools**: `claude` disables the CLI's own built-in dev tools entirely.
+  `codex` leaves Codex's built-in shell/`apply_patch` enabled but broker-gated — and when no
+  broker is configured anywhere, `codex` defaults its sandbox to `read-only` instead of
+  `workspace-write`, so an unconfigured caller never gets ungated filesystem writes. An
+  explicit `Profile.backend_options["sandbox"]` always wins.
+- **The toolproxy unix socket** has no authentication of its own — filesystem permissions
+  (`0o700` socket directory) and the same-machine, same-OS-user assumption are the boundary.
 
-See [docs/RUNBOOK.md](docs/RUNBOOK.md#socket-security-posture-toolproxy-shim-task-12) and
-[docs/RUNBOOK.md](docs/RUNBOOK.md#codex-sandbox-default-when-no-broker-is-configured-final-fix-wave)
-for the full detail behind each of these.
+See [docs/RUNBOOK.md](docs/RUNBOOK.md) for the full detail behind each of these.
 
 ## Integration-test environment variables
 
@@ -129,8 +328,7 @@ None of these are read by the library itself — only by the test suite, and onl
 | `ANTHROPIC_API_KEY` | Live langchain tests against the real Anthropic API. |
 | `GROQ_API_KEY` | Live langchain tests against the free-tier Groq API (`ChatGroq`). |
 
-Cursor's live conformance suite (`tests/conformance/test_cursor.py`) has no env gate: it
-self-skips unconditionally until a Cursor subscription exists and the skip is removed by hand.
+Cursor's live conformance suite self-skips unconditionally until a Cursor subscription exists.
 
 ## Development
 
