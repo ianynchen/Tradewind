@@ -49,7 +49,7 @@ uv run pytest tests/conformance/test_cursor.py -v      # always self-skips; no e
 - `tests/conformance/test_cursor.py` — 1 skipped (module-level `BLOCKED` skip, expected, no
   Cursor subscription on this machine).
 - langchain: no `GROQ_API_KEY`/`ANTHROPIC_API_KEY` on this machine, so
-  `tests/integration/test_langchain_live.py`'s Groq live test **PASSED on 2026-09-02** (`ChatGroq(model="openai/gpt-oss-120b")` via the free tier; the originally planned `llama-3.3-70b-versatile` was retired by Groq and the test updated). The Anthropic-API variant remains **DEFERRED**
+  `tests/integration/test_langchain_live.py`'s Groq live test **PASSED on 2026-09-02** (`ChatGroq(model="openai/gpt-oss-120b")` via the free tier; the originally planned `llama-3.3-70b-versatile` was retired by Groq and the test updated). The Anthropic-API variant **PASSED on 2026-09-02** (real API key in git-ignored `.env`; note: pinned `claude-3-5-haiku-20241022` is past its announced EOL yet still served — bump the model when it finally 404s)
   (both self-skip; part of `check.sh`'s 7 skips). The langchain adapter's own conformance
   coverage (`tests/conformance/test_langchain.py`, fake `_ScriptedChatModel`) runs and passes
   on every `check.sh` invocation — see the matrix row above.
@@ -158,7 +158,7 @@ caller-facing summary.
 |---|---|---|
 | `TRADEWIND_RUN_CLAUDE_INTEGRATION=1` | `tests/conformance/test_claude.py`, `tests/integration/test_claude_live.py` | Requires a real Claude Code subscription login on the machine; real, billed-by-subscription API calls (~40s for the full matrix). |
 | `TRADEWIND_RUN_CODEX_INTEGRATION=1` | `tests/conformance/test_codex.py` | Requires a real ChatGPT/Codex subscription login; spawns real `codex app-server` subprocesses (~100s for the full matrix). |
-| `ANTHROPIC_API_KEY` | `tests/integration/test_langchain_live.py::test_...anthropic` | Real Anthropic API key; DEFERRED — none available yet on this machine. |
+| `ANTHROPIC_API_KEY` | `tests/integration/test_langchain_live.py::test_...anthropic` | Real Anthropic API key; ACTIVE — key in git-ignored `.env`, run via `scripts/live-tests.sh`; passed 2026-09-02. |
 | `GROQ_API_KEY` | `tests/integration/test_langchain_live.py::test_...groq` | Free-tier Groq key (`console.groq.com`, `ChatGroq`, `openai/gpt-oss-120b`); ACTIVE — key in git-ignored `.env`, run via `scripts/live-tests.sh`; passed 2026-09-02. |
 | (none — Cursor) | `tests/conformance/test_cursor.py` | No env gate exists; the module skips unconditionally until a Cursor subscription is available and the skip is removed by hand. |
 
