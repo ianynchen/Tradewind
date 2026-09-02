@@ -11,6 +11,8 @@ dependencies = [
     "pydantic>=2.9",
     "anyio>=4",
     "mcp==2.1.1",
+    "langchain-anthropic==1.7.0",
+    "langchain-core==1.6.1",
 ]
 
 [dependency-groups]
@@ -96,6 +98,36 @@ disallow_any_expr = false
 # not anything this module writes. `disallow_any_explicit` stays on — this
 # module never spells `Any` itself. Narrowed to this module only.
 module = "tradewind.application.tool_host"
+disallow_any_expr = false
+
+[[tool.mypy.overrides]]
+# `langchain_backend` is the first adapter to actually consume
+# `langchain-core`'s own normalized message typing rather than just pass
+# opaque objects through. Two of its own public types taint nearly every
+# expression this module touches:
+# (1) `AIMessage.content_blocks` / `AIMessageChunk.content_blocks` return
+#     `list[ContentBlock]`, where `ContentBlock` is a 14-member `Union` of
+#     TypedDicts (text/reasoning/tool_call/image/... — langchain_core's own
+#     `content.py`). Every `.get(...)` read off one of these dicts is
+#     "Expression type contains Any" under `disallow_any_expr`, because at
+#     least one union member's value type resolves through `dict[str, Any]`
+#     somewhere in that Union — this is the library's own typing, not
+#     anything this module writes.
+# (2) `AIMessage.tool_calls: list[ToolCall]`, and `ToolCall` itself
+#     (`langchain_core.messages.tool`) declares `args: dict[str, Any]` — so
+#     every read/write of a tool call's id/name/args is tainted the same
+#     way, both when reconstructing history into `ToolCall`s
+#     (`_rebuild_messages`) and when reading them back off a model response
+#     (`_run_turn`'s tool loop).
+# Confirmed by minimal repro: replacing every `.get()`/subscript with an
+# explicit `cast(...)` on the *value* still leaves the "Expression type
+# contains Any" `[misc]` diagnostic, because the flagged expression is the
+# third-party `ContentBlock`/`ToolCall` access itself, not this module's
+# annotation of its result — same root cause and same resolution as the
+# `tradewind.application.tool_host` override above. `disallow_any_explicit`
+# stays on: this module never spells `Any` itself (`object`/`cast` are used
+# throughout instead). Narrowed to this module only.
+module = "tradewind.adapters.langchain_backend"
 disallow_any_expr = false
 
 [tool.ruff]

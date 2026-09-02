@@ -5,14 +5,34 @@ implemented by adapters (GUIDELINES §8: dependencies flow inward).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, ClassVar
 
+from tradewind.application.tool_host import ToolHost
+from tradewind.domain.events import Event
 from tradewind.domain.models import (
     BackendName,
+    Capabilities,
+    ModelSpec,
     NormalizedMessage,
+    PermissionBroker,
+    Profile,
     SessionRow,
     StoredMessage,
     TurnStatus,
 )
+
+if TYPE_CHECKING:
+    # Deferred to a TYPE_CHECKING-only import to break the runtime cycle:
+    # `application.config` imports `SessionStorePort` from this module, so a
+    # top-level import here of `NativeStoreConfig` (declared in config.py)
+    # would import-loop. `Backend.__init__` is a plain ABC method (not a
+    # pydantic model), so its annotation never needs runtime resolution —
+    # `from __future__ import annotations` already makes it a lazily
+    # evaluated string, and this guard keeps that string resolvable for
+    # static type checkers without ever executing at import time.
+    from tradewind.application.config import NativeStoreConfig
 
 
 class SessionStorePort(ABC):
@@ -227,5 +247,100 @@ class SessionStorePort(ABC):
         Returns:
             That `native_id`, or None when no message in the session has a
             non-null `native_id` (including when `session_id` is unknown).
+        """
+        ...
+
+
+@dataclass
+class TurnContext:
+    """Everything a `Backend.run()` needs for one turn, assembled by the
+    turn runner (a later task) from `SessionOptions`/config — the backend
+    itself never touches the store (task-8 brief).
+
+    `load_history` is a closure over the store's `history()` verb,
+    pre-bound to this call's `session_id` with `include_raw=False` (mirror
+    reconstruction never needs raw provider payloads — NFR-1); a backend
+    calls it to rebuild the messages array for previous turns.
+    """
+
+    session: SessionRow
+    turn_id: str
+    prompt: str
+    model_spec: ModelSpec
+    system_prompt: str | None
+    output_schema: dict[str, object] | None
+    tools: ToolHost
+    broker: PermissionBroker
+    load_history: Callable[[], list[StoredMessage]]
+
+
+class Backend(ABC):
+    """One provider's turn-execution adapter (ARCHITECTURE §3.1). Subclasses
+    own everything provider-specific — request shape, streaming, tool-loop
+    mechanics — behind this one port; `Tradewind`/`Session` depend on this
+    interface only, never on a concrete backend (GUIDELINES §8).
+
+    `name` identifies which `BackendName` this class implements; a
+    concrete subclass sets it as a class attribute.
+    """
+
+    name: ClassVar[BackendName]
+
+    def __init__(self, profile: Profile, native_config: NativeStoreConfig) -> None:
+        self.profile = profile
+        self.native_config = native_config
+
+    @abstractmethod
+    def capabilities(self) -> Capabilities:
+        """This backend's fixed capability flags (FR-8.1).
+
+        Constant for the class — never varies per call or per session.
+        Callers (and this backend itself) raise `Unsupported` where these
+        flags deny a capability that was asked for (R-1).
+        """
+        ...
+
+    @abstractmethod
+    def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        """Execute one turn, yielding the normalized event stream.
+
+        `TurnStarted` is always the first event. On a clean finish,
+        `TurnCompleted` is the last event; on an unrecoverable error,
+        `TurnFailed` is the last event instead. `interrupt()` called for
+        `ctx.session.session_id` while this iterator is in flight ends it
+        early with neither — no exception escapes, and the iterator simply
+        stops (the turn runner, not this method, assigns the terminal
+        `interrupted`/`cancelled` status).
+        """
+        ...
+
+    @abstractmethod
+    async def probe_native(self, session: SessionRow) -> bool:
+        """Whether `session` has a live native (backend-side) transcript
+        distinct from the mirror, that `read_native_transcript` could read.
+
+        Backends with no native store of record
+        (`capabilities().supports_native_resume` is False) always return
+        False.
+        """
+        ...
+
+    @abstractmethod
+    async def read_native_transcript(
+        self, session: SessionRow, after_native_id: str | None
+    ) -> list[NormalizedMessage]:
+        """Read `session`'s native transcript items after `after_native_id`
+        (None reads from the start of the native transcript).
+
+        Failure modes:
+            Unsupported: `capabilities().supports_transcript_read` is False.
+        """
+        ...
+
+    @abstractmethod
+    async def interrupt(self, session_id: str) -> None:
+        """Cancel the in-flight `run()` call for `session_id`, if any.
+
+        A no-op when no turn is currently in flight for `session_id`.
         """
         ...
