@@ -20,7 +20,8 @@ from __future__ import annotations
 
 import logging
 import uuid
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from contextlib import aclosing
 from typing import cast
 
 import anyio
@@ -48,10 +49,12 @@ class _AllowAllBroker:
     """Fallback used when neither `SessionOptions.permission_broker` nor
     `TradewindConfig.permission_broker` is set: permits every tool call.
 
-    No ruling specifies a default policy for "no broker configured at all";
-    this is the least-surprising default for an embedded library (FR-4.1
-    requires a broker be *consulted*, not that a caller-supplied one always
-    exists) -- flagged here so it is easy to revisit.
+    Controller ruling (task-9 fix round 1): APPROVED as the default -- a
+    caller that registers tools without wiring a broker gets those tools
+    callable, not silently inert (FR-4.1 requires a broker be *consulted*,
+    not that a caller-supplied one always exists). See also
+    `TradewindConfig.permission_broker`'s field comment. Test-locked by
+    `tests/unit/test_turn_runner.py::test_tool_executes_when_no_broker_is_configured_anywhere`.
     """
 
     async def decide(self, _tool_name: str, _tool_input: dict[str, object]) -> Verdict:
@@ -79,10 +82,13 @@ def _effective_tier(
     """Merge `TurnDefaults.tier < snapshot["tier"] < overrides["tier"]`
     (task-9 ruling) and validate the result against `profile.models`.
 
-    `TurnDefaults.request_timeout_s` is the other field in this layering
-    but nothing downstream of this runner enforces a wall-clock timeout
-    yet -- deferred, not silently dropped (flagged for a later task, same
-    pattern as `ctx.output_schema` in the langchain adapter).
+    `TurnDefaults.request_timeout_s` is the other field named in this
+    layering, but it is UNIMPLEMENTED here -- not merged into anything,
+    not read, not enforced. Wiring a wall-clock timeout needs a decision
+    this runner doesn't make on its own (what termination status a timeout
+    gets; none of `completed`/`failed`/`interrupted` was specified for it):
+    flagged for a later task rather than guessed at, same pattern as
+    `ctx.output_schema` in the langchain adapter.
     """
     override_tier = overrides.get("tier")
     if override_tier is not None:
@@ -231,21 +237,38 @@ class TurnRunner:
                     load_history=lambda: history,
                 )
 
-                async for event in backend.run(ctx):
-                    if isinstance(event, ItemCompleted):
-                        await anyio.to_thread.run_sync(
-                            self._store.append_message, session_id, turn_id, event.message
-                        )
-                    if isinstance(event, TurnCompleted):
-                        terminal_status = event.result.status
-                        final_text = event.result.final_text
-                        usage = cast("dict[str, object]", event.result.usage)
-                        cost_usd = event.result.cost_usd
-                    elif isinstance(event, TurnFailed):
-                        terminal_status = "failed"
-                        error = event.error
-                    self._tap(event, turn_id)
-                    yield event
+                # `aclosing` (not a bare `async for`) so that if THIS
+                # generator (`execute()`) is itself abandoned/aclosed mid-turn
+                # (a consumer `break`s out of `session.stream()` without
+                # calling `stop()`), the backend's own generator is closed
+                # deterministically right here -- rather than left to
+                # whenever the garbage collector happens to finalize it -- so
+                # a backend blocked on e.g. a network call unwinds its
+                # `finally`s (cancel scopes, connections) immediately.
+                # `Backend.run()`'s port signature is the broader
+                # `AsyncIterator[Event]` (ports.py, task-8 brief, not
+                # touched here), but every concrete implementation is an
+                # `async def ... yield ...` generator (an `AsyncGenerator`,
+                # which is what `aclosing` needs -- an `aclose()` method);
+                # the cast reflects that real contract without widening the
+                # port's own.
+                backend_run = cast("AsyncGenerator[Event]", backend.run(ctx))
+                async with aclosing(backend_run) as backend_events:
+                    async for event in backend_events:
+                        if isinstance(event, ItemCompleted):
+                            await anyio.to_thread.run_sync(
+                                self._store.append_message, session_id, turn_id, event.message
+                            )
+                        if isinstance(event, TurnCompleted):
+                            terminal_status = event.result.status
+                            final_text = event.result.final_text
+                            usage = cast("dict[str, object]", event.result.usage)
+                            cost_usd = event.result.cost_usd
+                        elif isinstance(event, TurnFailed):
+                            terminal_status = "failed"
+                            error = event.error
+                        self._tap(event, turn_id)
+                        yield event
 
                 if terminal_status is None:
                     # The backend's iterator ended with neither TurnCompleted
@@ -284,16 +307,23 @@ class TurnRunner:
                 interrupted = session_id in self._interrupt_requested
                 terminal_status = "interrupted" if interrupted else "failed"
                 error = None if interrupted else "turn ended without emitting a terminal event"
-            await anyio.to_thread.run_sync(
-                lambda: self._store.finalize_turn(
-                    turn_id,
-                    status=terminal_status,
-                    final_text=final_text,
-                    usage=usage,
-                    cost_usd=cost_usd,
-                    error=error,
+            # Shielded: this write must land even if the surrounding task is
+            # itself being cancelled (e.g. the caller's own task group is
+            # tearing down while this `finally` runs) -- an unfinalized turn
+            # would otherwise sit `in_progress` until the next
+            # `sweep_stale_turns` (session open) instead of recording what
+            # actually happened.
+            with anyio.CancelScope(shield=True):
+                await anyio.to_thread.run_sync(
+                    lambda: self._store.finalize_turn(
+                        turn_id,
+                        status=terminal_status,
+                        final_text=final_text,
+                        usage=usage,
+                        cost_usd=cost_usd,
+                        error=error,
+                    )
                 )
-            )
             self._interrupt_requested.discard(session_id)
 
     def _resolve_ref(self, ref: str) -> str:

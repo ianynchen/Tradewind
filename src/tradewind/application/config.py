@@ -64,6 +64,11 @@ class TradewindConfig(BaseModel):
     profiles: dict[str, Profile]
     default_profile: str
     store: StoreConfig
+    # Default broker for every session that doesn't supply its own via
+    # `SessionOptions.permission_broker`. Absent here too (the common case:
+    # `None`), `TurnRunner` falls back to an allow-all policy -- with no
+    # broker configured anywhere, every caller-registered tool is callable
+    # (task-9 fix round 1 ruling).
     permission_broker: PermissionBroker | None = None
     native_stores: NativeStoreConfig = NativeStoreConfig()
     tool_host: ToolHostConfig = ToolHostConfig()
