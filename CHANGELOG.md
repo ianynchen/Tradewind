@@ -22,6 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On the langchain backend, a response the provider truncated at
   `max_tokens` now completes with `end_reason="max_tokens"` and its
   (possibly truncated) tool calls are not executed.
+- Optional persistence (FR-5.7, ADR-0001): `TradewindConfig.store` may now
+  be omitted — the mirror becomes an ephemeral in-memory sqlite database,
+  private to the instance and gone at exit. Turns, history (so langchain
+  keeps conversation context within the process), single-flight, and
+  reconcile behave identically; SDK backends still persist natively.
 
 ### Changed
 
@@ -29,3 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   projects declaring `requires-python = ">=3.12"` (e.g. sextant) can resolve
   tradewind. No source changes were needed; the full suite, mypy strict,
   ruff, and the import-linter contracts pass on both 3.12 and 3.13.
+- **Breaking (ADR-0001):** `StoreConfig` is removed. `TradewindConfig.store`
+  is one union field: `Path | SessionStorePort | None = None` — a path for
+  the default sqlite engine (was `StoreConfig(sqlite_path=...)`), a
+  caller-built store (was `StoreConfig(store=...)`), or `None` for the
+  ephemeral mirror. The both-set error state is now unrepresentable.
+
+### Fixed
+
+- `tradewind.__version__` is synced with `pyproject.toml` (it had been left
+  at 0.1.0 through the 0.2.0/0.3.0 bumps).

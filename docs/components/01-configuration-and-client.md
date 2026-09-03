@@ -31,7 +31,10 @@ config, never at first use.
 class TradewindConfig(BaseModel):
     profiles: dict[str, Profile]          # at least one
     default_profile: str                  # key into profiles
-    store: StoreConfig                    # storage backend selection
+    store: Path | SessionStorePort | None = None  # storage selection (ADR-0001): a path -> default
+                                          # sqlite engine (WAL, user_version migrations); a
+                                          # caller-built store (Postgres later, P-4); or None ->
+                                          # ephemeral in-memory mirror (FR-5.7)
     permission_broker: PermissionBroker | None = None   # default broker; per-call override allowed
     native_stores: NativeStoreConfig = NativeStoreConfig()
     tool_host: ToolHostConfig = ToolHostConfig()
@@ -47,10 +50,6 @@ class Profile(BaseModel):
 class ModelSpec(BaseModel):
     model: str                            # provider model id, verbatim for this profile's backend
     effort: EffortLevel | None = None     # for backends with reasoning effort (claude, codex)
-
-class StoreConfig(BaseModel):             # one of:
-    sqlite_path: Path | None = None       #   default engine (WAL, user_version migrations)
-    store: SessionStorePort | None = None #   or a caller-built store (Postgres later, P-4)
 
 class NativeStoreConfig(BaseModel):
     isolation_mode: bool = False          # DR-3: relocate native stores (cloud); default keeps CLI interop

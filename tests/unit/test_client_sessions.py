@@ -18,7 +18,7 @@ from pydantic import SecretStr
 
 from tradewind.adapters.sqlite_store import SqliteSessionStore
 from tradewind.application.client import Session, Tradewind
-from tradewind.application.config import NativeStoreConfig, StoreConfig, TradewindConfig
+from tradewind.application.config import NativeStoreConfig, TradewindConfig
 from tradewind.application.ports import Backend, SessionStorePort
 from tradewind.domain.errors import (
     ConfigError,
@@ -58,7 +58,7 @@ def _config(tmp_path: Path, name: str = "sessions.db") -> TradewindConfig:
     return TradewindConfig(
         profiles={"default": _profile()},
         default_profile="default",
-        store=StoreConfig(sqlite_path=tmp_path / name),
+        store=tmp_path / name,
     )
 
 
@@ -414,7 +414,7 @@ async def test_history_passes_include_children_and_include_raw_through_to_store(
     config = TradewindConfig(
         profiles={"default": _profile()},
         default_profile="default",
-        store=StoreConfig(store=spy),
+        store=spy,
     )
     tw = Tradewind(config)
 
@@ -430,7 +430,7 @@ async def test_history_defaults_include_children_and_include_raw_to_false() -> N
     config = TradewindConfig(
         profiles={"default": _profile()},
         default_profile="default",
-        store=StoreConfig(store=spy),
+        store=spy,
     )
     tw = Tradewind(config)
 

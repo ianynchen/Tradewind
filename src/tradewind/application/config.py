@@ -20,17 +20,6 @@ from tradewind.domain.events import Event
 from tradewind.domain.models import PermissionBroker, Profile, TierName
 
 
-class StoreConfig(BaseModel):
-    """Where session state lives: either a sqlite file path (the store is
-    built for the caller) or an already-constructed store. Exactly one of
-    the two must be set (`TradewindConfig.model_post_init` enforces it)."""
-
-    model_config = ConfigDict(arbitrary_types_allowed=True)
-
-    sqlite_path: Path | None = None
-    store: SessionStorePort | None = None
-
-
 class NativeStoreConfig(BaseModel):
     """Backend-native session storage a later task wires up (codex/cursor)."""
 
@@ -63,7 +52,20 @@ class TradewindConfig(BaseModel):
 
     profiles: dict[str, Profile]
     default_profile: str
-    store: StoreConfig
+    # Where session state lives — one union field so the illegal
+    # two-sources state is unrepresentable (ADR-0001):
+    #   Path              -> tradewind builds its default sqlite engine there
+    #                        (WAL, user_version migrations)
+    #   SessionStorePort  -> a caller-built store (Postgres later, P-4)
+    #   None (default)    -> EPHEMERAL in-memory mirror (FR-5.7): private to
+    #                        this instance, gone at process exit. Turns run
+    #                        identically (history, single-flight, reconcile),
+    #                        but nothing tradewind-side persists — durability
+    #                        is then only the SDK backends' own native stores
+    #                        (claude/codex/cursor write those regardless),
+    #                        and a langchain session's conversation context
+    #                        lives exactly as long as the instance.
+    store: Path | SessionStorePort | None = None
     # Default broker for every session that doesn't supply its own via
     # `SessionOptions.permission_broker`. Absent here too (the common case:
     # `None`), `TurnRunner` falls back to an allow-all policy -- with no
@@ -91,12 +93,4 @@ class TradewindConfig(BaseModel):
             raise ConfigError(
                 "all profiles must share one identical tier-name set, got: "
                 f"{ {name: sorted(tiers) for name, tiers in tier_sets.items()} }"
-            )
-
-        has_sqlite_path = self.store.sqlite_path is not None
-        has_store = self.store.store is not None
-        if has_sqlite_path == has_store:
-            raise ConfigError(
-                "StoreConfig requires exactly one of sqlite_path/store, got "
-                f"sqlite_path={self.store.sqlite_path!r} store={self.store.store!r}"
             )

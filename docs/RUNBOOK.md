@@ -220,6 +220,22 @@ library) — they are read only by the test files that need real credentials to 
   on 3.12 unchanged. Keep the floor as low as the code actually needs, and when changing it,
   update `pyproject.toml` (`requires-python`, mypy `python_version`, ruff `target-version`),
   `uv.lock`, README, and ARCHITECTURE §6 together.
+- **Never batch-rewrite code with a bare-substring regex.** The `StoreConfig`
+  migration's `re.sub("StoreConfig, ", ...)` also matched *inside*
+  `NativeStoreConfig, ` — producing `NativeTradewindConfig` imports and
+  `native_config: Nativeevents:` signatures across six test files. Use word
+  boundaries (`\bStoreConfig\b`) or AST-aware edits, and always run the suite
+  immediately after a mechanical rewrite (which is what caught it).
+- **`sqlite3` `":memory:"` + a single-connection store = a free ephemeral
+  `SessionStorePort`.** `SqliteSessionStore` holds one connection for its
+  lifetime, so `SqliteSessionStore(":memory:")` is a complete in-memory
+  implementation (FR-5.7/ADR-0001) — no new store class, per-instance
+  isolation guaranteed by sqlite's per-connection memory databases
+  (test-locked by `test_two_ephemeral_instances_never_share_sessions`).
+- **`__version__` in `__init__.py` drifts silently from `pyproject.toml`** —
+  it sat at 0.1.0 through two confirmed bumps because nothing checks the two
+  agree. Caught while touching the file for ADR-0001. When bumping, grep for
+  the version string repo-wide; a follow-up could assert equality in a test.
 - **Check a spec's numbering before citing a new requirement id.** FR-6.5's first draft
   cited "FR-6.3" in fourteen code comments — but FR-6.3 already existed (native-store
   durability); grep REQUIREMENTS.md for the id before writing it into code. Caught

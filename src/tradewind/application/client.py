@@ -3,7 +3,7 @@ thin per-session handle bound to it) (task-6 brief; turn wiring task-9).
 
 Layering note (controller ruling): the application layer may not import
 adapters (import-linter `layers` contract; GUIDELINES §8 "dependencies
-flow inward"), but `StoreConfig.sqlite_path` needs a concrete
+flow inward"), but a `TradewindConfig.store` path needs a concrete
 `SessionStorePort` built from it, and a session's `Profile.backend` needs a
 concrete `Backend` adapter. Rather than construct either here, this module
 exposes two module-private, constant import-time seams (GUIDELINES §8
@@ -65,7 +65,9 @@ _backend_factories: dict[BackendName, BackendFactory] = {}
 
 def _set_default_store_factory(factory: StoreFactory) -> None:
     """Assign the constant, import-time `SessionStorePort` constructor used
-    when `StoreConfig.sqlite_path` is given instead of `StoreConfig.store`.
+    when `TradewindConfig.store` is a filesystem path — or, as `Path(":memory:")`,
+    when it is None (the ephemeral mirror, FR-5.7) — rather than an
+    already-built `SessionStorePort`.
 
     Module-private: not part of the public API, and callers never invoke
     this directly. It is assigned exactly once, by `tradewind/__init__.py`
@@ -93,19 +95,21 @@ def _set_backend_factories(factories: dict[BackendName, BackendFactory]) -> None
 
 
 def _resolve_store(config: TradewindConfig) -> SessionStorePort:
-    if config.store.store is not None:
-        return config.store.store
-    sqlite_path = config.store.sqlite_path
-    if sqlite_path is None:
-        # Unreachable: TradewindConfig.model_post_init already guarantees
-        # exactly one of sqlite_path/store is set.
-        raise ConfigError("StoreConfig has neither sqlite_path nor store set")
+    if isinstance(config.store, SessionStorePort):
+        return config.store
     if _default_store_factory is None:
         raise ConfigError(
             "no sqlite store factory assigned; `import tradewind` (not just "
-            "`tradewind.application.client`) before constructing Tradewind from a sqlite_path"
+            "`tradewind.application.client`) before constructing Tradewind from a store path"
         )
-    return _default_store_factory(sqlite_path)
+    if config.store is None:
+        # No store configured (FR-5.7): an ephemeral in-memory mirror.
+        # sqlite ":memory:" is per-connection, and `SqliteSessionStore`
+        # holds exactly one shared connection for its lifetime, so this is
+        # a fully functional store that simply vanishes with the
+        # `Tradewind` instance -- and two instances never share one.
+        return _default_store_factory(Path(":memory:"))
+    return _default_store_factory(config.store)
 
 
 def _validate_session_id(session_id: str) -> None:

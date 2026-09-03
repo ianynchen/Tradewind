@@ -17,14 +17,16 @@ retrieval shapes.
 
 Implements `SessionStorePort` declared in `application`; `domain` never imports
 it. Default engine is stdlib `sqlite3`; a caller-built implementation of the port
-(Postgres, P-4) is accepted via `StoreConfig.store`.
+(Postgres, P-4) is accepted via a `SessionStorePort`-valued `TradewindConfig.store`
+(ADR-0001: one union field — path, port instance, or None for the ephemeral
+in-memory mirror, FR-5.7).
 
 ## Storage decisions
 
 | Decision | Choice | Why |
 |---|---|---|
 | Engine | stdlib `sqlite3`, WAL, `foreign_keys=ON`, `busy_timeout` 5 s | House pattern (waypoint 01); zero deps; embedder-friendly single file. |
-| Location | `StoreConfig.sqlite_path`, no default path | Library rule: the host decides where data lives (NFR-5). |
+| Location | path-valued `TradewindConfig.store`, no default path; `None` selects an ephemeral in-memory database (FR-5.7) | Library rule: the host decides where data lives (NFR-5) — including nowhere. |
 | Schema versioning | `PRAGMA user_version`, forward-only migrations at open | An embedder upgrade must never strand transcripts. |
 | Timestamps | UTC ISO-8601 text | Legible in any SQLite browser. |
 | Identifiers | caller-minted UUID text primary keys (FR-5.6, I-1a) | Idempotent creation; embedder records the id before calling. |
