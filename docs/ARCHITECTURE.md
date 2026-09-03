@@ -303,7 +303,7 @@ already mirrored stays.
 
 ## 6. Technology
 
-- Python ≥3.13, uv-managed; Typer only if a debug CLI emerges (library first, NFR-5).
+- Python ≥3.12, uv-managed; Typer only if a debug CLI emerges (library first, NFR-5).
 - Pinned provider packages: `claude-agent-sdk`, `openai-codex`, `cursor-sdk`,
   `langchain-anthropic` (+ `anthropic`); `mcp` for the tool shim; `sqlite3` stdlib
   behind the store port.

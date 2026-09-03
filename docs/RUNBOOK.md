@@ -212,6 +212,17 @@ library) — they are read only by the test files that need real credentials to 
   keeping two variables (`backend_prompt` vs. the caller's original `prompt`) and gating the
   fold on `is_first_turn`. Emulation logic that touches what gets sent to a backend must never
   share a variable with what gets persisted as the caller's own words.
+- **`requires-python` metadata gates downstream resolvers on the declared *range*, not the
+  interpreter actually in use.** Sextant (declares `>=3.12`, runs 3.14) could not resolve
+  tradewind at `>=3.13` even though every interpreter involved satisfied it — uv resolves for
+  the whole declared range. Confirmed the floor was pure metadata: no 3.13-only construct in
+  source, deps resolve on 3.12, and the full suite + mypy strict + ruff + import-linter pass
+  on 3.12 unchanged. Keep the floor as low as the code actually needs, and when changing it,
+  update `pyproject.toml` (`requires-python`, mypy `python_version`, ruff `target-version`),
+  `uv.lock`, README, and ARCHITECTURE §6 together.
+- `CHANGELOG.md` started and first version bump applied (0.1.0 → 0.2.0, user-confirmed) with
+  the 3.12-floor change — the flag in the bullet below is resolved; versioning now follows
+  GUIDELINES §11 as written. `PROJECT.md` still absent.
 - No `CHANGELOG.md`/`PROJECT.md`/version bump exist in this repo as of phase 1 close-out
   (confirmed absent since task 9, unchanged through task 16) — GUIDELINES §5/§11 name them as
   house conventions; flagged again here in case phase 2 wants them started, matching the

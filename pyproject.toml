@@ -4,9 +4,9 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tradewind"
-version = "0.1.0"
+version = "0.2.0"
 description = "Agent infrastructure and policy execution engine"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "pydantic>=2.9",
     "anyio>=4",
@@ -42,7 +42,7 @@ markers = [
 
 [tool.mypy]
 strict = true
-python_version = "3.13"
+python_version = "3.12"
 warn_unused_configs = true
 disallow_any_unimported = true
 disallow_any_expr = true
@@ -257,7 +257,7 @@ disallow_any_expr = false
 
 [tool.ruff]
 line-length = 100
-target-version = "py313"
+target-version = "py312"
 
 [tool.ruff.lint]
 select = [
