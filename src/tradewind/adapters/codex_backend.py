@@ -208,12 +208,14 @@ from tradewind.domain.models import (
     Capabilities,
     EffortLevel,
     McpServerDef,
+    ModelSpec,
     NormalizedMessage,
     PermissionBroker,
     Profile,
     SessionRow,
     TurnResult,
     Verdict,
+    calculate_cost,
 )
 
 _logger = logging.getLogger(__name__)
@@ -527,6 +529,24 @@ def _final_text_from_items(agent_messages: list[AgentMessageThreadItem]) -> str 
         if message.phase is None and fallback is None:
             fallback = message.text
     return fallback
+
+
+def _computed_cost(model_spec: ModelSpec, usage: dict[str, int]) -> float | None:
+    """`TurnResult.cost_usd` from the tier's cost table (FR-10.5); None
+    without one. Field mapping per the Phase-1 spec: codex's
+    `cached_input_tokens` is a subset of `input_tokens` billed at the
+    cache-read rate (OpenAI usage semantics), and codex reports no
+    cache-write figure."""
+    meta = model_spec.meta
+    if meta is None or meta.cost is None:
+        return None
+    cached = usage.get("cached_input_tokens", 0)
+    return calculate_cost(
+        meta.cost,
+        input_tokens=max(usage.get("input_tokens", 0) - cached, 0),
+        output_tokens=usage.get("output_tokens", 0),
+        cache_read_tokens=cached,
+    )
 
 
 def _usage_dict(usage: ThreadTokenUsage) -> dict[str, int]:
@@ -1005,7 +1025,7 @@ class CodexBackend(Backend):
             worker.start()
             terminal_event_observed = False
             try:
-                async for event in self._consume(ctx.turn_id, out_queue):
+                async for event in self._consume(ctx.turn_id, out_queue, ctx.model_spec):
                     if isinstance(event, (TurnCompleted, TurnFailed)):
                         terminal_event_observed = True
                     yield event
@@ -1049,7 +1069,9 @@ class CodexBackend(Backend):
             # double-handle those.
             yield TurnFailed(turn_id=ctx.turn_id, error=str(exc))
 
-    async def _consume(self, turn_id: str, out_queue: queue.Queue[object]) -> AsyncIterator[Event]:
+    async def _consume(
+        self, turn_id: str, out_queue: queue.Queue[object], model_spec: ModelSpec
+    ) -> AsyncIterator[Event]:
         agent_messages: list[AgentMessageThreadItem] = []
         usage: ThreadTokenUsage | None = None
         while True:
@@ -1099,11 +1121,13 @@ class CodexBackend(Backend):
                             end_reason="end_turn",
                             final_text=_final_text_from_items(agent_messages),
                             usage=_usage_dict(usage) if usage is not None else {},
-                            # Codex's own `Turn`/`TurnCompletedNotification`
-                            # carries no per-turn cost figure (unlike
-                            # Claude's `ResultMessage.total_cost_usd`) --
-                            # `None` is honest absence, not an unwired field.
-                            cost_usd=None,
+                            # Codex reports no per-turn dollar figure, so
+                            # this is COMPUTED from the tier's cost table
+                            # when one exists (FR-10.5; API-equivalent
+                            # price on subscription auth), else honest None.
+                            cost_usd=_computed_cost(
+                                model_spec, _usage_dict(usage) if usage is not None else {}
+                            ),
                         )
                     )
                 else:

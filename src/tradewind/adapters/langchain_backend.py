@@ -61,7 +61,17 @@ from langchain_core.messages.tool import tool_call as make_tool_call
 
 from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import Backend, TurnContext
-from tradewind.domain.errors import Unsupported
+from tradewind.domain.compaction import (
+    build_summary_request,
+    compacted_view,
+    estimate_tokens,
+    find_cut_point,
+    find_latest_compaction,
+    merge_split_turn_summaries,
+    serialize_for_summary,
+    should_compact,
+)
+from tradewind.domain.errors import CompactionFailed, Unsupported
 from tradewind.domain.events import (
     Event,
     ItemCompleted,
@@ -82,6 +92,7 @@ from tradewind.domain.models import (
     SessionRow,
     StoredMessage,
     TurnResult,
+    calculate_cost,
 )
 
 _MAX_ITERATIONS = 25
@@ -145,9 +156,23 @@ def _rebuild_messages(ctx: TurnContext, history: list[StoredMessage]) -> list[Ba
     items each become their own `ToolMessage` (langchain-anthropic groups
     consecutive `ToolMessage`s into one API-side user turn itself).
     """
+    summary, retained = compacted_view(history)
     messages: list[BaseMessage] = []
     if ctx.system_prompt is not None:
         messages.append(SystemMessage(content=ctx.system_prompt))
+    if summary is not None:
+        # FR-5.8 rebuild rule: the latest compaction record renders as a
+        # user message carrying the checkpoint; older rows are omitted
+        # from the FEED only -- the mirror keeps every row.
+        messages.append(
+            HumanMessage(
+                content=(
+                    "The conversation history before this point was compacted "
+                    f"into the following summary:\n\n<summary>\n{summary}\n</summary>"
+                )
+            )
+        )
+    history = retained
 
     pending_tool_calls: list[ToolCall] = []
 
@@ -438,7 +463,20 @@ class LangchainBackend(Backend):
             chat_model = self._chat_model_factory(ctx.model_spec)
             schemas = ctx.tools.schemas()
             bound_model = _bind_tools(chat_model, schemas)
-            messages = _rebuild_messages(ctx, await ctx.load_history())
+            history = await ctx.load_history()
+            record, failure_item, summarizer_usage = await self._maybe_auto_compact(ctx, history)
+            if failure_item is not None:
+                # Auto-compaction failed (FR-5.8 hard-fail rule): surfaced
+                # loudly as a mirrored event item, turn proceeds uncompacted.
+                yield ItemCompleted(message=failure_item)
+            if record is not None:
+                # The record reaches the mirror through the ordinary
+                # ItemCompleted path (Kind="compaction"); locally it joins
+                # the in-memory history so THIS turn already rebuilds from
+                # summary + retained tail.
+                yield ItemCompleted(message=record)
+                history = [*history, record]
+            messages = _rebuild_messages(ctx, history)
             messages.append(HumanMessage(content=ctx.prompt))
 
             usage_totals: dict[str, int] = {}
@@ -540,8 +578,172 @@ class LangchainBackend(Backend):
                     end_reason=end_reason,
                     final_text=final_text,
                     usage=usage_totals,
-                    cost_usd=None,
+                    cost_usd=self._computed_cost(ctx.model_spec, usage_totals, summarizer_usage),
                 )
             )
         except Exception as exc:
             yield TurnFailed(turn_id=ctx.turn_id, error=str(exc))
+
+    # --- compaction (FR-5.8) -------------------------------------------
+
+    def _computed_cost(
+        self,
+        model_spec: ModelSpec,
+        usage_totals: dict[str, int],
+        summarizer_usage: dict[str, int],
+    ) -> float | None:
+        """`TurnResult.cost_usd` from the tier's cost table (FR-10.5) --
+        None without one (honest absence). Includes the summarizer call's
+        spend when this turn triggered a compaction. On a subscription
+        profile the figure is the API-EQUIVALENT price of the tokens used,
+        not billed spend (user decision 2026-09-03)."""
+        meta = model_spec.meta
+        if meta is None or meta.cost is None:
+            return None
+        cost = calculate_cost(
+            meta.cost,
+            input_tokens=usage_totals.get("input_tokens", 0),
+            output_tokens=usage_totals.get("output_tokens", 0),
+        )
+        if summarizer_usage:
+            cost += calculate_cost(
+                meta.cost,
+                input_tokens=summarizer_usage.get("input_tokens", 0),
+                output_tokens=summarizer_usage.get("output_tokens", 0),
+            )
+        return cost
+
+    async def _maybe_auto_compact(
+        self, ctx: TurnContext, history: list[StoredMessage]
+    ) -> tuple[StoredMessage | None, NormalizedMessage | None, dict[str, int]]:
+        """The automatic trigger (FR-5.8 B3): fires only when settings allow
+        (`auto=True`), the tier declares a `context_window`, and the chars/4
+        estimate of the ABOUT-TO-BE-FED context (summary + retained tail +
+        this prompt) trips Pi's `window - reserve` predicate. Returns
+        (compaction record, failure event item, summarizer usage) -- at most
+        one of the first two is set."""
+        settings = ctx.compaction
+        meta = ctx.model_spec.meta
+        if settings is None or not settings.auto or meta is None:
+            return None, None, {}
+        summary, retained = compacted_view(history)
+        feed_estimate = (
+            estimate_tokens(retained)
+            + (len(summary) // 4 if summary is not None else 0)
+            + len(ctx.prompt) // 4
+            + (len(ctx.system_prompt) // 4 if ctx.system_prompt is not None else 0)
+        )
+        if not should_compact(feed_estimate, meta.context_window, settings.reserve_tokens):
+            return None, None, {}
+        try:
+            record, usage = await self._compact(
+                ctx.model_spec, history, keep_recent_tokens=settings.keep_recent_tokens
+            )
+        except CompactionFailed as exc:
+            failure = NormalizedMessage(
+                role="assistant",
+                kind="event",
+                content={"type": "compaction_failed", "error": str(exc)},
+            )
+            return None, failure, {}
+        return record, None, usage
+
+    async def compact_history(
+        self,
+        model_spec: ModelSpec,
+        history: list[StoredMessage],
+        *,
+        keep_recent_tokens: int,
+        instructions: str | None = None,
+    ) -> tuple[StoredMessage, dict[str, int]]:
+        """Manual compaction entry point (FR-5.8 B3), duck-typed from the
+        turn runner (same pattern as `take_native_session_id`: not part of
+        the `Backend` ABC). Works without `ModelMeta` -- the caller supplies
+        the "when". Returns the un-persisted compaction record (the runner
+        appends it to the mirror) and the summarizer usage.
+
+        Failure modes:
+            CompactionFailed: nothing to compact, or the summarizer's
+                output was truncated/unusable (hard-fail rule -- a broken
+                summary must never become a checkpoint).
+        """
+        return await self._compact(
+            model_spec, history, keep_recent_tokens=keep_recent_tokens, instructions=instructions
+        )
+
+    async def _compact(
+        self,
+        model_spec: ModelSpec,
+        history: list[StoredMessage],
+        *,
+        keep_recent_tokens: int,
+        instructions: str | None = None,
+    ) -> tuple[StoredMessage, dict[str, int]]:
+        previous = find_latest_compaction(history)
+        previous_summary = str(previous.content["summary"]) if previous is not None else None
+        # Chaining (FR-5.8 B6, Pi's rule): re-summarize the previously-kept
+        # tail plus everything since -- `compacted_view` IS that window --
+        # never the old summary as conversation; it rides along as
+        # <previous-summary> instead.
+        _, view_rows = compacted_view(history)
+        cut = find_cut_point(view_rows, keep_recent_tokens)
+        if cut is None:
+            raise CompactionFailed(
+                "nothing to compact: the transcript already fits within keep_recent_tokens"
+            )
+        boundary = cut.turn_start_index if cut.is_split_turn else cut.first_kept_index
+        model = self._chat_model_factory(model_spec)
+        system_prompt, user_text = build_summary_request(
+            serialize_for_summary(view_rows[:boundary]),
+            previous_summary=previous_summary,
+            instructions=instructions,
+        )
+        summary_text, usage = await self._invoke_summarizer(model, system_prompt, user_text)
+        if cut.is_split_turn:
+            prefix_system, prefix_text_req = build_summary_request(
+                serialize_for_summary(view_rows[cut.turn_start_index : cut.first_kept_index]),
+                turn_prefix=True,
+            )
+            prefix_summary, prefix_usage = await self._invoke_summarizer(
+                model, prefix_system, prefix_text_req
+            )
+            summary_text = merge_split_turn_summaries(summary_text, prefix_summary)
+            for key, value in prefix_usage.items():
+                usage[key] = usage.get(key, 0) + value
+        record = StoredMessage(
+            role="user",
+            kind="compaction",
+            content={
+                "summary": summary_text,
+                "first_kept_seq": view_rows[cut.first_kept_index].seq,
+                "tokens_before": estimate_tokens(view_rows),
+                "summarizer_usage": dict(usage),
+            },
+        )
+        return record, usage
+
+    async def _invoke_summarizer(
+        self, model: BaseChatModel, system_prompt: str, user_text: str
+    ) -> tuple[str, dict[str, int]]:
+        """One summarization call, with Pi's hard-fail honesty rules: a
+        `max_tokens` stop or a tool-call response is a failure, never a
+        checkpoint. No explicit output cap is set (documented Phase-1
+        divergence: `BaseChatModel` has no portable per-call max_tokens;
+        the model's own default applies and the stop_reason check guards
+        truncation)."""
+        response = await model.ainvoke(
+            [SystemMessage(content=system_prompt), HumanMessage(content=user_text)]
+        )
+        if _stop_reason(response) == "max_tokens":
+            raise CompactionFailed(
+                "summarizer output was truncated at its token cap; a truncated "
+                "summary must not become a checkpoint"
+            )
+        if getattr(response, "tool_calls", None):
+            raise CompactionFailed("summarizer returned tool calls instead of a summary")
+        text = _final_text(response)
+        if text is None:
+            raise CompactionFailed("summarizer returned empty output")
+        usage: dict[str, int] = {}
+        _accumulate_usage(usage, response.usage_metadata)
+        return text, usage

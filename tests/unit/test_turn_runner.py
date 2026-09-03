@@ -40,14 +40,24 @@ from pydantic import ConfigDict, Field, SecretStr
 from tradewind.adapters.langchain_backend import LangchainBackend
 from tradewind.application import client as _client
 from tradewind.application.client import Tradewind
-from tradewind.application.config import NativeStoreConfig, TradewindConfig
+from tradewind.application.config import (
+    CompactionSettings,
+    NativeStoreConfig,
+    TradewindConfig,
+    TurnDefaults,
+)
 from tradewind.application.ports import Backend, TurnContext
 from tradewind.application.turn_runner import (
     _emulate_system_prompt,
     _fold_system_prompt,
     _write_rules_file,
 )
-from tradewind.domain.errors import ConfigError, Unsupported
+from tradewind.domain.errors import (
+    CompactionFailed,
+    ConfigError,
+    TurnInProgress,
+    Unsupported,
+)
 from tradewind.domain.events import (
     Event,
     ItemCompleted,
@@ -1471,3 +1481,235 @@ async def test_invalid_history_scope_raises_config_error_without_opening_a_turn(
 
     assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == []
     assert fake.contexts == []
+
+
+# --- compaction (FR-5.8): automatic trigger, manual verb, honesty gates ---
+
+
+def _meta_profile(*, context_window: int = 100, with_cost: bool = False) -> Profile:
+    from tradewind.domain.models import ModelCost, ModelMeta
+
+    meta = ModelMeta(
+        context_window=context_window,
+        max_tokens=50,
+        cost=ModelCost(input=3.0, output=15.0, cache_read=0.3, cache_write=3.75)
+        if with_cost
+        else None,
+    )
+    return Profile(
+        backend="langchain",
+        auth=ApiKeyAuth(api_key=SecretStr("sk-test")),
+        models={"standard": ModelSpec(model="model-standard", meta=meta)},
+    )
+
+
+def _langchain_tw(
+    tmp_path: Path, profile: Profile, model: FakeMessagesListChatModel, **config_kwargs: object
+) -> Tradewind:
+    def factory(p: Profile, native_config: NativeStoreConfig) -> Backend:
+        return LangchainBackend(p, native_config, chat_model_factory=lambda _spec: model)
+
+    return Tradewind(
+        _config(tmp_path, profile, **config_kwargs), backend_factories={"langchain": factory}
+    )
+
+
+_CHECKPOINT = "## Goal\nkeep going\n## Progress\nDone: step one"
+
+
+async def test_auto_compaction_fires_and_the_turn_sees_summary_plus_tail(
+    tmp_path: Path,
+) -> None:
+    # window=100, reserve=20 -> trigger when the feed estimate exceeds 80
+    # tokens; prompts/replies of ~200 chars are ~50 tokens each, so turn 3
+    # trips it. keep_recent=30 keeps roughly the newest message.
+    model = _RecordingChatModel(
+        responses=[
+            AIMessage(content="reply one " * 10),
+            AIMessage(content="reply two " * 10),
+            AIMessage(content=_CHECKPOINT),  # consumed by the SUMMARIZER
+            AIMessage(content="reply three"),
+        ]
+    )
+    tw = _langchain_tw(
+        tmp_path,
+        _meta_profile(context_window=100),
+        model,
+        defaults=TurnDefaults(
+            compaction=CompactionSettings(auto=True, reserve_tokens=20, keep_recent_tokens=30)
+        ),
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("prompt one " * 9)
+    await session.run("prompt two " * 9)
+
+    result = await session.run("prompt three")
+
+    assert result.status == "completed"
+    # The record reached the mirror as an ordinary item (Kind="compaction").
+    records = [m for m in await tw.history(_VALID_ID) if m.kind == "compaction"]
+    assert len(records) == 1
+    assert records[0].content["summary"].startswith("## Goal")
+    assert isinstance(records[0].content["first_kept_seq"], int)
+    # The triggering turn itself was fed summary + tail, not full history.
+    final_request = [str(message.content) for message in model.calls[-1]]
+    assert any("compacted into the following summary" in text for text in final_request)
+    assert not any("prompt one" in text for text in final_request)
+    # The mirror keeps EVERY row -- compaction changes the feed, not storage.
+    assert any("prompt one" in str(m.content.get("text", "")) for m in await tw.history(_VALID_ID))
+
+
+async def test_no_metadata_means_no_auto_compaction(tmp_path: Path) -> None:
+    model = _RecordingChatModel(responses=[AIMessage(content="r1 " * 50), AIMessage(content="r2")])
+    tw = _langchain_tw(
+        tmp_path,
+        _profile(),  # no ModelMeta
+        model,
+        defaults=TurnDefaults(
+            compaction=CompactionSettings(auto=True, reserve_tokens=20, keep_recent_tokens=30)
+        ),
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("p1 " * 100)
+    await session.run("p2")
+
+    assert [m for m in await tw.history(_VALID_ID) if m.kind == "compaction"] == []
+
+
+async def test_auto_false_suppresses_automatic_compaction(tmp_path: Path) -> None:
+    model = _RecordingChatModel(responses=[AIMessage(content="r1 " * 50), AIMessage(content="r2")])
+    tw = _langchain_tw(
+        tmp_path,
+        _meta_profile(context_window=50),
+        model,
+        defaults=TurnDefaults(
+            compaction=CompactionSettings(auto=False, reserve_tokens=20, keep_recent_tokens=30)
+        ),
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("p1 " * 100)
+    await session.run("p2")
+
+    assert [m for m in await tw.history(_VALID_ID) if m.kind == "compaction"] == []
+
+
+async def test_manual_compact_persists_record_and_feeds_later_turns(tmp_path: Path) -> None:
+    model = _RecordingChatModel(
+        responses=[
+            AIMessage(content="reply one " * 10),
+            AIMessage(content="reply two " * 10),
+            AIMessage(content=_CHECKPOINT),  # summarizer
+            AIMessage(content="post-compact reply"),
+        ]
+    )
+    # No ModelMeta and auto=False: manual must work regardless.
+    tw = _langchain_tw(
+        tmp_path,
+        _profile(),
+        model,
+        defaults=TurnDefaults(
+            compaction=CompactionSettings(auto=False, reserve_tokens=20, keep_recent_tokens=30)
+        ),
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("prompt one " * 9)
+    await session.run("prompt two " * 9)
+
+    record = await session.compact("focus on the auth work")
+
+    assert record.kind == "compaction"
+    assert record.seq > 0  # persisted, with its assigned mirror seq
+    stored = [m for m in await tw.history(_VALID_ID) if m.kind == "compaction"]
+    assert len(stored) == 1
+    # The caller's instructions reached the summarization prompt.
+    summarizer_request = " ".join(str(m.content) for m in model.calls[2])
+    assert "Additional focus: focus on the auth work" in summarizer_request
+
+    result = await session.run("wrap up")
+    assert result.final_text == "post-compact reply"
+    final_request = [str(message.content) for message in model.calls[-1]]
+    assert any("compacted into the following summary" in text for text in final_request)
+
+
+async def test_compact_on_native_resume_backend_raises_unsupported(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _NativeResumeBackend(
+        profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), _completed()]
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    with pytest.raises(Unsupported, match="compact"):
+        await session.compact()
+
+
+async def test_compact_with_nothing_to_summarize_fails_loudly(tmp_path: Path) -> None:
+    model = _RecordingChatModel(responses=[AIMessage(content="r1")])
+    tw = _langchain_tw(tmp_path, _profile(), model)
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("short")
+
+    with pytest.raises(CompactionFailed, match="nothing to compact"):
+        await session.compact()
+
+
+async def test_busy_session_rejects_both_run_and_compact(tmp_path: Path) -> None:
+    model = _RecordingChatModel(responses=[AIMessage(content="r1")])
+    tw = _langchain_tw(tmp_path, _profile(), model)
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    tw._turn_runner._busy.add(_VALID_ID)
+    try:
+        with pytest.raises(TurnInProgress):
+            await session.run("hi")
+        with pytest.raises(TurnInProgress):
+            await session.compact()
+    finally:
+        tw._turn_runner._busy.discard(_VALID_ID)
+
+
+async def test_cost_usd_computed_from_tier_cost_table(tmp_path: Path) -> None:
+    model = _RecordingChatModel(responses=[AIMessage(content="pong")])
+    tw = _langchain_tw(tmp_path, _meta_profile(context_window=100_000, with_cost=True), model)
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    result = await session.run("ping")
+
+    # A cost table exists: computed cost is a number (the fake model
+    # reports no usage, so it is 0.0) -- never None. Without a table
+    # (every other langchain test here) cost_usd stays None.
+    assert result.cost_usd == 0.0
+
+
+async def test_manual_compact_splits_a_turn_with_prefix_summary(tmp_path: Path) -> None:
+    # The cut lands INSIDE turn 2 (its long reply carries the whole
+    # keep_recent budget), so Pi's split-turn path runs: a second
+    # summarizer call covers the turn PREFIX and both merge under the
+    # split-turn marker.
+    model = _RecordingChatModel(
+        responses=[
+            AIMessage(content="reply one " * 10),
+            AIMessage(content="reply two " * 30),  # long tail carrying the budget
+            AIMessage(content=_CHECKPOINT),  # summarizer: main history
+            AIMessage(content="## Original Request\nprefix part"),  # summarizer: turn prefix
+        ]
+    )
+    tw = _langchain_tw(
+        tmp_path,
+        _profile(),
+        model,
+        defaults=TurnDefaults(
+            compaction=CompactionSettings(auto=False, reserve_tokens=20, keep_recent_tokens=60)
+        ),
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("prompt one " * 9)
+    await session.run("prompt two " * 9)
+
+    record = await session.compact()
+
+    summary = str(record.content["summary"])
+    assert "**Turn Context (split turn):**" in summary
+    assert summary.index("## Goal") < summary.index("prefix part")
+    # Two summarizer calls happened (main + prefix): 2 turns + 2 = 4.
+    assert len(model.calls) == 4

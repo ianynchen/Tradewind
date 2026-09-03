@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-09-03
+
+### Added
+
+- Model metadata (FR-10.5): optional `ModelMeta` on `ModelSpec`
+  (`context_window`, `max_tokens`, `ModelCost` table in $/Mtok with
+  whole-request pricing tiers) plus `calculate_cost`. `TurnResult.cost_usd`
+  is now computed from token usage on `langchain`/`codex`/`cursor` when a
+  cost table exists — on all auth modes; a subscription profile's figure is
+  the API-equivalent price, not billed spend. Claude's reported cost is
+  never overwritten. Absent metadata keeps `cost_usd` at `None`.
+- Mirror compaction (FR-5.8, design ported from Pi, MIT): on mirror-fed
+  paths (`langchain`), older transcript is summarized into a structured
+  checkpoint recorded as a `kind="compaction"` mirror message and later
+  requests rebuild from `[checkpoint + retained tail]` — cut points never
+  split a tool call from its result, mid-turn cuts summarize the turn
+  prefix separately (exact `turn_id` detection), and repeated compactions
+  chain through `<previous-summary>`. Automatic triggering is doubly gated
+  (`CompactionSettings.auto` AND the tier's `context_window`; conservative
+  chars/4 estimate); `Session.compact(instructions)` compacts manually,
+  metadata-free, and raises `Unsupported` on native-resume backends. A
+  truncated summary is a hard failure (`CompactionFailed` / a loud event
+  item), never a checkpoint. The mirror keeps every row; forks copy
+  verbatim history without compaction records.
+
 ## [0.6.0] - 2026-09-03
 
 ### Added

@@ -220,6 +220,16 @@ library) — they are read only by the test files that need real credentials to 
   on 3.12 unchanged. Keep the floor as low as the code actually needs, and when changing it,
   update `pyproject.toml` (`requires-python`, mypy `python_version`, ruff `target-version`),
   `uv.lock`, README, and ARCHITECTURE §6 together.
+- **Scripted-fake compaction tests must budget a response per SUMMARIZER call, and
+  `FakeMessagesListChatModel` cycles its list** — the first Phase-1 integration tests
+  under-provisioned: an unexpected split-turn cut consumed a second summarizer response,
+  the fake wrapped around, and turn replies shifted by two. When a test's fake serves
+  multiple consumers (turn loop + summarizer), count the calls per path (a split turn
+  costs TWO) and script exact-length messages so the chars/4 trigger fires on the
+  intended turn only.
+- **FR numbering slipped a THIRD time** (FR-10.5 inserted above FR-10.4) — the grep
+  habit exists but the insertion-anchor habit doesn't: anchor the Edit on the LAST
+  existing bullet of the section, not the section header or the following heading.
 - **`append_message`'s returned seq is a free "is this the session's first turn"
   oracle** — the prompt landing at seq 1 IS the empty-history fact, so FR-9.3's
   lazy loading could drop the eager whole-history read the R-1 emulation used to

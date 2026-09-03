@@ -55,6 +55,13 @@ supports_tool_round_cap         True    # the loop is Tradewind's own, so the ca
    descendant session pre-folded into one wrapped text block by the runner;
    `include_raw=False`; `tool_use`/`tool_result` kinds reconstruct real
    content blocks; thinking blocks are omitted — see Decisions).
+   Before the request, the automatic compaction check runs (FR-5.8: gated on
+   `CompactionSettings.auto` and the tier's `ModelMeta.context_window`; the
+   summarizer is the tier's own model via `chat_model_factory`); the rebuild
+   honors the latest `kind="compaction"` record — checkpoint-as-user-message
+   plus rows `seq >= first_kept_seq`. Pure machinery lives in
+   `domain/compaction.py`; the manual verb enters via `compact_history`
+   (duck-typed from the runner, like `take_native_session_id`).
 2. Bind caller tools (`ToolHost` schemas) to the model; send request with
    `system`, messages, and per-call options.
 3. Stream: text/thinking deltas → normalized delta events (live only, I-3);

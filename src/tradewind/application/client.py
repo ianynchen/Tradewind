@@ -177,6 +177,22 @@ class Session:
     async def stop(self) -> None:
         await self._client._stop(self.id)
 
+    async def compact(self, instructions: str | None = None) -> StoredMessage:
+        """Manually compact this session's mirror transcript NOW (FR-5.8):
+        older history is summarized into a checkpoint through the same
+        machinery automatic compaction uses; `instructions` is appended to
+        the summarization prompt as "Additional focus: ...". Available
+        regardless of `CompactionSettings.auto` and without `ModelMeta`.
+        Returns the persisted compaction record. The mirror keeps every
+        row — compaction changes what is FED to the model, never what is
+        stored.
+
+        Failure modes: see `TurnRunner.compact` (SessionNotFound,
+        Unsupported on native-resume backends, TurnInProgress mid-turn,
+        CompactionFailed when the summarizer output is unusable).
+        """
+        return await self._client._turn_runner.compact(self.id, instructions)
+
     async def spawn(self, prompt: str, *, tier: TierName | None = None) -> Session:
         return await self._client._spawn(self, prompt, tier)
 

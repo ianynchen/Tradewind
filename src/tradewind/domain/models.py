@@ -72,9 +72,84 @@ class Capabilities(BaseModel):
     supports_tool_round_cap: bool
 
 
+class ModelCostTier(BaseModel):
+    """One request-wide pricing tier (FR-10.5): applies when the request's
+    total input-side tokens (input + cache_read + cache_write) exceed
+    `input_tokens_above`. The highest matched threshold wins and its rates
+    apply to the WHOLE request (no marginal/blended pricing) — ported from
+    Pi's `calculateCost` semantics (docs/research/2026-09-03-pi-
+    implementation-notes.md §3)."""
+
+    input_tokens_above: int
+    input: float
+    output: float
+    cache_read: float
+    cache_write: float
+
+
+class ModelCost(BaseModel):
+    """Per-model price table in $/Mtok (FR-10.5)."""
+
+    input: float
+    output: float
+    cache_read: float
+    cache_write: float
+    tiers: list[ModelCostTier] = []
+
+
+class ModelMeta(BaseModel):
+    """Optional per-tier model metadata (FR-10.5). Absent by default —
+    absence keeps every consumer honest: no `cost` means computed
+    `TurnResult.cost_usd` stays None; no `context_window` means automatic
+    compaction (FR-5.8) stays off. When `cost` is present, computed
+    cost is the API price of the tokens used regardless of auth mode; on
+    a subscription profile that figure is the API-EQUIVALENT price, a
+    budgeting aid — not billed spend."""
+
+    context_window: int
+    max_tokens: int
+    cost: ModelCost | None = None
+
+
+def calculate_cost(
+    cost: ModelCost,
+    *,
+    input_tokens: int,
+    output_tokens: int,
+    cache_read_tokens: int = 0,
+    cache_write_tokens: int = 0,
+) -> float:
+    """Dollar cost of one request's token usage against `cost` (FR-10.5).
+
+    Tier selection per Pi's semantics: total input-side tokens
+    (input + cache_read + cache_write) select the tier with the highest
+    `input_tokens_above` they exceed, else base rates; the chosen rates
+    apply to the whole request. Each adapter maps its own usage field
+    names onto these keyword arguments; absent fields are zero. The
+    Anthropic 1h-cache-write 2x rule is deliberately omitted — no adapter
+    surfaces the 1h split (documented in the Phase-1 spec).
+
+    Returns dollars (float, >= 0). Never raises on zero usage.
+    """
+    rates: ModelCostTier | ModelCost = cost
+    total_input = input_tokens + cache_read_tokens + cache_write_tokens
+    best_threshold = -1
+    for tier in cost.tiers:
+        if total_input > tier.input_tokens_above and tier.input_tokens_above > best_threshold:
+            rates = tier
+            best_threshold = tier.input_tokens_above
+    return (
+        rates.input * input_tokens
+        + rates.output * output_tokens
+        + rates.cache_read * cache_read_tokens
+        + rates.cache_write * cache_write_tokens
+    ) / 1e6
+
+
 class ModelSpec(BaseModel):
     model: str
     effort: EffortLevel | None = None
+    meta: ModelMeta | None = None
 
 
 class SubscriptionAuth(BaseModel):

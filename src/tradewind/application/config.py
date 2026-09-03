@@ -34,9 +34,22 @@ class ToolHostConfig(BaseModel):
     socket_dir: Path | None = None
 
 
+class CompactionSettings(BaseModel):
+    """Mirror-compaction settings (FR-5.8), config-wide. `auto` governs
+    AUTOMATIC triggering only — `auto=False` never disables the manual
+    `Session.compact()` verb. Automatic compaction is additionally inert
+    unless the turn's tier declares `ModelMeta.context_window` (honest: no
+    guessed windows). Defaults ported from Pi's."""
+
+    auto: bool = True
+    reserve_tokens: int = 16384
+    keep_recent_tokens: int = 20000
+
+
 class TurnDefaults(BaseModel):
     tier: TierName = "standard"
     request_timeout_s: float = 600.0
+    compaction: CompactionSettings = CompactionSettings()
 
 
 EventHook = Callable[[Event], None]

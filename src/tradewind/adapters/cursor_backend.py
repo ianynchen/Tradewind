@@ -188,9 +188,11 @@ from tradewind.domain.events import Event, ItemCompleted, TurnCompleted, TurnFai
 from tradewind.domain.models import (
     BackendName,
     Capabilities,
+    ModelSpec,
     NormalizedMessage,
     Profile,
     SessionRow,
+    calculate_cost,
 )
 from tradewind.domain.models import (
     TurnResult as DomainTurnResult,
@@ -313,6 +315,21 @@ def sdk_message_items(message: SDKMessage) -> list[NormalizedMessage]:
         # it here would duplicate it (module docstring).
         return []
     return [_event_message(message)]
+
+
+def _computed_cost(model_spec: ModelSpec, usage: dict[str, int]) -> float | None:
+    """`TurnResult.cost_usd` from the tier's cost table (FR-10.5); None
+    without one."""
+    meta = model_spec.meta
+    if meta is None or meta.cost is None:
+        return None
+    return calculate_cost(
+        meta.cost,
+        input_tokens=usage.get("input_tokens", 0),
+        output_tokens=usage.get("output_tokens", 0),
+        cache_read_tokens=usage.get("cache_read_tokens", 0),
+        cache_write_tokens=usage.get("cache_write_tokens", 0),
+    )
 
 
 def _usage_dict(usage: TokenUsage) -> dict[str, int]:
@@ -501,7 +518,7 @@ class CursorBackend(Backend):
             run = await agent.send(ctx.prompt)
             self._runs[session_id] = run
             try:
-                async for event in self._consume(ctx.turn_id, run):
+                async for event in self._consume(ctx.turn_id, run, ctx.model_spec):
                     yield event
             finally:
                 # Identity-checked pop, same reasoning as `ClaudeBackend.
@@ -522,7 +539,9 @@ class CursorBackend(Backend):
                 # logged, not raised (GUIDELINES §9).
                 _logger.exception("AsyncClient.aclose() failed", extra={"turn_id": ctx.turn_id})
 
-    async def _consume(self, turn_id: str, run: AsyncRun) -> AsyncIterator[Event]:
+    async def _consume(
+        self, turn_id: str, run: AsyncRun, model_spec: ModelSpec
+    ) -> AsyncIterator[Event]:
         async for event in run:
             if event.sdk_message is not None:
                 for message in sdk_message_items(event.sdk_message):
@@ -549,13 +568,16 @@ class CursorBackend(Backend):
                     end_reason="end_turn",
                     final_text=result.result,
                     usage=_usage_dict(result.usage) if result.usage is not None else {},
-                    # `RunResult` carries no per-run dollar cost (unlike
-                    # Claude's `ResultMessage.total_cost_usd`) -- billed
-                    # cost is only available via `Agent.get_usage()`, a
-                    # separate, eventually-consistent RPC this adapter does
-                    # not wire into every turn. `None` is honest absence,
-                    # not an unwired field.
-                    cost_usd=None,
+                    # `RunResult` carries no per-run dollar cost, so
+                    # this is COMPUTED from the tier's cost table when one
+                    # exists (FR-10.5; API-equivalent price on subscription
+                    # auth), else honest None. Cursor reports distinct
+                    # cache_read/cache_write fields alongside input
+                    # (Anthropic-style split), mapped directly.
+                    cost_usd=_computed_cost(
+                        model_spec,
+                        _usage_dict(result.usage) if result.usage is not None else {},
+                    ),
                 )
             )
             return
