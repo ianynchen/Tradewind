@@ -465,6 +465,7 @@ None of these are read by the library itself — only by the test suite, and onl
 | `TRADEWIND_RUN_CODEX_INTEGRATION=1` | Live conformance against a real Codex/ChatGPT subscription. |
 | `ANTHROPIC_API_KEY` | Live langchain tests against the real Anthropic API. |
 | `GROQ_API_KEY` | Live langchain tests against the free-tier Groq API (`ChatGroq`). |
+| `ANTHROPIC_API_KEY` (same var) | Also gates the Phase-2c live compaction validation (`tests/integration/test_compaction_live.py`): a long real session that must compact twice and recall a summarized-away fact. |
 
 Cursor's live conformance suite self-skips unconditionally until a Cursor subscription exists.
 
