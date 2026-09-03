@@ -434,3 +434,15 @@ def retry_notice(
             "error": error,
         },
     )
+
+
+def resume_degraded_notice(*, reason: str) -> NormalizedMessage:
+    """The mirrored `kind="event"` visibility item for a NATIVE->REPLAY
+    degrade or cross-backend continuation (FR-6.1): the conversation
+    survived, and the record says why the native path was abandoned.
+    Zero event-taxonomy growth (the compaction/retry precedent)."""
+    return NormalizedMessage(
+        role="assistant",
+        kind="event",
+        content={"type": "resume_degraded", "policy": "replay", "reason": reason},
+    )

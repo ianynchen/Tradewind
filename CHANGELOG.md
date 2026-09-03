@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-03
+
+### Added
+
+- NATIVE→REPLAY degrade and cross-backend continuation (FR-6.1/FR-10.2,
+  closes ARCHITECTURE P-7): a lost native session (reaped claude jsonl,
+  expired codex thread, archived cursor agent) or a backend change no
+  longer fails the turn — tradewind renders the mirror's compacted view
+  into a deterministic, budget-capped transcript preamble and injects it
+  into a fresh native session (lossless rebuild on langchain), re-homing
+  the row and archiving the stale pair. Claude's `probe_native` is now a
+  real local-transcript existence check; codex/cursor degrade reactively
+  on conservatively classified resume errors; ambiguous errors fail
+  closed to `TurnFailed`. Every degrade is a mirrored `resume_degraded`
+  event item. `ResumePlanner.plan()` is finally consulted every turn.
+
 ## [0.10.0] - 2026-09-03
 
 ### Added

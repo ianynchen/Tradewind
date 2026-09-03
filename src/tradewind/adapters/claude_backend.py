@@ -102,6 +102,7 @@ from claude_agent_sdk import (
 from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import Backend, TurnContext
 from tradewind.application.tool_host import ToolHost
+from tradewind.domain.compaction import compose_replay_prompt
 from tradewind.domain.errors import Unsupported
 from tradewind.domain.events import (
     Event,
@@ -121,6 +122,7 @@ from tradewind.domain.models import (
     SessionRow,
     TurnResult,
     normalize_decision,
+    resume_degraded_notice,
     retry_notice,
 )
 
@@ -548,12 +550,24 @@ class ClaudeBackend(Backend):
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
-        # Cheap probe (controller ruling, task-10 orchestration): a truthy
-        # `native_session_id` only means a resume was *recorded*, not that
-        # `~/.claude/projects/.../<id>.jsonl` still resolves (deleted,
-        # moved cwd, ...) -- a full existence probe is Task 11's reconcile
-        # concern.
-        return session.native_session_id is not None
+        # REAL probe since Phase 4 (FR-6.1): claude's native store is a
+        # LOCAL jsonl, so existence is deterministically checkable via the
+        # same `get_session_messages` path reconcile reads -- no
+        # error-string matching. Empty and missing are indistinguishable
+        # here and both answer False: an id whose transcript holds nothing
+        # has nothing to natively resume, and the REPLAY it triggers
+        # rebuilds the same (empty) context from the mirror harmlessly.
+        native_session_id = session.native_session_id
+        if native_session_id is None:
+            return False
+
+        def _exists() -> bool:
+            try:
+                return bool(get_session_messages(native_session_id, session.cwd))
+            except Exception:
+                return False
+
+        return await anyio.to_thread.run_sync(_exists)
 
     async def read_native_transcript(
         self, session: SessionRow, after_native_id: str | None
@@ -631,12 +645,29 @@ class ClaudeBackend(Backend):
     async def _run_turn(self, ctx: TurnContext) -> AsyncIterator[Event]:
         yield TurnStarted(turn_id=ctx.turn_id)
         session_id = ctx.session.session_id
+        effective_prompt = ctx.prompt
+        if ctx.force_replay and ctx.load_replay_history is not None:
+            # FR-6.1 REPLAY: the runner suppressed a stale/lost native id;
+            # this fresh native session opens with the rendered mirror
+            # transcript ahead of the caller's prompt. The mirror records
+            # only the caller's prompt (runner-side separation).
+            replay_rows = await ctx.load_replay_history()
+            budget = ctx.compaction.keep_recent_tokens if ctx.compaction is not None else 20000
+            effective_prompt = compose_replay_prompt(replay_rows, budget, ctx.prompt)
+            yield ItemCompleted(
+                message=resume_degraded_notice(
+                    reason="native session unavailable or cross-backend continuation; "
+                    "rendered mirror transcript injected into a fresh native session"
+                )
+            )
         pending_events: list[Event] = []
         terminate_flag = [False]
         client = ClaudeSDKClient(self._build_options(ctx, pending_events, terminate_flag))
         self._clients[session_id] = client
         try:
-            async for event in self._drive_client(client, ctx, pending_events, terminate_flag):
+            async for event in self._drive_client(
+                client, ctx, effective_prompt, pending_events, terminate_flag
+            ):
                 yield event
         except Exception as exc:
             yield TurnFailed(turn_id=ctx.turn_id, error=str(exc))
@@ -663,6 +694,7 @@ class ClaudeBackend(Backend):
         self,
         client: ClaudeSDKClient,
         ctx: TurnContext,
+        prompt: str,
         pending_events: list[Event],
         terminate_flag: list[bool],
     ) -> AsyncIterator[Event]:
@@ -673,7 +705,7 @@ class ClaudeBackend(Backend):
         connect_retries = 0
         while True:
             try:
-                await client.connect(ctx.prompt)
+                await client.connect(prompt)
                 break
             except Exception as exc:
                 retry_settings = ctx.retry

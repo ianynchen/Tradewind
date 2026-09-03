@@ -184,6 +184,7 @@ from cursor_sdk.asyncio import AsyncAgent, AsyncClient, AsyncRun
 from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import Backend, TurnContext
 from tradewind.application.tool_host import ToolHost
+from tradewind.domain.compaction import compose_replay_prompt
 from tradewind.domain.errors import ConfigError, Unsupported
 from tradewind.domain.events import Event, ItemCompleted, TurnCompleted, TurnFailed, TurnStarted
 from tradewind.domain.models import (
@@ -194,6 +195,7 @@ from tradewind.domain.models import (
     Profile,
     SessionRow,
     calculate_cost,
+    resume_degraded_notice,
     retry_notice,
 )
 from tradewind.domain.models import (
@@ -208,6 +210,24 @@ _logger = logging.getLogger(__name__)
 # handled the same way `ClaudeBackend`/`CodexBackend` handle their own
 # aborted/interrupted terminal states (module docstring).
 _CANCELLED_STATUS = "cancelled"
+
+# Conservative native-loss classification for `Agent.resume` failures
+# (FR-6.1, fail-closed: anything unmatched stays TurnFailed).
+_NATIVE_LOST_MARKERS = (
+    "not found",
+    "no such agent",
+    "does not exist",
+    "archived",
+    "expired",
+    "deleted",
+)
+
+
+def _is_native_lost_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _NATIVE_LOST_MARKERS)
+
+
 _FINISHED_STATUS = "finished"
 
 
@@ -534,14 +554,46 @@ class CursorBackend(Backend):
         try:
             custom_tools = _build_custom_tools(ctx.tools)
             options = _agent_options(ctx.model_spec.model, ctx.session.cwd, custom_tools)
+            effective_prompt = ctx.prompt
+
+            async def _replay_prompt(reason: str) -> str:
+                rows = (
+                    await ctx.load_replay_history() if ctx.load_replay_history is not None else []
+                )
+                budget = ctx.compaction.keep_recent_tokens if ctx.compaction is not None else 20000
+                del reason
+                return compose_replay_prompt(rows, budget, ctx.prompt)
+
+            if ctx.force_replay:
+                # FR-6.1 planned REPLAY (cross-backend continuation).
+                effective_prompt = await _replay_prompt("cross-backend")
+                yield ItemCompleted(
+                    message=resume_degraded_notice(
+                        reason="cross-backend continuation onto cursor; rendered mirror "
+                        "transcript injected into a fresh agent (EXPERIMENTAL, P-5)"
+                    )
+                )
             native_session_id = ctx.session.native_session_id
             if native_session_id is not None:
-                agent = await AsyncAgent.resume(native_session_id, options, client=client)
+                try:
+                    agent = await AsyncAgent.resume(native_session_id, options, client=client)
+                except Exception as resume_exc:
+                    if not _is_native_lost_error(resume_exc):
+                        raise  # ambiguous: fail closed (FR-6.1 honesty rule)
+                    # Reactive degrade: archived/deleted agent.
+                    effective_prompt = await _replay_prompt(str(resume_exc))
+                    yield ItemCompleted(
+                        message=resume_degraded_notice(
+                            reason=f"cursor agent unavailable ({resume_exc}); rendered "
+                            "mirror transcript injected into a fresh agent"
+                        )
+                    )
+                    agent = await AsyncAgent.create(options, client=client)
             else:
                 agent = await AsyncAgent.create(options, client=client)
             self._native_ids[session_id] = agent.agent_id
 
-            run = await agent.send(ctx.prompt)
+            run = await agent.send(effective_prompt)
             self._runs[session_id] = run
             try:
                 async for event in self._consume(ctx.turn_id, run, ctx.model_spec):

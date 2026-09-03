@@ -244,3 +244,47 @@ def test_view_emits_latest_summary_and_retained_tail_only() -> None:
     # Retained: seq >= 3, compaction records themselves excluded.
     assert [m.seq for m in retained] == [3, 5]
     assert find_latest_compaction([older, record_a]) is record_a
+
+
+# --- REPLAY rendering (FR-6.1, Phase 4) ---
+
+
+def test_replay_context_is_budget_capped_newest_first_with_marker() -> None:
+    from tradewind.domain.compaction import REPLAY_PREAMBLE_HEADER, render_replay_context
+
+    messages = [
+        _msg(1, text="ancient " * 100),
+        _msg(2, text="middle " * 100),
+        _msg(3, text="newest fact: DRIFTBOLT"),
+    ]
+
+    rendered = render_replay_context(messages, budget_tokens=200)
+
+    assert rendered.startswith(REPLAY_PREAMBLE_HEADER)
+    assert "DRIFTBOLT" in rendered  # newest always kept
+    assert "[earlier history truncated]" in rendered
+    assert "ancient" not in rendered  # oldest fell out of the budget
+
+
+def test_replay_context_composes_with_a_compaction_checkpoint() -> None:
+    from tradewind.domain.compaction import render_replay_context
+
+    record = _msg(
+        4, "compaction", content={"summary": "## Goal\nold checkpoint", "first_kept_seq": 3}
+    )
+    messages = [_msg(1, text="summarized away"), _msg(3, text="kept tail"), record]
+
+    rendered = render_replay_context(messages, budget_tokens=10_000)
+
+    assert "old checkpoint" in rendered  # the checkpoint rides along
+    assert "kept tail" in rendered
+    assert "summarized away" not in rendered  # pre-checkpoint rows omitted
+
+
+def test_compose_replay_prompt_appends_the_callers_prompt_last() -> None:
+    from tradewind.domain.compaction import compose_replay_prompt
+
+    composed = compose_replay_prompt([_msg(1, text="prior")], 10_000, "the actual ask")
+
+    assert composed.endswith("the actual ask")
+    assert "prior" in composed

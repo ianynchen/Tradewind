@@ -231,3 +231,45 @@ def summarizer_spend(messages: list[StoredMessage]) -> tuple[dict[str, int], flo
         if isinstance(recorded, int | float):
             cost = (cost or 0.0) + float(recorded)
     return totals, cost
+
+
+REPLAY_PREAMBLE_HEADER = (
+    "[Resumed session: the prior conversation below was restored from "
+    "tradewind's mirror after the native session became unavailable. "
+    "Continue as the same assistant.]"
+)
+
+
+def render_replay_context(messages: list[StoredMessage], budget_tokens: int) -> str:
+    """The REPLAY preamble (FR-6.1 / ARCH §5.2 point 2, the RENDERED
+    branch): the mirror's compacted view serialized to plain text,
+    newest-first budget-capped. Deterministic -- no model call, no
+    billing; a session that was mirror-compacted contributes its
+    checkpoint automatically via `compacted_view`."""
+    summary, retained = compacted_view(messages)
+    kept: list[StoredMessage] = []
+    total = 0
+    truncated = False
+    for message in reversed(retained):
+        tokens = estimate_message_tokens(message)
+        if kept and total + tokens > budget_tokens:
+            truncated = True
+            break
+        kept.append(message)
+        total += tokens
+    kept.reverse()
+    parts: list[str] = []
+    if summary is not None:
+        parts.append(f"Checkpoint summary of earlier history:\n{summary}")
+    if truncated:
+        parts.append("[earlier history truncated]")
+    parts.append(serialize_for_summary(kept))
+    body = "\n\n".join(part for part in parts if part)
+    return f"{REPLAY_PREAMBLE_HEADER}\n<transcript>\n{body}\n</transcript>"
+
+
+def compose_replay_prompt(messages: list[StoredMessage], budget_tokens: int, prompt: str) -> str:
+    """The full first prompt of a REPLAY turn: rendered mirror context,
+    then the caller's actual prompt. The mirror records only `prompt`
+    (the runner's backend_prompt/prompt separation, R-1 precedent)."""
+    return f"{render_replay_context(messages, budget_tokens)}\n\n{prompt}"

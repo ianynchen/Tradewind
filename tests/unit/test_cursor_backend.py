@@ -300,3 +300,15 @@ async def test_launch_failure_retries_then_fails_loudly(
     failed = [e for e in events if isinstance(e, TurnFailed)]
     assert len(failed) == 1
     assert "bridge spawn failed" in failed[0].error
+
+
+# --- REPLAY (FR-6.1, Phase 4): classification only -- the full path rides
+# EXPERIMENTAL until P-5 live verification ---
+
+
+def test_native_lost_classification_is_conservative() -> None:
+    from tradewind.adapters.cursor_backend import _is_native_lost_error
+
+    assert _is_native_lost_error(Exception("Agent not found")) is True
+    assert _is_native_lost_error(Exception("agent was archived")) is True
+    assert _is_native_lost_error(Exception("connection reset")) is False

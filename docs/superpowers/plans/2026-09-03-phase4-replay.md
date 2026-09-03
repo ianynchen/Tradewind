@@ -1,6 +1,6 @@
 # Phase 4: REPLAY — NATIVE→REPLAY degrade and cross-backend continuation
 
-Date: 2026-09-03 · Status: PROPOSED (awaiting approval) · Parent:
+Date: 2026-09-03 · Status: APPROVED (user, 2026-09-03) · Parent:
 `2026-09-03-improvement-roadmap.md` (item G). Closes ARCHITECTURE **P-7**
 and delivers FR-6.1's unkept promise: "NATIVE is attempted first; failure
 degrades to REPLAY, never to an error that loses the conversation."

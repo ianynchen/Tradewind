@@ -2,15 +2,13 @@
 context when it resumes (FR-10.2), independent of whatever backend/profile
 the session currently resolves to (task-9 brief).
 
-Stage-1 scope: `langchain` is the only registered backend and it has
-`capabilities().supports_native_resume=False` — every turn already rebuilds
-its messages from the mirror unconditionally (`ctx.load_history()`,
-component spec "History" decision), so `plan()` always answers `"replay"`
-and `TurnRunner` does not consult it yet (there is nothing for it to
-branch on). `"native"` (prefer a live native transcript over the mirror)
-and `"fresh"` (neither is usable) become reachable once a backend with
-`supports_native_resume=True` lands (claude, later tasks) and this
-planner starts inspecting `session.backend`/`session.native_session_id`.
+Wired since Phase 4 (P-7 closed): `TurnRunner.execute` consults
+`plan()` every turn — `"native"` resumes by id, `"replay"` suppresses a
+stale/lost native id so the adapter rebuilds (langchain) or injects a
+rendered mirror transcript into a fresh native session (SDK backends),
+and `"fresh"` starts clean. Reactive degrades (a resume error the adapter
+classifies as native-store loss) reach the same REPLAY machinery
+in-adapter without re-consulting the planner.
 
 `reconcile()` (task-11 brief, ARCHITECTURE §5.2) is the other half: before a
 native-path turn, backfill the mirror with any native transcript activity
@@ -35,16 +33,29 @@ ResumePlan = Literal["native", "replay", "fresh"]
 class ResumePlanner:
     """Decides how a turn should reconstruct `session`'s prior context."""
 
-    def plan(self, session: SessionRow) -> ResumePlan:
-        """Always `"replay"` for now (see module docstring).
+    def plan(self, session: SessionRow, *, backend_name: str, probe_ok: bool | None) -> ResumePlan:
+        """Route the turn's context source (FR-6.1, wired since Phase 4 --
+        P-7's "no callers" note is closed):
 
-        `session` is accepted (not discarded via a `noqa`) because a later
-        backend's plan legitimately depends on it (`native_session_id`
-        presence, backend match) once a `supports_native_resume=True`
-        adapter exists to make `"native"`/`"fresh"` reachable.
+        - `"native"`: same backend, native id present, and the probe did
+          not say the native store is gone (`probe_ok` True, or None when
+          no probe ran).
+        - `"replay"`: a native id exists but is unusable -- the session
+          was recorded under a DIFFERENT backend (cross-backend
+          continuation, FR-10.2) or the probe found the native store
+          lost. The runner suppresses the stale id and the adapter
+          rebuilds/injects from the mirror; reactive in-adapter degrades
+          (a resume error classified as loss) reach the same path without
+          re-consulting this planner.
+        - `"fresh"`: no native id recorded -- the first native turn, or a
+          mirror-only backend's normal state.
+
         """
-        del session
-        return "replay"
+        if session.native_session_id is None:
+            return "fresh"
+        if session.backend != backend_name or probe_ok is False:
+            return "replay"
+        return "native"
 
     async def reconcile(
         self, session: SessionRow, backend: Backend, store: SessionStorePort

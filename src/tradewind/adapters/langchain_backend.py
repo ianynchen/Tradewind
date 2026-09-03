@@ -95,6 +95,7 @@ from tradewind.domain.models import (
     TurnResult,
     calculate_cost,
     normalize_decision,
+    resume_degraded_notice,
     retry_notice,
 )
 
@@ -498,6 +499,14 @@ class LangchainBackend(Backend):
 
     async def _run_turn(self, ctx: TurnContext) -> AsyncIterator[Event]:
         yield TurnStarted(turn_id=ctx.turn_id)
+        if ctx.force_replay:
+            # FR-6.1: cross-backend continuation landed here -- the mirror
+            # rebuild below IS the (lossless) replay; the event records it.
+            yield ItemCompleted(
+                message=resume_degraded_notice(
+                    reason="cross-backend continuation: lossless mirror rebuild on langchain"
+                )
+            )
         try:
             chat_model = self._chat_model_factory(ctx.model_spec)
             schemas = ctx.tools.schemas()
