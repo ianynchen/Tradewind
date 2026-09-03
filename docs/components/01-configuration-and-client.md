@@ -148,7 +148,9 @@ adapter receives and what `options_json` snapshots.
   no SDK construction, no network. Adapters are built lazily per profile on first
   use and cached on the instance.
 - `resume()` on a session whose profile/backend differs from its recorded one does
-  not error: the Resume Planner routes to REPLAY (FR-10.2).
+  not error: the Resume Planner routes to REPLAY (FR-10.2) — wired since Phase 4:
+  lossless rebuild onto `langchain`, rendered-transcript injection into a fresh
+  native session on SDK backends, with the stale pair archived by `rehome_native`.
 - Every public method validates the session id is a UUID at the boundary (I-1a).
 - One in-flight turn per session (I-5): a concurrent `run()`/`stream()` raises
   `TurnInProgress`.

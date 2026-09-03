@@ -404,6 +404,23 @@ emulates silently — an unsupported call raises `Unsupported`.
 session on `claude`/`codex`/`cursor` currently surfaces as `TurnFailed` rather than degrading
 to a mirror-replay turn.
 
+## Resume & recovery
+
+Resume is three-valued (`NATIVE → REPLAY → FRESH`) and never loses the conversation:
+
+- **NATIVE**: same backend, native id valid — the engine resumes its own session (claude's
+  probe is a real local-transcript existence check, not a guess).
+- **REPLAY**: the native store is gone (reaped file, expired thread, archived agent) or the
+  session is continuing on a **different backend** (profile changed) — tradewind renders the
+  mirror's compacted view into a deterministic transcript preamble and injects it into a
+  fresh native session (on `langchain`, the rebuild is simply lossless). The stale native id
+  is archived in `native_history`; the degrade is visible as a `resume_degraded` event item.
+  No model call, no extra billing.
+- **FRESH**: nothing recorded yet.
+
+Ambiguous resume errors stay `TurnFailed` — tradewind never silently abandons native context
+on a guess.
+
 ## Resilience
 
 - **Retry** (config: `TurnDefaults.retry`, default 3 attempts, 2s doubling backoff): transient

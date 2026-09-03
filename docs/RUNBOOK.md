@@ -220,6 +220,14 @@ library) — they are read only by the test files that need real credentials to 
   on 3.12 unchanged. Keep the floor as low as the code actually needs, and when changing it,
   update `pyproject.toml` (`requires-python`, mypy `python_version`, ruff `target-version`),
   `uv.lock`, README, and ARCHITECTURE §6 together.
+- **P-7 CLOSED (Phase 4)** — and one design lesson from it: the REPLAY preamble is a
+  DETERMINISTIC rendering (serialize the compacted view, budget-capped) rather than a
+  model-generated summary — zero billing, unit-testable, no summarizer-model
+  dependency on SDK-only profiles, and it composes with existing compaction
+  checkpoints for free. Codex's reactive degrade uses a worker→loop request/reply
+  queue pair so the replay prompt is built LAZILY on the event loop (zero mirror
+  reads on healthy turns) without relaunching the worker thread and disturbing its
+  cleanup finally.
 - **Automated string-replaces anchored on comments are fragile across formatter
   runs** (Phase 3): the langchain terminate-break block silently failed to insert
   because its anchor comment had been re-wrapped since Phase 1 — the script printed

@@ -197,6 +197,7 @@ from openai_codex.models import JsonObject, Notification
 
 from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import Backend, TurnContext
+from tradewind.domain.compaction import compose_replay_prompt
 from tradewind.domain.errors import ConfigError, Unsupported
 from tradewind.domain.events import (
     Event,
@@ -220,6 +221,7 @@ from tradewind.domain.models import (
     Verdict,
     calculate_cost,
     normalize_decision,
+    resume_degraded_notice,
     retry_notice,
 )
 
@@ -776,6 +778,35 @@ def _approval_policy_value_from_options(backend_options: dict[str, Any]) -> AskF
     return AskForApprovalValue(value)
 
 
+# Conservative native-loss classification for `thread_resume` failures
+# (FR-6.1, fail-closed: anything unmatched stays TurnFailed).
+_NATIVE_LOST_MARKERS = (
+    "not found",
+    "no such thread",
+    "does not exist",
+    "expired",
+    "unknown thread",
+)
+
+
+def _is_native_lost_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return any(marker in text for marker in _NATIVE_LOST_MARKERS)
+
+
+@dataclass
+class _ReplayPromptRequest:
+    """Queue payload from the worker: `thread_resume` failed with a
+    classified native-loss error (FR-6.1). `_consume` (on the event loop)
+    lazily builds the rendered replay prompt, emits the `resume_degraded`
+    item, and answers on `reply`; the worker then starts a FRESH thread
+    with it -- one worker, no relaunch, zero mirror reads on healthy
+    turns."""
+
+    reason: str
+    reply: queue.Queue[str]
+
+
 @dataclass
 class _TerminateRequested:
     """Queue payload: a broker `Denial(terminate=True)` was delivered on
@@ -848,20 +879,39 @@ def _drive_turn(
                 time.sleep(delay)
                 client = make_client()
         approval_policy = AskForApproval(root=approval_policy_value)
+        replay_prompt: str | None = None
         if session.native_session_id is not None:
-            resumed = client.thread_resume(
-                session.native_session_id,
-                ThreadResumeParams(
-                    thread_id=session.native_session_id,
-                    cwd=session.cwd,
-                    model=model,
-                    sandbox=sandbox,
-                    approval_policy=approval_policy,
-                    approvals_reviewer=ApprovalsReviewer.user,
-                    base_instructions=system_prompt,
-                ),
-            )
-            thread_id = resumed.thread.id
+            try:
+                resumed = client.thread_resume(
+                    session.native_session_id,
+                    ThreadResumeParams(
+                        thread_id=session.native_session_id,
+                        cwd=session.cwd,
+                        model=model,
+                        sandbox=sandbox,
+                        approval_policy=approval_policy,
+                        approvals_reviewer=ApprovalsReviewer.user,
+                        base_instructions=system_prompt,
+                    ),
+                )
+                thread_id = resumed.thread.id
+            except Exception as exc:
+                if not _is_native_lost_error(exc):
+                    raise  # ambiguous: fail closed (FR-6.1 honesty rule)
+                reply: queue.Queue[str] = queue.Queue()
+                out_queue.put(_ReplayPromptRequest(reason=str(exc), reply=reply))
+                replay_prompt = reply.get(timeout=60)
+                started = client.thread_start(
+                    ThreadStartParams(
+                        cwd=session.cwd,
+                        model=model,
+                        sandbox=sandbox,
+                        approval_policy=approval_policy,
+                        approvals_reviewer=ApprovalsReviewer.user,
+                        base_instructions=system_prompt,
+                    )
+                )
+                thread_id = started.thread.id
         else:
             started = client.thread_start(
                 ThreadStartParams(
@@ -876,6 +926,7 @@ def _drive_turn(
             thread_id = started.thread.id
         record_native_id(thread_id)
 
+        effective_prompt = replay_prompt if replay_prompt is not None else prompt
         turn_started = client.turn_start(
             thread_id,
             # `prompt` (the positional `input_items` arg) is what actually
@@ -886,14 +937,14 @@ def _drive_turn(
             # `prompt` (a bare `str`, which `_normalize_input_items` wraps
             # as `[{"type": "text", "text": prompt}]`) overwrites whatever
             # `TurnStartParams.input` below produces, every time.
-            prompt,
+            effective_prompt,
             params=TurnStartParams(
                 thread_id=thread_id,
                 # Required by `TurnStartParams` (no default) but never
                 # actually sent -- see the comment above. Built from the
                 # same `prompt` purely to satisfy pydantic validation, not
                 # because its value matters.
-                input=[UserInput(TextUserInput(type="text", text=prompt))],
+                input=[UserInput(TextUserInput(type="text", text=effective_prompt))],
                 model=model,
                 effort=effort,
                 output_schema=output_schema,
@@ -1077,12 +1128,26 @@ class CodexBackend(Backend):
             def record_native_id(native_thread_id: str) -> None:
                 self._native_ids[session_id] = native_thread_id
 
+            worker_prompt = ctx.prompt
+            if ctx.force_replay and ctx.load_replay_history is not None:
+                # FR-6.1 planned REPLAY (cross-backend continuation): the
+                # runner suppressed the stale id; open a fresh thread with
+                # the rendered mirror preamble.
+                replay_rows = await ctx.load_replay_history()
+                budget = ctx.compaction.keep_recent_tokens if ctx.compaction is not None else 20000
+                worker_prompt = compose_replay_prompt(replay_rows, budget, ctx.prompt)
+                yield ItemCompleted(
+                    message=resume_degraded_notice(
+                        reason="cross-backend continuation onto codex; rendered mirror "
+                        "transcript injected into a fresh thread"
+                    )
+                )
             worker = threading.Thread(
                 target=_drive_turn,
                 args=(
                     make_client,
                     ctx.session,
-                    ctx.prompt,
+                    worker_prompt,
                     ctx.model_spec.model,
                     effort,
                     ctx.output_schema,
@@ -1105,8 +1170,23 @@ class CodexBackend(Backend):
                     if handle_ref:
                         await anyio.to_thread.run_sync(handle_ref[0].interrupt)
 
+                async def _build_replay_prompt() -> str:
+                    rows = (
+                        await ctx.load_replay_history()
+                        if ctx.load_replay_history is not None
+                        else []
+                    )
+                    budget = (
+                        ctx.compaction.keep_recent_tokens if ctx.compaction is not None else 20000
+                    )
+                    return compose_replay_prompt(rows, budget, ctx.prompt)
+
                 async for event in self._consume(
-                    ctx.turn_id, out_queue, ctx.model_spec, _request_interrupt
+                    ctx.turn_id,
+                    out_queue,
+                    ctx.model_spec,
+                    _request_interrupt,
+                    _build_replay_prompt,
                 ):
                     if isinstance(event, (TurnCompleted, TurnFailed)):
                         terminal_event_observed = True
@@ -1157,6 +1237,7 @@ class CodexBackend(Backend):
         out_queue: queue.Queue[object],
         model_spec: ModelSpec,
         request_interrupt: Callable[[], Awaitable[None]] | None = None,
+        build_replay_prompt: Callable[[], Awaitable[str]] | None = None,
     ) -> AsyncIterator[Event]:
         agent_messages: list[AgentMessageThreadItem] = []
         usage: ThreadTokenUsage | None = None
@@ -1167,6 +1248,20 @@ class CodexBackend(Backend):
                 return
             if isinstance(item, PermissionRequested):
                 yield item
+                continue
+            if isinstance(item, _ReplayPromptRequest):
+                # FR-6.1 reactive degrade: the worker classified the
+                # resume failure as native loss and is blocked on `reply`.
+                if build_replay_prompt is None:
+                    item.reply.put("")  # unreachable in practice; unblock the worker
+                    continue
+                yield ItemCompleted(
+                    message=resume_degraded_notice(
+                        reason=f"codex thread unavailable ({item.reason}); rendered mirror "
+                        "transcript injected into a fresh thread"
+                    )
+                )
+                item.reply.put(await build_replay_prompt())
                 continue
             if isinstance(item, _TerminateRequested):
                 # FR-4.4 approximate terminate: reject was already sent;

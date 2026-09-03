@@ -1990,3 +1990,86 @@ async def test_stale_pre_compaction_usage_never_retriggers(tmp_path: Path) -> No
 
     records = [m for m in await tw.history(_VALID_ID) if m.kind == "compaction"]
     assert len(records) == 1
+
+
+# --- REPLAY (FR-6.1, Phase 4): planned routing + rehome ---
+
+
+async def test_cross_backend_continuation_replays_on_langchain_and_rehomes(
+    tmp_path: Path,
+) -> None:
+    model = _RecordingChatModel(
+        responses=[AIMessage(content="first"), AIMessage(content="after replay")]
+    )
+    tw = _langchain_tw(tmp_path, _profile(), model)
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("hello there")
+    # Simulate the session having previously lived on claude: rehome the
+    # row onto a (claude, native-id) pair, as FR-10.2's scenario produces.
+    await anyio.to_thread.run_sync(tw._store.rehome_native, _VALID_ID, "claude", "stale-native-1")
+
+    result = await session.run("continue please")
+
+    assert result.status == "completed"
+    # The degrade is visible in the mirror...
+    degraded = [
+        m
+        for m in await tw.history(_VALID_ID)
+        if m.kind == "event" and m.content.get("type") == "resume_degraded"
+    ]
+    assert len(degraded) == 1
+    # ...the langchain rebuild carried the prior exchange (lossless replay)...
+    final_request = [str(message.content) for message in model.calls[-1]]
+    assert any("hello there" in text for text in final_request)
+    # ...and the row is re-homed onto langchain with the stale pair archived.
+    row = await anyio.to_thread.run_sync(tw._store.get_session, _VALID_ID)
+    assert row is not None
+    assert row.backend == "langchain"
+    assert row.native_session_id is None
+    assert any(entry.get("native_session_id") == "stale-native-1" for entry in row.native_history)
+
+
+class _ProbeableBackend(_CtxRecordingBackend):
+    """Native-resume fake whose probe answer is scripted."""
+
+    probe_answer = False
+
+    def capabilities(self) -> Capabilities:
+        return super().capabilities().model_copy(update={"supports_native_resume": True})
+
+    async def probe_native(self, session: SessionRow) -> bool:  # noqa: ARG002
+        return self.probe_answer
+
+
+async def test_probe_loss_degrades_to_replay_and_rehomes(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _ProbeableBackend(profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), _completed()])
+    fake.probe_answer = False
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await anyio.to_thread.run_sync(tw._store.rehome_native, _VALID_ID, "langchain", "reaped-native")
+
+    await session.run("hi")
+
+    ctx = fake.contexts[-1]
+    assert ctx.force_replay is True
+    assert ctx.session.native_session_id is None  # suppressed for this turn
+    row = await anyio.to_thread.run_sync(tw._store.get_session, _VALID_ID)
+    assert row is not None and row.native_session_id is None  # rehomed off the dead id
+
+
+async def test_healthy_probe_keeps_the_native_path(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _ProbeableBackend(profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), _completed()])
+    fake.probe_answer = True
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await anyio.to_thread.run_sync(tw._store.rehome_native, _VALID_ID, "langchain", "alive-native")
+
+    await session.run("hi")
+
+    ctx = fake.contexts[-1]
+    assert ctx.force_replay is False
+    assert ctx.session.native_session_id == "alive-native"

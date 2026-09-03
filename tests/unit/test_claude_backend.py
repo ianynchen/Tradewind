@@ -396,7 +396,7 @@ async def test_broker_terminated_abort_completes_honestly(
     events = [
         event
         async for event in backend._drive_client(
-            cast(Any, _FakeClient()), _make_ctx(output_schema=None), [], [True]
+            cast(Any, _FakeClient()), _make_ctx(output_schema=None), "hello", [], [True]
         )
     ]
 
@@ -411,3 +411,84 @@ def test_capabilities_declare_native_deny_reason() -> None:
     assert (
         ClaudeBackend(_profile(), NativeStoreConfig()).capabilities().supports_deny_reason is True
     )
+
+
+# --- REPLAY (FR-6.1, Phase 4): real probe + preamble injection ---
+
+
+async def test_probe_native_checks_the_local_transcript_for_real(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+    row = SessionRow(
+        session_id="s1",
+        backend="claude",
+        profile="default",
+        options_snapshot={},
+        native_session_id="native-1",
+    )
+
+    monkeypatch.setattr(claude_backend_module, "get_session_messages", lambda *_: [object()])
+    assert await backend.probe_native(row) is True
+
+    monkeypatch.setattr(claude_backend_module, "get_session_messages", lambda *_: [])
+    assert await backend.probe_native(row) is False  # empty == nothing to resume
+
+    def _raises(*_: object) -> list[object]:
+        raise FileNotFoundError("reaped")
+
+    monkeypatch.setattr(claude_backend_module, "get_session_messages", _raises)
+    assert await backend.probe_native(row) is False
+
+    row_no_id = SessionRow(
+        session_id="s1", backend="claude", profile="default", options_snapshot={}
+    )
+    assert await backend.probe_native(row_no_id) is False
+
+
+async def test_forced_replay_injects_rendered_mirror_into_a_fresh_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from tradewind.domain.models import StoredMessage
+
+    connected_prompts: list[str] = []
+    captured = _install_fake_sdk_client(monkeypatch, [_success_result()])
+
+    real_client_cls = claude_backend_module.ClaudeSDKClient
+
+    class _PromptCapturing(real_client_cls):  # type: ignore[misc,valid-type]
+        async def connect(self, prompt: str) -> None:
+            connected_prompts.append(prompt)
+
+    monkeypatch.setattr(claude_backend_module, "ClaudeSDKClient", _PromptCapturing)
+
+    async def load_replay() -> list[StoredMessage]:
+        return [
+            StoredMessage(
+                role="user",
+                kind="text",
+                content={"text": "the codeword is MOSSPETAL"},
+                seq=1,
+                session_id="s1",
+                created_at="t",
+            )
+        ]
+
+    ctx = _make_ctx(output_schema=None)
+    ctx.force_replay = True
+    ctx.load_replay_history = load_replay
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(ctx)]
+
+    assert any(isinstance(e, TurnCompleted) for e in events)
+    degraded = [
+        e
+        for e in events
+        if isinstance(e, ItemCompleted) and e.message.content.get("type") == "resume_degraded"
+    ]
+    assert len(degraded) == 1
+    assert len(connected_prompts) == 1
+    assert "MOSSPETAL" in connected_prompts[0]  # rendered mirror preamble
+    assert connected_prompts[0].endswith("hello")  # caller's prompt last
+    assert cast(Any, captured[0]).resume is None  # fresh native session

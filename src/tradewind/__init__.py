@@ -31,7 +31,7 @@ from tradewind.application.config import (
 from tradewind.application.ports import Backend, SessionStorePort
 from tradewind.domain.models import Profile
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 
 def _build_default_store(path: Path) -> SessionStorePort:

@@ -25,6 +25,7 @@ import logging
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
+from dataclasses import replace
 from pathlib import Path
 from typing import ClassVar, Protocol, cast
 
@@ -481,6 +482,27 @@ class TurnRunner:
         # the next `sweep_stale_turns` (session open).
         try:
             backend = self._resolve_backend(session_row.profile, profile)
+            # FR-6.1 resume routing (Phase 4, closes P-7): probe only where
+            # it is real and cheap (claude's local-jsonl existence check;
+            # other backends return truthy-id probes), then let the planner
+            # route. "replay" with a recorded native id means that id is
+            # UNUSABLE (cross-backend continuation, or the probe found the
+            # native store gone): suppress it on the row this turn sees, so
+            # reconcile skips and the adapter starts fresh -- injecting the
+            # rendered mirror preamble on native backends.
+            probe_ok: bool | None = None
+            if (
+                session_row.native_session_id is not None
+                and session_row.backend == backend.name
+                and backend.capabilities().supports_native_resume
+            ):
+                probe_ok = await backend.probe_native(session_row)
+            resume_plan = self._resume_planner.plan(
+                session_row, backend_name=backend.name, probe_ok=probe_ok
+            )
+            forced_replay = resume_plan == "replay" and session_row.native_session_id is not None
+            if forced_replay:
+                session_row = replace(session_row, native_session_id=None)
             # FR-9.3 scope resolution. A native-resume backend's engine
             # replays its own history -- tradewind feeds it no mirror
             # context -- so the honest default there is "none", while a
@@ -617,6 +639,14 @@ class TurnRunner:
                     )
                     return _fold_child_history(session_id, tree_rows, prompt_seq)
 
+                async def load_replay_history() -> list[StoredMessage]:
+                    rows = await anyio.to_thread.run_sync(
+                        lambda: self._store.history(
+                            session_id, include_children=False, include_raw=False
+                        )
+                    )
+                    return [m for m in rows if m.seq < prompt_seq]
+
                 ctx = TurnContext(
                     session=session_row,
                     turn_id=turn_id,
@@ -627,6 +657,8 @@ class TurnRunner:
                     tools=tool_host,
                     broker=broker,
                     load_history=load_history,
+                    load_replay_history=load_replay_history,
+                    force_replay=forced_replay,
                     compaction=self._config.defaults.compaction,
                     retry=self._config.defaults.retry,
                     last_turn_usage=last_turn_usage,
@@ -746,6 +778,16 @@ class TurnRunner:
                         session_id,
                         backend.name,
                         new_native_session_id,
+                    )
+                elif forced_replay and new_native_session_id is None:
+                    # FR-6.1: the REPLAY landed on a backend that reported
+                    # no new native id (langchain, or a degraded turn that
+                    # never opened one) -- re-home the row onto the current
+                    # backend with no native id so the next turn doesn't
+                    # re-attempt the dead one; the superseded pair is
+                    # archived in native_history by rehome itself.
+                    await anyio.to_thread.run_sync(
+                        self._store.rehome_native, session_id, backend.name, None
                     )
         except BaseException as exc:
             # `GeneratorExit` (the caller abandoning `session.stream()` --

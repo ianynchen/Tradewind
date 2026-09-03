@@ -329,6 +329,17 @@ class TurnContext:
     # gate), so native-resume turns still cost zero store reads.
     last_turn_usage: dict[str, int] | None = None
     last_turn_id: str | None = None
+    # REPLAY (FR-6.1, Phase 4): a lazy ALWAYS-FLAT history closure for
+    # building the rendered replay preamble -- independent of
+    # `history_scope` (a scope-"none" SDK turn still needs mirror rows
+    # when degrading), and never awaited on a healthy turn (zero reads).
+    load_replay_history: Callable[[], Awaitable[list[StoredMessage]]] | None = None
+    # True when the runner routed REPLAY up front: the session's recorded
+    # native id was suppressed (cross-backend continuation, or the probe
+    # found the native store gone) -- the adapter starts fresh, injecting
+    # the rendered preamble on native backends, and emits the
+    # `resume_degraded` event item.
+    force_replay: bool = False
     # Per-call cap on tool-execution rounds (FR-6.5): None means uncapped
     # (today's behavior). A backend whose
     # `capabilities().supports_tool_round_cap` is False raises `Unsupported`

@@ -640,3 +640,46 @@ async def test_terminate_request_interrupts_and_reclassifies() -> None:
     assert len(completed) == 1
     assert completed[0].result.status == "completed"
     assert completed[0].result.end_reason == "broker_terminated"
+
+
+# --- REPLAY (FR-6.1, Phase 4): reactive degrade over the worker queue ---
+
+
+def test_native_lost_classification_is_conservative() -> None:
+    assert codex_backend._is_native_lost_error(Exception("Thread not found: t-1")) is True
+    assert codex_backend._is_native_lost_error(Exception("thread t-1 does not exist")) is True
+    assert codex_backend._is_native_lost_error(Exception("rate limited")) is False
+    assert codex_backend._is_native_lost_error(Exception("internal server error")) is False
+
+
+async def test_replay_prompt_request_is_answered_and_visible() -> None:
+    backend = CodexBackend(_profile(), NativeStoreConfig())
+    reply: queue.Queue[str] = queue.Queue()
+    out_queue: queue.Queue[object] = queue.Queue()
+    out_queue.put(codex_backend._ReplayPromptRequest(reason="thread not found", reply=reply))
+    out_queue.put(codex_backend._DONE)
+
+    async def build_replay_prompt() -> str:
+        return "RENDERED-PREAMBLE\n\nthe ask"
+
+    events = [
+        event
+        async for event in backend._consume(
+            "turn-1",
+            out_queue,
+            ModelSpec(model="gpt-5.4-mini"),
+            None,
+            build_replay_prompt,
+        )
+    ]
+
+    assert reply.get_nowait() == "RENDERED-PREAMBLE\n\nthe ask"  # worker unblocked
+    from tradewind.domain.events import ItemCompleted
+
+    degraded = [
+        e
+        for e in events
+        if isinstance(e, ItemCompleted) and e.message.content.get("type") == "resume_degraded"
+    ]
+    assert len(degraded) == 1
+    assert "thread not found" in str(degraded[0].message.content["reason"])
