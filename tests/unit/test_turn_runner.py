@@ -1306,3 +1306,168 @@ async def test_backend_factories_leaves_unnamed_backends_on_the_registry(
 
     assert result.final_text == "registry pong"
     assert registry_used == ["langchain"]
+
+
+# --- history_scope (FR-9.3): lazy loading, per-backend defaults, tree
+# folding, and the loud Unsupported on impossible explicit scopes ---
+
+
+class _NativeResumeBackend(_CtxRecordingBackend):
+    """A ctx-recording fake that declares native resume -- the runner must
+    treat it like the SDK backends: default scope "none", zero history
+    reads, explicit "flat"/"tree" refused."""
+
+    def capabilities(self) -> Capabilities:
+        base = super().capabilities()
+        return base.model_copy(update={"supports_native_resume": True})
+
+
+async def test_native_resume_backend_turn_issues_no_history_query(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _NativeResumeBackend(
+        profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), _completed()]
+    )
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("hi one")  # seed one turn so a second HAS history to skip
+
+    def must_not_read(*_args: object, **_kwargs: object) -> list[object]:
+        raise AssertionError("store.history() must not be called for a native-resume turn")
+
+    tw._store.history = must_not_read  # type: ignore[method-assign]
+
+    result = await session.run("hi two")
+
+    assert result.status == "completed"
+
+
+async def test_flat_scope_loads_lazily_and_excludes_this_turns_prompt(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+
+    loaded: list[list[StoredMessage]] = []
+
+    class _AwaitingBackend(_CtxRecordingBackend):
+        async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+            loaded.append(await ctx.load_history())
+            for event in self._events:
+                yield event
+
+    fake = _AwaitingBackend(profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), _completed()])
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    await session.run("first prompt")
+    await session.run("second prompt")
+
+    # Turn 1 sees nothing; turn 2 sees turn 1's exchange but NOT its own
+    # prompt (the backend appends ctx.prompt itself).
+    assert [m.content.get("text") for m in loaded[0]] == []
+    texts = [m.content.get("text") for m in loaded[1]]
+    assert "first prompt" in texts
+    assert "second prompt" not in texts
+
+
+async def test_tree_scope_folds_child_transcript_after_the_spawning_turn(tmp_path: Path) -> None:
+    profile = _profile()
+    model = _RecordingChatModel(
+        responses=[
+            AIMessage(content="parent turn one"),
+            AIMessage(content="child answer"),
+            AIMessage(content="parent turn two"),
+        ]
+    )
+
+    def factory(p: Profile, native_config: NativeStoreConfig) -> Backend:
+        return LangchainBackend(p, native_config, chat_model_factory=lambda _spec: model)
+
+    tw = Tradewind(_config(tmp_path, profile), backend_factories={"langchain": factory})
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("do step one")
+    await session.spawn("investigate the detail")
+
+    await session.run("wrap up", history_scope="tree")
+
+    final_request = [str(message.content) for message in model.calls[2]]
+    folded = [text for text in final_request if text.startswith("[subagent ")]
+    assert len(folded) == 1
+    # The child's own prompt and reply are inside the wrapped block --
+    # verbatim, not as the parent's own conversation turns.
+    assert "investigate the detail" in folded[0]
+    assert "child answer" in folded[0]
+    # Positioned after the spawning turn's exchange, before this prompt.
+    fold_at = final_request.index(folded[0])
+    assert fold_at > final_request.index("parent turn one")
+    assert final_request[-1] == "wrap up"
+
+
+async def test_flat_scope_does_not_include_child_transcripts(tmp_path: Path) -> None:
+    profile = _profile()
+    model = _RecordingChatModel(
+        responses=[
+            AIMessage(content="parent turn one"),
+            AIMessage(content="child answer"),
+            AIMessage(content="parent turn two"),
+        ]
+    )
+
+    def factory(p: Profile, native_config: NativeStoreConfig) -> Backend:
+        return LangchainBackend(p, native_config, chat_model_factory=lambda _spec: model)
+
+    tw = Tradewind(_config(tmp_path, profile), backend_factories={"langchain": factory})
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("do step one")
+    await session.spawn("investigate the detail")
+
+    await session.run("wrap up")  # default flat
+
+    final_request = [str(message.content) for message in model.calls[2]]
+    assert not any(text.startswith("[subagent ") for text in final_request)
+
+
+async def test_explicit_tree_scope_on_native_resume_backend_raises_unsupported(
+    tmp_path: Path,
+) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _NativeResumeBackend(
+        profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), _completed()]
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    with pytest.raises(Unsupported, match="history_scope"):
+        await session.run("hi", history_scope="tree")
+
+
+async def test_explicit_none_scope_is_accepted_on_native_resume_backend(tmp_path: Path) -> None:
+    # "none" on a native-resume backend states what already happens --
+    # accepted, not refused (user decision, 2026-09-03).
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _NativeResumeBackend(
+        profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), _completed()]
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    result = await session.run("hi", history_scope="none")
+
+    assert result.status == "completed"
+
+
+async def test_invalid_history_scope_raises_config_error_without_opening_a_turn(
+    tmp_path: Path,
+) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _CtxRecordingBackend(
+        profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), _completed()]
+    )
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    with pytest.raises(ConfigError, match="history_scope"):
+        await session.run("hi", history_scope="everything")
+
+    assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == []
+    assert fake.contexts == []

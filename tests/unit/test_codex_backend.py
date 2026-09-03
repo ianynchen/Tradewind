@@ -31,7 +31,14 @@ from tradewind.application.ports import TurnContext
 from tradewind.application.tool_host import ToolHost
 from tradewind.domain.errors import ConfigError, Unsupported
 from tradewind.domain.events import PermissionRequested, TurnStarted
-from tradewind.domain.models import ModelSpec, Profile, SessionRow, SubscriptionAuth, Verdict
+from tradewind.domain.models import (
+    ModelSpec,
+    Profile,
+    SessionRow,
+    StoredMessage,
+    SubscriptionAuth,
+    Verdict,
+)
 
 
 def _profile() -> Profile:
@@ -405,6 +412,16 @@ def test_codex_env_raises_when_isolation_mode_is_on_without_a_codex_home() -> No
 # the still-in-flight worker, not hang `worker.join()` forever ------------
 
 
+def _history_loader(messages: list[StoredMessage]):
+    """`TurnContext.load_history` is async since FR-9.3 (lazy, awaited by
+    mirror-rebuilding backends); tests hand it a pre-baked list."""
+
+    async def load() -> list[StoredMessage]:
+        return messages
+
+    return load
+
+
 def _make_turn_context(*, broker: Any, tools: ToolHost) -> TurnContext:
     return TurnContext(
         session=SessionRow(
@@ -417,7 +434,7 @@ def _make_turn_context(*, broker: Any, tools: ToolHost) -> TurnContext:
         output_schema=None,
         tools=tools,
         broker=broker,
-        load_history=lambda: [],
+        load_history=_history_loader([]),
     )
 
 

@@ -220,6 +220,16 @@ library) — they are read only by the test files that need real credentials to 
   on 3.12 unchanged. Keep the floor as low as the code actually needs, and when changing it,
   update `pyproject.toml` (`requires-python`, mypy `python_version`, ruff `target-version`),
   `uv.lock`, README, and ARCHITECTURE §6 together.
+- **`append_message`'s returned seq is a free "is this the session's first turn"
+  oracle** — the prompt landing at seq 1 IS the empty-history fact, so FR-9.3's
+  lazy loading could drop the eager whole-history read the R-1 emulation used to
+  justify. When a read exists only to answer a yes/no question, look for a write
+  that already returns the answer.
+- **The Unreleased section of CHANGELOG.md silently accumulated four shipped
+  versions** (0.2.0–0.5.0 all bumped pyproject without rolling the changelog) —
+  caught while adding FR-9.3's entry. When bumping, roll `[Unreleased]` into a
+  dated `[x.y.z]` section in the same commit; nothing enforces this, so it is a
+  checklist discipline (now also a DoD reminder via this note).
 - **Never hold an anyio `CancelScope` (or task group) open across a `yield` in an
   async generator.** `LangchainBackend.run`'s `with scope: async for ...: yield`
   passed every in-repo test yet failed sextant's first real integration: a consumer

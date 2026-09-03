@@ -18,6 +18,7 @@ import an adapter itself (GUIDELINES §8 "dependencies flow inward" --
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
@@ -31,13 +32,15 @@ from tradewind.application.config import TradewindConfig
 from tradewind.application.ports import Backend, SessionStorePort, TurnContext
 from tradewind.application.resume import ResumePlanner
 from tradewind.application.tool_host import ToolHost
-from tradewind.domain.errors import ConfigError, SessionNotFound
+from tradewind.domain.errors import ConfigError, SessionNotFound, Unsupported
 from tradewind.domain.events import Event, ItemCompleted, TurnCompleted, TurnFailed
 from tradewind.domain.models import (
+    HistoryScope,
     NormalizedMessage,
     Profile,
     SessionOptions,
     SessionRow,
+    StoredMessage,
     TierName,
     TurnResult,
     TurnStatus,
@@ -141,6 +144,96 @@ def _effective_max_tool_rounds(overrides: dict[str, object]) -> int | None:
     if type(value) is not int or value < 0:
         raise ConfigError(f"max_tool_rounds must be a non-negative int, got {value!r}")
     return value
+
+
+def _effective_history_scope(overrides: dict[str, object]) -> HistoryScope | None:
+    """Validate the per-call `history_scope` override (FR-9.3). Per-call
+    only, like `max_tool_rounds`. Returns None when unset -- the effective
+    default is per-backend and resolved in `execute()` once the backend's
+    capabilities are known ("flat" on a mirror-rebuilding backend, "none"
+    on a native-resume one).
+
+    Failure modes:
+        ConfigError: the value is not one of "none"/"flat"/"tree".
+    """
+    value = overrides.get("history_scope")
+    if value is None:
+        return None
+    if value not in ("none", "flat", "tree"):
+        raise ConfigError(f"history_scope must be one of 'none'/'flat'/'tree', got {value!r}")
+    # mypy narrows `value` to the literal set via the membership check above.
+    return value
+
+
+def _render_child_block(child_session_id: str, messages: list[StoredMessage]) -> str:
+    """One descendant session's transcript as a single plain-text block
+    (FR-9.3, scope "tree"): text kinds verbatim, tool activity as
+    one-liners, `thinking` dropped (matching `_rebuild_messages`'
+    always-drop rule for replayed context). Wrapping -- rather than raw
+    interleave -- keeps the parent's role alternation and tool_use/
+    tool_result pairing valid for the provider API (user decision,
+    2026-09-03)."""
+    lines = [f"[subagent {child_session_id} transcript]"]
+    for message in messages:
+        content = cast("dict[str, object]", message.content)
+        if message.kind == "thinking":
+            continue
+        if message.kind == "text":
+            text = content.get("text")
+            if text:
+                lines.append(f"{message.role}: {text}")
+        elif message.kind == "tool_use":
+            lines.append(
+                f"assistant called tool {content.get('name')!r} "
+                f"with {json.dumps(content.get('input', {}))}"
+            )
+        elif message.kind == "tool_result":
+            flag = "error" if content.get("is_error") else "ok"
+            lines.append(f"tool result ({flag}): {content.get('content', '')}")
+        else:
+            lines.append(f"{message.role} {message.kind}: {json.dumps(content)}")
+    lines.append(f"[end subagent {child_session_id} transcript]")
+    return "\n".join(lines)
+
+
+def _fold_child_history(
+    parent_session_id: str, rows: list[StoredMessage], before_seq: int
+) -> list[StoredMessage]:
+    """Shape a tree read (`history(include_children=True)`, ordered
+    `(session_id, seq)`) into feedable context (FR-9.3): the parent's own
+    messages in order (excluding this turn's prompt, `seq >= before_seq`),
+    with each descendant session folded into ONE wrapped `kind="text"`
+    block positioned after the last parent message at or before the
+    descendant's first message timestamp -- i.e. after the parent turn
+    during which it was spawned (user decision, 2026-09-03: coarse
+    timestamp positioning now; exact spawn-point interleave waits on the
+    `spawned_by_message_id` deferral). Timestamps are the store's own
+    microsecond-ISO `created_at` strings, lexicographically ordered."""
+    parent = [m for m in rows if m.session_id == parent_session_id and m.seq < before_seq]
+    children: dict[str, list[StoredMessage]] = {}
+    for message in rows:
+        if message.session_id != parent_session_id:
+            children.setdefault(message.session_id, []).append(message)
+    blocks = [
+        StoredMessage(
+            role="user",
+            kind="text",
+            content={"text": _render_child_block(child_id, messages)},
+            session_id=child_id,
+            created_at=messages[0].created_at,
+        )
+        for child_id, messages in children.items()
+    ]
+    blocks.sort(key=lambda block: block.created_at)
+    merged: list[StoredMessage] = []
+    next_block = 0
+    for message in parent:
+        while next_block < len(blocks) and blocks[next_block].created_at < message.created_at:
+            merged.append(blocks[next_block])
+            next_block += 1
+        merged.append(message)
+    merged.extend(blocks[next_block:])
+    return merged
 
 
 def _effective_output_schema(
@@ -314,6 +407,7 @@ class TurnRunner:
         # Validated here, with tier -- before `begin_turn` opens a turn a
         # bad value would only fail.
         max_tool_rounds = _effective_max_tool_rounds(overrides)
+        history_scope_override = _effective_history_scope(overrides)
 
         turn_id = str(uuid.uuid4())
         self._interrupt_requested.discard(session_id)
@@ -332,6 +426,30 @@ class TurnRunner:
         # the next `sweep_stale_turns` (session open).
         try:
             backend = self._resolve_backend(session_row.profile, profile)
+            # FR-9.3 scope resolution. A native-resume backend's engine
+            # replays its own history -- tradewind feeds it no mirror
+            # context -- so the honest default there is "none", while a
+            # mirror-rebuilding backend (langchain) defaults to "flat". An
+            # EXPLICIT "flat"/"tree" on a native-resume backend cannot
+            # reach the model and raises rather than silently dropping
+            # (FR-1.2); an explicit "none" is accepted anywhere -- on a
+            # native-resume backend it merely states what already happens.
+            feeds_mirror_context = not backend.capabilities().supports_native_resume
+            if (
+                history_scope_override is not None
+                and history_scope_override != "none"
+                and not feeds_mirror_context
+            ):
+                raise Unsupported(
+                    f"history_scope={history_scope_override!r} cannot be honored on backend "
+                    f"{backend.name!r}: it resumes natively and tradewind feeds it no mirror "
+                    "context"
+                )
+            history_scope: HistoryScope = (
+                history_scope_override
+                if history_scope_override is not None
+                else ("flat" if feeds_mirror_context else "none")
+            )
             effective_system_prompt = _effective_system_prompt(session_row, overrides)
             if (
                 session_row.native_session_id is not None
@@ -367,49 +485,69 @@ class TurnRunner:
                 socket_dir=self._config.tool_host.socket_dir,
                 broker=tool_host_broker,
             ) as tool_host:
-                history = await anyio.to_thread.run_sync(
-                    lambda: self._store.history(
-                        session_id, include_children=False, include_raw=False
-                    )
-                )
-                # R-1 emulation (ARCHITECTURE §3.1), computed here -- after
-                # `history` loads, before anything is persisted -- for two
-                # reasons: (1) the fold-fallback path needs to know whether
-                # this is genuinely the session's first turn (`history`
-                # empty), per the controller ruling in `_emulate_system_
-                # prompt`'s own docstring; (2) `backend_prompt` (the
-                # possibly-emulated text) is deliberately kept SEPARATE from
-                # `prompt` (the caller's own, untouched text) from this
-                # point on -- `backend_prompt` is what reaches `ctx`/the
-                # backend, `prompt` is what gets persisted below. Folding
-                # `prompt` itself (the earlier, buggy shape -- fix round 1)
-                # both re-applied the fold on every turn AND wrote the
-                # `[Instructions]\n...\n[Task]\n...` wrapper into the mirror
-                # as if the caller had typed it, corrupting `store.
-                # history()` for good.
-                backend_prompt = _emulate_system_prompt(
-                    backend,
-                    session_row,
-                    effective_system_prompt,
-                    prompt,
-                    is_first_turn=not history,
-                )
                 # The prompt is this turn's own input, not something a
                 # backend "completes" as an `ItemCompleted` event, so
-                # nothing else mirrors it -- the runner writes it directly.
-                # Always the CALLER's original `prompt`, never `backend_
-                # prompt` (see above): the mirror records what the caller
-                # actually said, not tradewind's own request-shaping. After
-                # `history` above so this turn's own prompt doesn't also
-                # show up in `ctx.load_history()` (the backend appends
-                # `ctx.prompt` itself when building its request).
+                # nothing else mirrors it -- the runner writes it directly,
+                # FIRST: its assigned `seq` anchors everything that used to
+                # need an eager history read (the read this replaced was
+                # paid on EVERY turn of EVERY backend, though only a
+                # mirror-rebuilding backend ever consumed it -- FR-9.3
+                # laziness). Always the CALLER's original `prompt`, never
+                # `backend_prompt` (below): the mirror records what the
+                # caller actually said, not tradewind's own request-shaping.
                 prompt_content: dict[str, object] = {"text": prompt}
-                await anyio.to_thread.run_sync(
+                prompt_seq = await anyio.to_thread.run_sync(
                     self._store.append_message,
                     session_id,
                     turn_id,
                     NormalizedMessage(role="user", kind="text", content=prompt_content),
                 )
+                # R-1 emulation (ARCHITECTURE §3.1). (1) The fold-fallback
+                # path needs to know whether this is genuinely the
+                # session's first turn (controller ruling in `_emulate_
+                # system_prompt`'s own docstring) -- `seq` is the session-
+                # wide message counter, so the prompt landing at seq 1 IS
+                # that fact, with no history read. (2) `backend_prompt`
+                # (the possibly-emulated text) is deliberately kept
+                # SEPARATE from `prompt` (the caller's own, untouched
+                # text): `backend_prompt` is what reaches `ctx`/the
+                # backend, `prompt` is what was persisted above. Folding
+                # `prompt` itself (the earlier, buggy shape -- fix round 1)
+                # both re-applied the fold on every turn AND wrote the
+                # `[Instructions]\n...\n[Task]\n...` wrapper into the
+                # mirror as if the caller had typed it.
+                backend_prompt = _emulate_system_prompt(
+                    backend,
+                    session_row,
+                    effective_system_prompt,
+                    prompt,
+                    is_first_turn=prompt_seq == 1,
+                )
+
+                # Lazy by design (FR-9.3): the store is not read until a
+                # backend actually awaits this -- native-resume backends
+                # never do, so their turns cost no history query. The
+                # `seq < prompt_seq` bound excludes this turn's own prompt
+                # (the backend appends `ctx.prompt` itself when building
+                # its request), replacing the old read-before-append
+                # ordering guarantee.
+                async def load_history() -> list[StoredMessage]:
+                    if history_scope == "none":
+                        return []
+                    if history_scope == "flat":
+                        rows = await anyio.to_thread.run_sync(
+                            lambda: self._store.history(
+                                session_id, include_children=False, include_raw=False
+                            )
+                        )
+                        return [m for m in rows if m.seq < prompt_seq]
+                    tree_rows = await anyio.to_thread.run_sync(
+                        lambda: self._store.history(
+                            session_id, include_children=True, include_raw=False
+                        )
+                    )
+                    return _fold_child_history(session_id, tree_rows, prompt_seq)
+
                 ctx = TurnContext(
                     session=session_row,
                     turn_id=turn_id,
@@ -419,7 +557,7 @@ class TurnRunner:
                     output_schema=_effective_output_schema(snapshot, overrides),
                     tools=tool_host,
                     broker=broker,
-                    load_history=lambda: history,
+                    load_history=load_history,
                     max_tool_rounds=max_tool_rounds,
                 )
 

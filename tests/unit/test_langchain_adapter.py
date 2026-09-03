@@ -71,6 +71,16 @@ class _NoBroker:
         raise AssertionError(f"broker.decide should not be called (got {tool_name!r})")
 
 
+def _history_loader(messages: list[StoredMessage]):
+    """`TurnContext.load_history` is async since FR-9.3 (lazy, awaited by
+    mirror-rebuilding backends); tests hand it a pre-baked list."""
+
+    async def load() -> list[StoredMessage]:
+        return messages
+
+    return load
+
+
 def _make_ctx(
     *,
     prompt: str = "hello",
@@ -88,7 +98,7 @@ def _make_ctx(
         output_schema=None,
         tools=tools if tools is not None else ToolHost([], [], lambda ref: ref),
         broker=cast(Any, broker),
-        load_history=(lambda: history if history is not None else []),
+        load_history=_history_loader(history if history is not None else []),
     )
 
 

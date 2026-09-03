@@ -5,7 +5,7 @@ implemented by adapters (GUIDELINES §8: dependencies flow inward).
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, ClassVar
 
@@ -268,10 +268,15 @@ class TurnContext:
     turn runner (a later task) from `SessionOptions`/config — the backend
     itself never touches the store (task-8 brief).
 
-    `load_history` is a closure over the store's `history()` verb,
-    pre-bound to this call's `session_id` with `include_raw=False` (mirror
-    reconstruction never needs raw provider payloads — NFR-1); a backend
-    calls it to rebuild the messages array for previous turns.
+    `load_history` is an async, LAZY closure over the store's `history()`
+    verb, pre-bound to this call's `session_id`, its `history_scope`
+    (FR-9.3), and `include_raw=False` (mirror reconstruction never needs
+    raw provider payloads — NFR-1). The store is not touched until a
+    backend actually awaits it — backends that resume natively never do,
+    so their turns cost no history read at all. The returned list excludes
+    this turn's own prompt (the backend appends `ctx.prompt` itself), and
+    under scope "tree" each descendant session arrives folded into one
+    wrapped `kind="text"` block at its spawn position.
     """
 
     session: SessionRow
@@ -282,7 +287,7 @@ class TurnContext:
     output_schema: dict[str, object] | None
     tools: ToolHost
     broker: PermissionBroker
-    load_history: Callable[[], list[StoredMessage]]
+    load_history: Callable[[], Awaitable[list[StoredMessage]]]
     # Per-call cap on tool-execution rounds (FR-6.5): None means uncapped
     # (today's behavior). A backend whose
     # `capabilities().supports_tool_round_cap` is False raises `Unsupported`
