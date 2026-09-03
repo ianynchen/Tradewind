@@ -125,7 +125,7 @@ Key fields:
 | `store` | One union field: a `Path` (built-in sqlite store there), a caller-built `SessionStorePort` (e.g. Postgres later), or **omitted/`None` for an ephemeral in-memory store** — sessions and history work normally for the life of the instance, nothing touches disk, everything is gone at exit. SDK backends still persist natively either way; a `langchain` session's context then lives only as long as the instance. |
 | `permission_broker` | Default broker consulted before tool execution. **Absent broker = all caller-registered tools allowed.** |
 | `native_stores` | `isolation_mode=True` relocates Codex/Cursor native stores (cloud hosts); default off preserves vendor-CLI interop. |
-| `defaults` | Default tier and timeouts (option layering: defaults < session options < per-call overrides). |
+| `defaults` | `TurnDefaults`: default tier, the ENFORCED `request_timeout_s` (600s), `CompactionSettings` (auto/reserve/keep_recent), and `RetrySettings` (attempts/backoff). Option layering: defaults < session options < per-call overrides. |
 | `on_event` | Fire-and-forget tap on the normalized event stream for logging/metrics. Cannot alter control flow. |
 | `secret_refs` | Values substituted for `"ref:<key>"` placeholders in MCP server definitions at connect time — secrets never enter the store. |
 
@@ -177,7 +177,7 @@ The frozen event taxonomy (`tradewind.domain.events`): `TurnStarted`, `TextDelta
 `ItemCompleted` (carries a `NormalizedMessage` — the unit the mirror stores), `PermissionRequested`
 (emitted on deny), `TurnCompleted`, `TurnFailed`. Per-call overrides accepted by
 `run`/`stream`: `tier`, `system_prompt`, `output_schema`, `max_tool_rounds`,
-`history_scope`.
+`history_scope`, `request_timeout_s`.
 
 ### What context the turn sees — `history_scope`
 
@@ -379,6 +379,7 @@ emulates silently — an unsupported call raises `Unsupported`.
 | `supports_fork` | no (`tw.fork` covers it) | yes | yes | no |
 | `supports_transcript_read` | no | yes | yes | no |
 | `supports_tool_round_cap` | yes (own loop) | yes (native `max_turns`) | no | no |
+| `supports_turn_retry` | yes (retry unit = one model call) | no (pre-turn connect retry only) | no (same) | no (same) |
 
 **NATIVE→REPLAY degrade is not implemented** (ARCHITECTURE §7 P-7): a reaped or expired native
 session on `claude`/`codex`/`cursor` currently surfaces as `TurnFailed` rather than degrading
