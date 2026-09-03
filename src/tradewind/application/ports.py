@@ -32,7 +32,7 @@ if TYPE_CHECKING:
     # `from __future__ import annotations` already makes it a lazily
     # evaluated string, and this guard keeps that string resolvable for
     # static type checkers without ever executing at import time.
-    from tradewind.application.config import NativeStoreConfig
+    from tradewind.application.config import CompactionSettings, NativeStoreConfig
 
 
 class SessionStorePort(ABC):
@@ -288,6 +288,12 @@ class TurnContext:
     tools: ToolHost
     broker: PermissionBroker
     load_history: Callable[[], Awaitable[list[StoredMessage]]]
+    # Mirror-compaction settings for this turn (FR-5.8), from
+    # `TradewindConfig.defaults.compaction`. Consumed only by
+    # mirror-rebuilding backends (langchain); None disables automatic
+    # compaction entirely (test contexts, and a safe default for direct
+    # `TurnContext` construction).
+    compaction: CompactionSettings | None = None
     # Per-call cap on tool-execution rounds (FR-6.5): None means uncapped
     # (today's behavior). A backend whose
     # `capabilities().supports_tool_round_cap` is False raises `Unsupported`

@@ -35,3 +35,12 @@ class TurnExecutionFailed(TradewindError):
     """`Session.run()` raises this when its turn's event stream ends in a
     `TurnFailed` event (task-9 brief): the message is that event's `error`
     string, verbatim."""
+
+
+class CompactionFailed(TradewindError):
+    """A summarization attempt could not produce a trustworthy checkpoint
+    (FR-5.8): the summarizer's output was truncated at its token cap, or
+    the model returned tool calls instead of a summary. Raised by manual
+    `Session.compact()`; the automatic path surfaces the same failure as a
+    `kind="event"` item and proceeds uncompacted — a broken summary must
+    never become a checkpoint."""

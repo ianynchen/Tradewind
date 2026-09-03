@@ -114,6 +114,9 @@ result = await s.run(prompt, history_scope="tree")  # per-call context scope (FR
                                                     # native-resume); explicit flat/tree on a native-resume
                                                     # backend raises Unsupported
 await s.stop()                                      # interrupt the in-flight turn (FR-6.2)
+record = await s.compact("focus on the auth work")  # manual mirror compaction (FR-5.8): mirror-fed
+                                                    # backends only; works without ModelMeta and
+                                                    # regardless of CompactionSettings.auto
 
 # History (FR-5.5):
 msgs = await tw.history(session_id, include_children=False, include_raw=False)

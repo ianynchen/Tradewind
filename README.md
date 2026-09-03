@@ -196,6 +196,44 @@ Loading is lazy: a backend that never consumes stored context costs zero history
 turn. An explicit `flat`/`tree` on a native-resume backend cannot reach the model and raises
 `Unsupported` rather than silently doing nothing.
 
+## Long sessions — compaction and model metadata
+
+Give a tier optional metadata and tradewind manages the mirror-fed context budget for you
+(design ported from [Pi](https://github.com/earendil-works/pi), MIT — see
+`docs/research/` for the source-verified notes):
+
+```python
+from tradewind.domain.models import ModelCost, ModelMeta, ModelSpec
+
+ModelSpec(
+    model="claude-sonnet-5",
+    meta=ModelMeta(
+        context_window=200_000,
+        max_tokens=64_000,
+        cost=ModelCost(input=3.0, output=15.0, cache_read=0.3, cache_write=3.75),  # $/Mtok
+    ),
+)
+```
+
+- **Automatic compaction** (`langchain` only — SDK engines manage their own context): when
+  the estimated context approaches `context_window - reserve_tokens`, older transcript is
+  summarized into a structured checkpoint, recorded in the mirror as a `kind="compaction"`
+  message, and later requests are rebuilt from `[checkpoint + retained tail]`. Cut points
+  never split a tool call from its result; a mid-turn cut summarizes the turn prefix
+  separately. **The mirror never loses a row** — compaction changes what is *fed*, not what
+  is *stored*; `tw.history()` always returns everything.
+- **Manual compaction**: `await session.compact("focus on the auth work")` — works without
+  metadata and regardless of the `auto` setting; raises `Unsupported` on SDK backends.
+- Config: `TradewindConfig(defaults=TurnDefaults(compaction=CompactionSettings(auto=True,
+  reserve_tokens=16384, keep_recent_tokens=20000)))`. `auto=False` disables only the
+  automatic trigger.
+- A summarizer failure (truncated output) is loud, never a broken checkpoint: manual raises
+  `CompactionFailed`; automatic emits an event item and proceeds uncompacted.
+- **Computed cost**: with a `cost` table, `TurnResult.cost_usd` is computed from token usage
+  on `langchain`/`codex`/`cursor` (claude's own reported cost always wins). On a
+  subscription profile the figure is the **API-equivalent price** of the tokens used — a
+  budgeting aid, not billed spend. Without a table it stays `None`, honestly.
+
 ### Why the turn ended — `end_reason`
 
 `TurnResult.end_reason` states machine-readably *why* the turn ended, so truncated output can

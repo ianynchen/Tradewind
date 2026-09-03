@@ -21,10 +21,10 @@ from __future__ import annotations
 import json
 import logging
 import uuid
-from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
 from pathlib import Path
-from typing import ClassVar, cast
+from typing import ClassVar, Protocol, cast
 
 import anyio
 
@@ -32,10 +32,16 @@ from tradewind.application.config import TradewindConfig
 from tradewind.application.ports import Backend, SessionStorePort, TurnContext
 from tradewind.application.resume import ResumePlanner
 from tradewind.application.tool_host import ToolHost
-from tradewind.domain.errors import ConfigError, SessionNotFound, Unsupported
+from tradewind.domain.errors import (
+    ConfigError,
+    SessionNotFound,
+    TurnInProgress,
+    Unsupported,
+)
 from tradewind.domain.events import Event, ItemCompleted, TurnCompleted, TurnFailed
 from tradewind.domain.models import (
     HistoryScope,
+    ModelSpec,
     NormalizedMessage,
     Profile,
     SessionOptions,
@@ -48,6 +54,22 @@ from tradewind.domain.models import (
 )
 
 _logger = logging.getLogger(__name__)
+
+
+class _CompactHistory(Protocol):
+    """The duck-typed manual-compaction seam a mirror-rebuilding backend
+    exposes (`LangchainBackend.compact_history`) -- typed here so
+    `TurnRunner.compact`'s `getattr` cast spells the real signature (same
+    reasoning as the `take_native_session_id` cast in `execute`)."""
+
+    def __call__(
+        self,
+        model_spec: ModelSpec,
+        history: list[StoredMessage],
+        *,
+        keep_recent_tokens: int,
+        instructions: str | None = None,
+    ) -> Awaitable[tuple[StoredMessage, dict[str, int]]]: ...
 
 
 class _AllowAllBroker:
@@ -352,6 +374,12 @@ class TurnRunner:
         # terminal event, to tell an expected interrupt apart from an
         # unexpected early end (see `execute()`).
         self._interrupt_requested: set[str] = set()
+        # Session ids with an in-flight turn OR manual compaction in THIS
+        # process (FR-5.8 B3 single-flight): the store's `begin_turn`
+        # covers turn-vs-turn; this set additionally keeps a manual
+        # `compact()` and a turn from interleaving mirror writes. Same
+        # single-process assumption as the store's own seq serialization.
+        self._busy: set[str] = set()
 
     async def request_stop(self, session_id: str, backend: Backend) -> None:
         """`Session.stop()`'s implementation: record that this session's
@@ -411,7 +439,12 @@ class TurnRunner:
 
         turn_id = str(uuid.uuid4())
         self._interrupt_requested.discard(session_id)
+        if session_id in self._busy:
+            # A manual compaction (or an in-process turn the store hasn't
+            # rejected yet) holds the session (FR-5.8 B3 / I-5).
+            raise TurnInProgress(f"session {session_id!r} is busy (turn or compaction in flight)")
         await anyio.to_thread.run_sync(self._store.begin_turn, session_id, turn_id, None)
+        self._busy.add(session_id)
 
         terminal_status: TurnStatus | None = None
         final_text: str | None = None
@@ -558,6 +591,7 @@ class TurnRunner:
                     tools=tool_host,
                     broker=broker,
                     load_history=load_history,
+                    compaction=self._config.defaults.compaction,
                     max_tool_rounds=max_tool_rounds,
                 )
 
@@ -705,6 +739,67 @@ class TurnRunner:
                     )
                 )
             self._interrupt_requested.discard(session_id)
+            self._busy.discard(session_id)
+
+    async def compact(self, session_id: str, instructions: str | None = None) -> StoredMessage:
+        """Manual mirror compaction (FR-5.8 B3): summarize the session's
+        older transcript into a checkpoint NOW, through the same machinery
+        the automatic trigger uses, and append the record to the mirror.
+        Available regardless of `CompactionSettings.auto` and without
+        `ModelMeta` (the caller supplies the "when"). Returns the persisted
+        record (with its assigned seq).
+
+        Failure modes:
+            SessionNotFound: `session_id` does not exist.
+            Unsupported: the session's backend resumes natively (tradewind
+                feeds it no mirror context) or exposes no compaction
+                machinery.
+            TurnInProgress: a turn or another compaction is in flight
+                (I-5 single-flight, in-process).
+            CompactionFailed: nothing to compact, or the summarizer's
+                output was unusable (hard-fail rule).
+        """
+        session_row = await anyio.to_thread.run_sync(self._store.get_session, session_id)
+        if session_row is None:
+            raise SessionNotFound(session_id)
+        profile = _resolve_profile(self._config, session_row.profile)
+        snapshot = cast("dict[str, object]", session_row.options_snapshot)
+        tier = _effective_tier(profile, snapshot, {}, self._config.defaults.tier)
+        model_spec = profile.models[tier]
+        backend = self._resolve_backend(session_row.profile, profile)
+        if backend.capabilities().supports_native_resume:
+            raise Unsupported(
+                f"compact() cannot be honored on backend {backend.name!r}: it resumes "
+                "natively and tradewind feeds it no mirror context (same doctrine as "
+                "history_scope)"
+            )
+        compact_history = cast(
+            "_CompactHistory | None",
+            getattr(backend, "compact_history", None),
+        )
+        if compact_history is None:
+            raise Unsupported(f"backend {backend.name!r} exposes no compaction machinery")
+        if session_id in self._busy:
+            raise TurnInProgress(f"session {session_id!r} is busy (turn or compaction in flight)")
+        self._busy.add(session_id)
+        try:
+            history = await anyio.to_thread.run_sync(
+                lambda: self._store.history(session_id, include_children=False, include_raw=False)
+            )
+            settings = self._config.defaults.compaction
+            record, _usage = await compact_history(
+                model_spec,
+                history,
+                keep_recent_tokens=settings.keep_recent_tokens,
+                instructions=instructions,
+            )
+            record.session_id = session_id
+            record.seq = await anyio.to_thread.run_sync(
+                self._store.append_message, session_id, None, record
+            )
+            return record
+        finally:
+            self._busy.discard(session_id)
 
     def _resolve_ref(self, ref: str) -> str:
         key = ref.removeprefix("ref:")
