@@ -131,11 +131,12 @@ def _stored_text(stored: StoredMessage) -> str:
     return cast(str, stored.content.get("text", ""))
 
 
-def _rebuild_messages(ctx: TurnContext) -> list[BaseMessage]:
-    """Rebuild the request's leading messages from the mirror
-    (`ctx.load_history()`), per the component spec's "History" decision:
-    the store is the conversation, so every turn after the first replays
-    it in full rather than keeping provider-side state.
+def _rebuild_messages(ctx: TurnContext, history: list[StoredMessage]) -> list[BaseMessage]:
+    """Rebuild the request's leading messages from the mirror (`history` =
+    the awaited `ctx.load_history()`, shaped by the turn's `history_scope`
+    -- FR-9.3), per the component spec's "History" decision: the store is
+    the conversation, so every turn after the first replays it in full
+    rather than keeping provider-side state.
 
     `thinking` items are dropped (see module docstring). Consecutive
     `tool_use` items from one assistant turn are merged into a single
@@ -155,7 +156,7 @@ def _rebuild_messages(ctx: TurnContext) -> list[BaseMessage]:
             messages.append(AIMessage(content="", tool_calls=list(pending_tool_calls)))
             pending_tool_calls.clear()
 
-    for stored in ctx.load_history():
+    for stored in history:
         if stored.kind == "thinking":
             continue
         if stored.kind == "tool_use":
@@ -437,7 +438,7 @@ class LangchainBackend(Backend):
             chat_model = self._chat_model_factory(ctx.model_spec)
             schemas = ctx.tools.schemas()
             bound_model = _bind_tools(chat_model, schemas)
-            messages = _rebuild_messages(ctx)
+            messages = _rebuild_messages(ctx, await ctx.load_history())
             messages.append(HumanMessage(content=ctx.prompt))
 
             usage_totals: dict[str, int] = {}

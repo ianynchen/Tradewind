@@ -39,6 +39,17 @@ TurnStatus = Literal["completed", "interrupted", "cancelled", "failed", "in_prog
 # member would be a value nothing can emit. Grows if that ever changes —
 # adding a Literal member later is backward-compatible for consumers.
 EndReason = Literal["end_turn", "max_tokens", "max_tool_rounds", "interrupted"]
+# What stored context tradewind feeds to a turn (FR-9.3): "flat" replays
+# this session's own history; "tree" additionally folds each descendant
+# session's transcript in as one wrapped block positioned after the parent
+# turn that spawned it; "none" feeds nothing. The DEFAULT is per-backend
+# and states what actually happens: "flat" on a mirror-rebuilding backend
+# (langchain), "none" on a native-resume backend (claude/codex/cursor --
+# their engines replay their own native history; tradewind feeds nothing).
+# An EXPLICIT "flat"/"tree" on a native-resume backend raises `Unsupported`
+# (FR-1.2: no silent dropping); an explicit "none" is accepted anywhere --
+# on a native-resume backend it merely states the truth.
+HistoryScope = Literal["none", "flat", "tree"]
 SpawnKind = Literal["fork", "subagent"]
 
 

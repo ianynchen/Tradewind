@@ -50,7 +50,10 @@ supports_tool_round_cap         True    # the loop is Tradewind's own, so the ca
 ## Turn algorithm
 
 1. Load session options (merged per layering rule); rebuild messages from the
-   mirror (`include_raw=False`; `tool_use`/`tool_result` kinds reconstruct real
+   mirror by awaiting `ctx.load_history()` — async and LAZY since FR-9.3, shaped
+   by the turn's `history_scope` (`flat` default here; `tree` arrives with each
+   descendant session pre-folded into one wrapped text block by the runner;
+   `include_raw=False`; `tool_use`/`tool_result` kinds reconstruct real
    content blocks; thinking blocks are omitted — see Decisions).
 2. Bind caller tools (`ToolHost` schemas) to the model; send request with
    `system`, messages, and per-call options.

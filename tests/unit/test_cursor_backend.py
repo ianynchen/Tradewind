@@ -26,7 +26,15 @@ from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import TurnContext
 from tradewind.application.tool_host import ToolHost
 from tradewind.domain.errors import Unsupported
-from tradewind.domain.models import ModelSpec, Profile, SessionRow, SubscriptionAuth, Tool, Verdict
+from tradewind.domain.models import (
+    ModelSpec,
+    Profile,
+    SessionRow,
+    StoredMessage,
+    SubscriptionAuth,
+    Tool,
+    Verdict,
+)
 
 
 def _profile() -> Profile:
@@ -45,6 +53,16 @@ class _NoBroker:
         raise AssertionError(f"broker.decide should not be called (got {tool_name!r})")
 
 
+def _history_loader(messages: list[StoredMessage]):
+    """`TurnContext.load_history` is async since FR-9.3 (lazy, awaited by
+    mirror-rebuilding backends); tests hand it a pre-baked list."""
+
+    async def load() -> list[StoredMessage]:
+        return messages
+
+    return load
+
+
 def _make_ctx(*, output_schema: dict[str, object] | None) -> TurnContext:
     return TurnContext(
         session=SessionRow(
@@ -57,7 +75,7 @@ def _make_ctx(*, output_schema: dict[str, object] | None) -> TurnContext:
         output_schema=output_schema,
         tools=ToolHost([], [], lambda ref: ref),
         broker=cast(Any, _NoBroker()),
-        load_history=lambda: [],
+        load_history=_history_loader([]),
     )
 
 

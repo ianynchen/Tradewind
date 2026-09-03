@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tradewind"
-version = "0.5.0"
+version = "0.6.0"
 description = "Agent infrastructure and policy execution engine"
 requires-python = ">=3.12"
 dependencies = [
@@ -83,6 +83,19 @@ disallow_any_expr = false
 # signature, so it hits this unconditionally. Narrowed to this module only.
 module = "tradewind.application.config"
 disallow_any_explicit = false
+disallow_any_expr = false
+
+[[tool.mypy.overrides]]
+# `turn_runner` gained its first direct reads of `StoredMessage.content`
+# (`dict[str, Any]` by the domain's own typing -- see the `tradewind.domain`
+# override's rationale) with FR-9.3's `_render_child_block`: rendering a
+# descendant transcript means reading each stored message's content dict,
+# and -- same root cause as the `tool_host`/`langchain_backend` overrides
+# below, confirmed the same way -- the flagged expression is the Any-typed
+# field access itself, which no cast on the *result* suppresses under
+# `disallow_any_expr`. `disallow_any_explicit` stays on: this module never
+# spells `Any` itself. Narrowed to this module only.
+module = "tradewind.application.turn_runner"
 disallow_any_expr = false
 
 [[tool.mypy.overrides]]

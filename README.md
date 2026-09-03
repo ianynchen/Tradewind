@@ -176,7 +176,25 @@ await session.stop()                              # turn finalizes with status "
 The frozen event taxonomy (`tradewind.domain.events`): `TurnStarted`, `TextDelta`,
 `ItemCompleted` (carries a `NormalizedMessage` — the unit the mirror stores), `PermissionRequested`
 (emitted on deny), `TurnCompleted`, `TurnFailed`. Per-call overrides accepted by
-`run`/`stream`: `tier`, `system_prompt`, `output_schema`, `max_tool_rounds`.
+`run`/`stream`: `tier`, `system_prompt`, `output_schema`, `max_tool_rounds`,
+`history_scope`.
+
+### What context the turn sees — `history_scope`
+
+```python
+result = await session.run("wrap up", history_scope="tree")   # include subagent transcripts
+```
+
+| `history_scope` | Meaning |
+|---|---|
+| `flat` | This session's own stored history is replayed (default on `langchain`, which rebuilds every request from the mirror). |
+| `tree` | Additionally, each child session's transcript (subagents/forks) is folded in as one wrapped plain-text block, positioned after the parent turn that spawned it — text verbatim, tool activity as one-liners. |
+| `none` | Nothing stored is fed — a stateless one-shot (default on `claude`/`codex`/`cursor`, whose engines replay their own native history; tradewind feeds them nothing either way). |
+
+Defaults are per-backend and truthful, so you only ever set this to *change* something.
+Loading is lazy: a backend that never consumes stored context costs zero history queries per
+turn. An explicit `flat`/`tree` on a native-resume backend cannot reach the model and raises
+`Unsupported` rather than silently doing nothing.
 
 ### Why the turn ended — `end_reason`
 
