@@ -529,3 +529,91 @@ async def test_uncapped_turn_still_hits_the_max_iterations_backstop() -> None:
 def test_capabilities_declare_tool_round_cap_support() -> None:
     caps = _backend(_ScriptedChatModel(responses=[AIMessage(content="x")])).capabilities()
     assert caps.supports_tool_round_cap is True
+
+
+# --- cancel-scope safety across tasks (sextant integration bug,
+# 2026-09-02): `run()` must never hold a CancelScope open across a
+# `yield`. When a consumer abandons the stream, asyncio's async-generator
+# finalizer delivers GeneratorExit FROM ITS OWN TASK -- the old shape then
+# died with "Attempted to exit cancel scope in a different task than it
+# was entered in" ---
+
+
+async def test_run_survives_being_closed_from_a_different_task() -> None:
+    import asyncio
+
+    model = _ScriptedChatModel(responses=[AIMessage(content="never finished")])
+    generator = _backend(model).run(_make_ctx())
+
+    first = await generator.__anext__()
+    assert first == TurnStarted(turn_id="turn-1")
+
+    # Close the generator from a DIFFERENT task -- exactly what asyncio's
+    # async-generator shutdown finalizer does to an abandoned stream.
+    await asyncio.get_running_loop().create_task(generator.aclose())
+    # Old code: RuntimeError from anyio's cross-task CancelScope check.
+    # Reaching here at all is the regression assertion.
+
+
+async def test_abandoning_the_stream_mid_turn_closes_cleanly() -> None:
+    # The consumer-side shape that triggered the bug end to end:
+    # `Session.run` raising on a `TurnFailed` abandons the stream between
+    # events; the backend generator must finalize without error and
+    # without leaking its pump task.
+    model = _ScriptedChatModel(responses=[AIMessage(content="hi")])
+    generator = _backend(model).run(_make_ctx())
+
+    assert await generator.__anext__() == TurnStarted(turn_id="turn-1")
+    await generator.aclose()
+
+    remaining = [event async for event in generator]
+    assert remaining == []
+
+
+async def test_bind_tools_not_implemented_fails_loudly_with_a_named_message() -> None:
+    """`BaseChatModel.bind_tools` raises a bare NotImplementedError whose
+    str() is EMPTY -- uncaught it produced `TurnFailed("")`. Tools were
+    registered and the model cannot take them: the failure must name the
+    operation (FR-1.2, GUIDELINES §9), never proceed unbound."""
+
+    async def handler(**_: object) -> str:
+        return "unreachable"
+
+    tool_host = ToolHost(
+        [Tool(name="t", description="d", input_schema={"type": "object"}, handler=handler)],
+        [],
+        lambda ref: ref,
+    )
+    # Plain FakeMessagesListChatModel: no bind_tools override, so the base
+    # class raises -- the shape sextant hit with GenericFakeChatModel.
+    model = FakeMessagesListChatModel(responses=[AIMessage(content="x")])
+    ctx = _make_ctx(tools=tool_host, broker=_AllowAllBroker())
+
+    events = [
+        event
+        async for event in LangchainBackend(
+            _profile(), NativeStoreConfig(), chat_model_factory=lambda _spec: model
+        ).run(ctx)
+    ]
+
+    failed = [e for e in events if isinstance(e, TurnFailed)]
+    assert len(failed) == 1
+    assert "bind_tools" in failed[0].error
+    assert "FakeMessagesListChatModel" in failed[0].error
+
+
+async def test_bind_tools_not_implemented_is_fine_when_no_tools_registered() -> None:
+    # No tools registered -> nothing to bind -> a bind_tools-less model
+    # works untouched.
+    model = FakeMessagesListChatModel(responses=[AIMessage(content="plain")])
+    ctx = _make_ctx()
+
+    events = [
+        event
+        async for event in LangchainBackend(
+            _profile(), NativeStoreConfig(), chat_model_factory=lambda _spec: model
+        ).run(ctx)
+    ]
+
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.final_text == "plain"

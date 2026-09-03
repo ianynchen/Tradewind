@@ -1245,3 +1245,64 @@ async def test_no_store_langchain_session_keeps_context_across_turns(
     assert "ping one" in second_request_texts
     assert "pong one" in second_request_texts
     assert second_request_texts[-1] == "ping two"
+
+
+# --- backend_factories injection seam (ADR-0002): the public front door
+# for an embedder's no-network tests, replacing monkeypatching of the
+# module-private `client._backend_factories` map ---
+
+
+async def test_backend_factories_kwarg_overrides_the_registry_per_instance(
+    tmp_path: Path,
+) -> None:
+    model = _ScriptedChatModel(responses=[AIMessage(content="scripted pong")])
+    built: list[Profile] = []
+
+    def scripted_factory(p: Profile, native_config: NativeStoreConfig) -> Backend:
+        built.append(p)
+        return LangchainBackend(p, native_config, chat_model_factory=lambda _spec: model)
+
+    tw = Tradewind(
+        _config(tmp_path, _profile()),
+        backend_factories={"langchain": scripted_factory},
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    result = await session.run("ping")
+
+    assert result.final_text == "scripted pong"
+    assert len(built) == 1
+    # Per-instance only: the module registry still holds the real factory,
+    # so a second, un-overridden Tradewind is untouched by this instance's
+    # injection.
+    assert _client._backend_factories["langchain"] is not scripted_factory
+
+
+async def test_backend_factories_leaves_unnamed_backends_on_the_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Overriding one backend name must not hide the registry's factories
+    # for every other name: a "claude" override plus a langchain profile
+    # still resolves langchain through the (here: patched-registry) path.
+    model = _ScriptedChatModel(responses=[AIMessage(content="registry pong")])
+    registry_used: list[str] = []
+
+    def registry_langchain(p: Profile, native_config: NativeStoreConfig) -> Backend:
+        registry_used.append(p.backend)
+        return LangchainBackend(p, native_config, chat_model_factory=lambda _spec: model)
+
+    monkeypatch.setattr(_client, "_backend_factories", {"langchain": registry_langchain})
+
+    def must_not_run(p: Profile, native_config: NativeStoreConfig) -> Backend:  # noqa: ARG001
+        raise AssertionError("override for 'claude' must not be used for a langchain profile")
+
+    tw = Tradewind(
+        _config(tmp_path, _profile()),
+        backend_factories={"claude": must_not_run},
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    result = await session.run("ping")
+
+    assert result.final_text == "registry pong"
+    assert registry_used == ["langchain"]

@@ -17,12 +17,16 @@ package (outside the layers contract):
   task-9, the others arrive with their own adapter tasks.
 
 Neither is per-instance state: every `Tradewind` in a process shares them.
-`Tradewind.__init__` stays a single-argument constructor exactly as
-specified, with no knowledge of which adapter modules back it. Per the
-task-9 ruling ("adapters are built lazily per profile, cached on the
-instance" -- component spec 01), each `Tradewind` instance keeps its own
-`_backends` cache keyed by profile name, populated on first use via the
-shared factory.
+`Tradewind.__init__` takes the config plus one optional keyword-only
+`backend_factories` mapping (ADR-0002 amends the original single-argument
+ruling): per-instance factory overrides consulted before the module
+registry -- the public injection seam an embedder's no-network tests use
+instead of monkeypatching this module's private map. It still has no
+knowledge of which adapter modules back it. Per the task-9 ruling
+("adapters are built lazily per profile, cached on the instance" --
+component spec 01), each `Tradewind` instance keeps its own `_backends`
+cache keyed by profile name, populated on first use via the shared (or
+overridden) factory.
 """
 
 from __future__ import annotations
@@ -182,8 +186,25 @@ class Tradewind:
     handles bound to itself. Construction opens/migrates the store and
     validates config; it never touches the network."""
 
-    def __init__(self, config: TradewindConfig) -> None:
+    def __init__(
+        self,
+        config: TradewindConfig,
+        *,
+        backend_factories: dict[BackendName, BackendFactory] | None = None,
+    ) -> None:
+        """`backend_factories` (keyword-only, optional; ADR-0002): per-name
+        overrides consulted BEFORE the module-level registry, per instance.
+        The front-door injection seam for an embedder's no-network tests —
+        e.g. a `"langchain"` factory returning a `LangchainBackend` with a
+        scripted `chat_model_factory` — replacing monkeypatching of the
+        private `_backend_factories` map. Names not in the mapping fall
+        through to the real registry, so overriding one backend leaves the
+        others fully functional. Overrides are per-instance and never touch
+        the module registry or other `Tradewind` instances."""
         self._config = config
+        self._backend_factory_overrides: dict[BackendName, BackendFactory] = dict(
+            backend_factories or {}
+        )
         self._store = _resolve_store(config)
         self._store.migrate()
         self._backends: dict[str, Backend] = {}
@@ -195,7 +216,9 @@ class Tradewind:
         cached = self._backends.get(profile_name)
         if cached is not None:
             return cached
-        factory = _backend_factories.get(profile.backend)
+        factory = self._backend_factory_overrides.get(profile.backend) or _backend_factories.get(
+            profile.backend
+        )
         if factory is None:
             raise ConfigError(
                 f"no backend factory registered for backend {profile.backend!r}; "

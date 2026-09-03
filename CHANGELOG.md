@@ -22,6 +22,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On the langchain backend, a response the provider truncated at
   `max_tokens` now completes with `end_reason="max_tokens"` and its
   (possibly truncated) tool calls are not executed.
+- `Tradewind(config, backend_factories=...)` (ADR-0002): keyword-only,
+  per-instance backend-factory overrides consulted before the module
+  registry — the public injection seam for embedders' no-network tests
+  (previously only reachable by monkeypatching a private map).
 - Optional persistence (FR-5.7, ADR-0001): `TradewindConfig.store` may now
   be omitted — the mirror becomes an ephemeral in-memory sqlite database,
   private to the instance and gone at exit. Turns, history (so langchain
@@ -42,5 +46,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Langchain backend: `run()` no longer holds an `anyio.CancelScope` open
+  across `yield` (the documented anyio async-generator pitfall). Abandoning
+  the stream mid-turn — e.g. `Session.run()` raising on a `TurnFailed` —
+  made asyncio's async-generator finalizer close the scope from its own
+  task and blew up with "Attempted to exit cancel scope in a different task
+  than it was entered in", failing otherwise-working turns. The turn now
+  runs in a dedicated pump task (scope entered and exited in that one task)
+  streaming events out through a memory channel.
+- Langchain backend: a chat model without `bind_tools` support plus
+  registered tools now fails loudly with a message naming the model and the
+  operation (FR-1.2), instead of a `TurnFailed` whose message was the empty
+  `str(NotImplementedError())`.
 - `tradewind.__version__` is synced with `pyproject.toml` (it had been left
   at 0.1.0 through the 0.2.0/0.3.0 bumps).

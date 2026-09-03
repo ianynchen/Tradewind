@@ -38,6 +38,8 @@ the task-8 report for controller follow-up, not silently dropped.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator, Callable
 from typing import ClassVar, cast
 
@@ -273,7 +275,22 @@ def _bind_tools(chat_model: BaseChatModel, schemas: list[dict[str, object]]) -> 
     """
     if not schemas:
         return chat_model
-    return cast(BaseChatModel, chat_model.bind_tools(schemas))
+    try:
+        return cast(BaseChatModel, chat_model.bind_tools(schemas))
+    except NotImplementedError as exc:
+        # `BaseChatModel.bind_tools` raises a bare `NotImplementedError`
+        # whose `str()` is EMPTY -- left uncaught it became a
+        # `TurnFailed("")` with no message at all (sextant integration
+        # repro, 2026-09-02: `GenericFakeChatModel` has no `bind_tools`).
+        # Tools were registered, the model cannot take them: fail loudly
+        # with a message that names the operation (FR-1.2, GUIDELINES §9),
+        # never proceed unbound as if the caller had registered nothing.
+        raise Unsupported(
+            f"chat model {type(chat_model).__name__} does not implement bind_tools, but "
+            f"{len(schemas)} tool(s) were registered for this turn; inject a chat_model_factory "
+            f"whose model supports tool binding (a scripted test fake can subclass it with a "
+            f"no-op bind_tools returning self)"
+        ) from exc
 
 
 def _accumulate_usage(totals: dict[str, int], usage: UsageMetadata | None) -> None:
@@ -355,11 +372,55 @@ class LangchainBackend(Backend):
         session_id = ctx.session.session_id
         scope = anyio.CancelScope()
         self._scopes[session_id] = scope
-        try:
+
+        # The turn runs in a dedicated pump task, streaming its events out
+        # through a zero-buffer memory channel, so the `CancelScope` is
+        # entered AND exited inside that one task. The earlier shape --
+        # `with scope:` wrapped around `yield` inside this async generator --
+        # was the documented anyio pitfall: when a consumer abandons the
+        # stream (e.g. `Session.run` raising on a `TurnFailed`), asyncio's
+        # async-generator finalizer delivers `GeneratorExit` at the yield
+        # point FROM ITS OWN TASK, and the scope then exits in a different
+        # task than it was entered in ("Attempted to exit cancel scope in a
+        # different task...", sextant integration repro, 2026-09-02).
+        # `asyncio.create_task` (not an anyio task group) deliberately: a
+        # task group is itself a cancel scope and would recreate the exact
+        # same across-`yield` hazard; `CodexBackend` already sets the
+        # asyncio-native precedent in this repo.
+        send, receive = anyio.create_memory_object_stream[Event](0)
+
+        async def pump() -> None:
             with scope:
-                async for event in self._run_turn(ctx):
+                async with send:
+                    async for event in self._run_turn(ctx):
+                        await send.send(event)
+            # Falling off the end covers both a clean finish (`_run_turn`
+            # always yields its own terminal event) and an interrupt:
+            # `scope.cancel()` unwinds `send.send`/`_run_turn` via
+            # `Cancelled`, `with scope:` swallows it (its own cancellation),
+            # and closing `send` ends the consumer loop below with no
+            # further event and no exception (Backend.run contract).
+
+        pump_task = asyncio.get_running_loop().create_task(pump())
+        try:
+            async with receive:
+                async for event in receive:
                     yield event
+            # Surface a pump crash (a bug escaping `_run_turn`'s own
+            # `except Exception` -> `TurnFailed` net) instead of silently
+            # ending the stream; on any normal end this is already done.
+            await pump_task
         finally:
+            if not pump_task.done():
+                scope.cancel()
+                # Shielded so the pump's own `finally`s complete even when
+                # this generator is being finalized under cancellation or
+                # from asyncio's async-generator finalizer task; the shield
+                # scope is entered and exited entirely inside this block, in
+                # whichever single task runs it, so it never trips the
+                # cross-task check this restructure exists to avoid.
+                with anyio.CancelScope(shield=True), contextlib.suppress(BaseException):
+                    await pump_task
             # Only pop the scope this call registered: a second `run()` on
             # the same `session_id` (e.g. this one interrupted, a new turn
             # started before this generator's `finally` runs) would already
@@ -369,12 +430,6 @@ class LangchainBackend(Backend):
             # `interrupt()` a silent no-op.
             if self._scopes.get(session_id) is scope:
                 self._scopes.pop(session_id, None)
-        # Falling off the end here covers both a clean finish (the loop
-        # below always yields its own terminal event) and an interrupt:
-        # `scope.cancel()` unwinds the `async for` above via `Cancelled`,
-        # `with scope:` swallows it (it is this scope's own cancellation),
-        # and the generator ends here with no further event and no
-        # exception (Backend.run contract).
 
     async def _run_turn(self, ctx: TurnContext) -> AsyncIterator[Event]:
         yield TurnStarted(turn_id=ctx.turn_id)

@@ -220,6 +220,26 @@ library) — they are read only by the test files that need real credentials to 
   on 3.12 unchanged. Keep the floor as low as the code actually needs, and when changing it,
   update `pyproject.toml` (`requires-python`, mypy `python_version`, ruff `target-version`),
   `uv.lock`, README, and ARCHITECTURE §6 together.
+- **Never hold an anyio `CancelScope` (or task group) open across a `yield` in an
+  async generator.** `LangchainBackend.run`'s `with scope: async for ...: yield`
+  passed every in-repo test yet failed sextant's first real integration: a consumer
+  that abandons the stream (e.g. `Session.run` raising on `TurnFailed`) leaves the
+  generator to asyncio's async-generator finalizer, which delivers `GeneratorExit`
+  from ITS OWN task — the scope then exits in a task it wasn't entered in. The safe
+  shape: run the work in a dedicated task that owns the scope end-to-end, stream
+  events out through a memory channel; an anyio task group is NOT a fix (it is
+  itself a scope across the yields). Regression-locked by
+  `test_run_survives_being_closed_from_a_different_task` (proved failing pre-fix).
+- **A `TurnFailed` whose error is `str(exc)` is only as good as the exception's
+  message** — `str(NotImplementedError())` is empty, so `bind_tools` on a model
+  without tool support produced `TurnFailed("")`. When wrapping third-party raises
+  into event errors, catch the specific case and write the message yourself (§9).
+- **Scripting langchain fakes: `GenericFakeChatModel` cannot script tool-call
+  turns** — it streams by splitting message *content*, so a content-empty
+  tool-call message yields zero chunks ("No generation chunks were returned"),
+  and it has no `bind_tools`. Use `FakeMessagesListChatModel` (invoke-based; the
+  whole message, tool_calls included, arrives as one chunk) subclassed with a
+  no-op `bind_tools` returning `self` — the repo's `_ScriptedChatModel` pattern.
 - **Never batch-rewrite code with a bare-substring regex.** The `StoreConfig`
   migration's `re.sub("StoreConfig, ", ...)` also matched *inside*
   `NativeStoreConfig, ` — producing `NativeTradewindConfig` imports and
