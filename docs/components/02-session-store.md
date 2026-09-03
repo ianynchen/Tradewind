@@ -27,7 +27,8 @@ in-memory mirror, FR-5.7).
 |---|---|---|
 | Engine | stdlib `sqlite3`, WAL, `foreign_keys=ON`, `busy_timeout` 5 s | House pattern (waypoint 01); zero deps; embedder-friendly single file. |
 | Location | path-valued `TradewindConfig.store`, no default path; `None` selects an ephemeral in-memory database (FR-5.7) | Library rule: the host decides where data lives (NFR-5) — including nowhere. |
-| Schema versioning | `PRAGMA user_version`, forward-only migrations at open | An embedder upgrade must never strand transcripts. |
+| Schema versioning | `PRAGMA user_version`, forward-only migrations at open (v2 adds the `meta` key-value table) | An embedder upgrade must never strand transcripts. |
+| Content-shape versioning (FR-5.9) | `meta.content_shape_version`, checked on every `migrate()`: newer-than-library → refuse loudly (`ConfigError`); older → forward-only shape-migration hook | The JSON inside `content_json` is a contract too; Pi versions its session files for the same reason. |
 | Timestamps | UTC ISO-8601 text | Legible in any SQLite browser. |
 | Identifiers | caller-minted UUID text primary keys (FR-5.6, I-1a) | Idempotent creation; embedder records the id before calling. |
 | `raw_json` | stored always, returned only on `include_raw` | The payload elephant stays out of the hot path (NFR-1). |
@@ -76,3 +77,19 @@ creates the fork row with lineage.
 - `import_native_items` applied twice is a no-op the second time.
 - 10k-message session: flat read without raw under 10 ms on local SQLite
   (NFR-1 smoke bound).
+
+
+## Content shapes (v1) — FR-5.9
+
+The per-kind `content` JSON stored in `messages.content_json`. ANY change
+here bumps `CONTENT_SHAPE_VERSION` (domain/models.py) and ships a shape
+migration in the same commit (§5.1 discipline applied to this contract).
+
+| kind | content (v1) |
+|---|---|
+| `text`, `thinking` | `{"text": str}` (thinking's signature, when present, rides `raw`, not content) |
+| `tool_use` | `{"id": str\|null, "name": str, "input": dict}` |
+| `tool_result` | `{"tool_use_id": str, "content": str, "is_error": bool}` |
+| `compaction` | `{"summary": str, "first_kept_seq": int, "tokens_before": int, "summarizer_usage": dict[str,int], "summarizer_cost_usd": float\|null}` |
+| `event` | `{"type": str, ...}` — adapter-declared discriminator plus free fields (e.g. `compaction_failed` carries `error`) |
+| `command_execution`, `file_change`, `plan`, `web_search` | adapter-defined pass-through of the engine's own payload (codex/cursor); readers must treat unknown fields as opaque |

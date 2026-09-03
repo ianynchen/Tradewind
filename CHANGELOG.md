@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-03
+
+### Added
+
+- Versioned mirror content shapes (FR-5.9): `CONTENT_SHAPE_VERSION` with a
+  store `meta` table (table-schema v2, forward-only); a store written by a
+  newer tradewind is refused loudly (`ConfigError`) instead of risking
+  corruption; the v1 per-kind shape table is documented in component spec
+  02 with a bump-plus-migration rule for any change.
+- Session accounting (FR-5.9): `SessionStorePort.turn_usages()` and the
+  public `Tradewind.usage(session_id)` rollup — turn token/cost totals
+  plus summarizer spend from compaction records, reported separately and
+  summing to the session total with no double counting; a cost total is
+  `None` only when every contributing cost is unknown.
+
+### Changed
+
+- **Breaking (custom store implementers):** `SessionStorePort` gains the
+  abstract `turn_usages()` verb.
+- No-double-count amendment to Phase 1: summarizer spend (tokens and the
+  newly recorded `summarizer_cost_usd`) lives ONLY on the compaction
+  record; a turn's `cost_usd` is the turn's own tokens (the langchain
+  adapter no longer folds summarizer cost into it).
+
 ## [0.7.0] - 2026-09-03
 
 ### Added

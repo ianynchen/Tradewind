@@ -464,7 +464,7 @@ class LangchainBackend(Backend):
             schemas = ctx.tools.schemas()
             bound_model = _bind_tools(chat_model, schemas)
             history = await ctx.load_history()
-            record, failure_item, summarizer_usage = await self._maybe_auto_compact(ctx, history)
+            record, failure_item = await self._maybe_auto_compact(ctx, history)
             if failure_item is not None:
                 # Auto-compaction failed (FR-5.8 hard-fail rule): surfaced
                 # loudly as a mirrored event item, turn proceeds uncompacted.
@@ -578,7 +578,7 @@ class LangchainBackend(Backend):
                     end_reason=end_reason,
                     final_text=final_text,
                     usage=usage_totals,
-                    cost_usd=self._computed_cost(ctx.model_spec, usage_totals, summarizer_usage),
+                    cost_usd=self._computed_cost(ctx.model_spec, usage_totals),
                 )
             )
         except Exception as exc:
@@ -586,36 +586,25 @@ class LangchainBackend(Backend):
 
     # --- compaction (FR-5.8) -------------------------------------------
 
-    def _computed_cost(
-        self,
-        model_spec: ModelSpec,
-        usage_totals: dict[str, int],
-        summarizer_usage: dict[str, int],
-    ) -> float | None:
+    def _computed_cost(self, model_spec: ModelSpec, usage_totals: dict[str, int]) -> float | None:
         """`TurnResult.cost_usd` from the tier's cost table (FR-10.5) --
-        None without one (honest absence). Includes the summarizer call's
-        spend when this turn triggered a compaction. On a subscription
-        profile the figure is the API-EQUIVALENT price of the tokens used,
-        not billed spend (user decision 2026-09-03)."""
+        None without one (honest absence); the turn's OWN tokens only.
+        Summarizer spend lives on the compaction record instead (Phase-2a
+        amendment: `tw.usage()` sums turns + records with no overlap). On
+        a subscription profile the figure is the API-EQUIVALENT price of
+        the tokens used, not billed spend (user decision 2026-09-03)."""
         meta = model_spec.meta
         if meta is None or meta.cost is None:
             return None
-        cost = calculate_cost(
+        return calculate_cost(
             meta.cost,
             input_tokens=usage_totals.get("input_tokens", 0),
             output_tokens=usage_totals.get("output_tokens", 0),
         )
-        if summarizer_usage:
-            cost += calculate_cost(
-                meta.cost,
-                input_tokens=summarizer_usage.get("input_tokens", 0),
-                output_tokens=summarizer_usage.get("output_tokens", 0),
-            )
-        return cost
 
     async def _maybe_auto_compact(
         self, ctx: TurnContext, history: list[StoredMessage]
-    ) -> tuple[StoredMessage | None, NormalizedMessage | None, dict[str, int]]:
+    ) -> tuple[StoredMessage | None, NormalizedMessage | None]:
         """The automatic trigger (FR-5.8 B3): fires only when settings allow
         (`auto=True`), the tier declares a `context_window`, and the chars/4
         estimate of the ABOUT-TO-BE-FED context (summary + retained tail +
@@ -625,7 +614,7 @@ class LangchainBackend(Backend):
         settings = ctx.compaction
         meta = ctx.model_spec.meta
         if settings is None or not settings.auto or meta is None:
-            return None, None, {}
+            return None, None
         summary, retained = compacted_view(history)
         feed_estimate = (
             estimate_tokens(retained)
@@ -634,9 +623,9 @@ class LangchainBackend(Backend):
             + (len(ctx.system_prompt) // 4 if ctx.system_prompt is not None else 0)
         )
         if not should_compact(feed_estimate, meta.context_window, settings.reserve_tokens):
-            return None, None, {}
+            return None, None
         try:
-            record, usage = await self._compact(
+            record, _usage = await self._compact(
                 ctx.model_spec, history, keep_recent_tokens=settings.keep_recent_tokens
             )
         except CompactionFailed as exc:
@@ -645,8 +634,8 @@ class LangchainBackend(Backend):
                 kind="event",
                 content={"type": "compaction_failed", "error": str(exc)},
             )
-            return None, failure, {}
-        return record, None, usage
+            return None, failure
+        return record, None
 
     async def compact_history(
         self,
@@ -710,6 +699,16 @@ class LangchainBackend(Backend):
             summary_text = merge_split_turn_summaries(summary_text, prefix_summary)
             for key, value in prefix_usage.items():
                 usage[key] = usage.get(key, 0) + value
+        meta = model_spec.meta
+        summarizer_cost = (
+            calculate_cost(
+                meta.cost,
+                input_tokens=usage.get("input_tokens", 0),
+                output_tokens=usage.get("output_tokens", 0),
+            )
+            if meta is not None and meta.cost is not None
+            else None
+        )
         record = StoredMessage(
             role="user",
             kind="compaction",
@@ -718,6 +717,10 @@ class LangchainBackend(Backend):
                 "first_kept_seq": view_rows[cut.first_kept_index].seq,
                 "tokens_before": estimate_tokens(view_rows),
                 "summarizer_usage": dict(usage),
+                # Computed at compact time so manual-compact spend is never
+                # lost to a later profile change (Phase-2a); None without a
+                # cost table -- honest absence.
+                "summarizer_cost_usd": summarizer_cost,
             },
         )
         return record, usage

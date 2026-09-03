@@ -21,6 +21,7 @@ from tradewind.domain.models import (
     SessionRow,
     StoredMessage,
     TurnStatus,
+    TurnUsage,
 )
 
 if TYPE_CHECKING:
@@ -47,7 +48,10 @@ class SessionStorePort(ABC):
         """Apply pending schema migrations up to the current version.
 
         Idempotent: calling this repeatedly on the same store is a no-op
-        once the store is already at the current version.
+        once the store is already at the current version. Implementations
+        also own their equivalent of the mirror CONTENT-shape check
+        (FR-5.9): refuse a store recorded at a shape version newer than
+        `tradewind.domain.models.CONTENT_SHAPE_VERSION`.
         """
         ...
 
@@ -170,6 +174,20 @@ class SessionStorePort(ABC):
 
         Returns:
             The number of turns swept.
+        """
+        ...
+
+    @abstractmethod
+    def turn_usages(self, session_id: str) -> list[TurnUsage]:
+        """Read back the session's per-turn accounting rows (FR-5.9
+        companion), ordered by turn seq: turn id, terminal status, token
+        usage as finalized, and the turn's own `cost_usd` (reported or
+        computed -- FR-10.5; never includes summarizer spend, which lives
+        on compaction records).
+
+        Returns:
+            The rows, `[]` when `session_id` is unknown (matching
+            `history()`'s read semantics).
         """
         ...
 

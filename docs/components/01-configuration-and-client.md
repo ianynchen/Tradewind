@@ -118,6 +118,10 @@ record = await s.compact("focus on the auth work")  # manual mirror compaction (
                                                     # backends only; works without ModelMeta and
                                                     # regardless of CompactionSettings.auto
 
+# Accounting (FR-5.9):
+totals = await tw.usage(session_id)                 # SessionUsage: turn token/cost sums + summarizer
+                                                    # spend from compaction records, no double counting
+
 # History (FR-5.5):
 msgs = await tw.history(session_id, include_children=False, include_raw=False)
 tree = await tw.history(session_id, include_children=True)

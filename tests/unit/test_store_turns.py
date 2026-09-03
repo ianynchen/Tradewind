@@ -209,3 +209,43 @@ def test_crash_simulation_history_readable_and_stale_turn_swept_after_restart(
         "SELECT status FROM turns WHERE turn_id = ?", ("turn-1",)
     )
     assert fetched_turn_status.fetchone()[0] == "failed"
+
+
+# --- turn_usages (FR-5.9 companion verb) ---
+
+
+def test_turn_usages_returns_rows_ordered_by_turn_seq(tmp_path: Path) -> None:
+    store = SqliteSessionStore(tmp_path / "sessions.db")
+    store.migrate()
+    store.create_session(_row("sess-1"))
+    store.begin_turn("sess-1", "turn-1", None)
+    store.finalize_turn(
+        "turn-1",
+        status="completed",
+        final_text="one",
+        usage={"input_tokens": 10, "output_tokens": 5, "service_tier": "std"},
+        cost_usd=0.01,
+        error=None,
+    )
+    store.begin_turn("sess-1", "turn-2", None)
+    store.finalize_turn(
+        "turn-2", status="failed", final_text=None, usage=None, cost_usd=None, error="boom"
+    )
+
+    usages = store.turn_usages("sess-1")
+
+    assert [u.turn_id for u in usages] == ["turn-1", "turn-2"]
+    assert usages[0].status == "completed"
+    # Non-int usage values are dropped (TurnUsage.usage is dict[str, int]).
+    assert usages[0].usage == {"input_tokens": 10, "output_tokens": 5}
+    assert usages[0].cost_usd == 0.01
+    assert usages[1].status == "failed"
+    assert usages[1].usage == {}
+    assert usages[1].cost_usd is None
+
+
+def test_turn_usages_unknown_session_is_empty(tmp_path: Path) -> None:
+    store = SqliteSessionStore(tmp_path / "sessions.db")
+    store.migrate()
+
+    assert store.turn_usages("no-such") == []

@@ -229,6 +229,10 @@ ModelSpec(
   automatic trigger.
 - A summarizer failure (truncated output) is loud, never a broken checkpoint: manual raises
   `CompactionFailed`; automatic emits an event item and proceeds uncompacted.
+- **Session accounting**: `await tw.usage(session_id)` rolls up a session's token totals,
+  turn costs, and summarizer spend (reported separately — the two sum to the session total
+  exactly once). The mirror's message shapes are versioned (`CONTENT_SHAPE_VERSION`); a store
+  written by a newer tradewind is refused loudly instead of corrupted.
 - **Computed cost**: with a `cost` table, `TurnResult.cost_usd` is computed from token usage
   on `langchain`/`codex`/`cursor` (claude's own reported cost always wins). On a
   subscription profile the figure is the **API-equivalent price** of the tokens used — a

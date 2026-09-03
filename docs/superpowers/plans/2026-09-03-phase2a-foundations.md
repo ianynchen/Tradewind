@@ -1,6 +1,6 @@
 # Phase 2a: Foundations — content-shape versioning + session accounting
 
-Date: 2026-09-03 · Status: PROPOSED (awaiting approval) · Parent:
+Date: 2026-09-03 · Status: APPROVED (user, 2026-09-03) · Parent:
 `2026-09-03-improvement-roadmap.md` (path AGREED; this is its first
 phase). Items C and D of the roadmap.
 
