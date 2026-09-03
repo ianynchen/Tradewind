@@ -114,6 +114,7 @@ from tradewind.domain.events import (
 from tradewind.domain.models import (
     BackendName,
     Capabilities,
+    EndReason,
     NormalizedMessage,
     PermissionBroker,
     Profile,
@@ -254,15 +255,37 @@ def _usage_ints(usage: dict[str, Any] | None) -> dict[str, int]:
     return {key: value for key, value in usage.items() if isinstance(value, int)}
 
 
+def is_max_turns_result(result: ResultMessage) -> bool:
+    """Whether `result` ends a turn the CLI's `max_turns` cap stopped
+    (FR-6.5). The CLI reports it as an *error* result (`subtype`
+    "error_max_turns", `terminal_reason` "max_turns"), but tradewind only
+    ever sets `max_turns` from the caller's own `ctx.max_tool_rounds`
+    (`_build_options`), so hitting it is the caller's requested cap doing
+    its job -- an honest `max_tool_rounds` completion, not a failure."""
+    return result.terminal_reason == "max_turns" or result.subtype == "error_max_turns"
+
+
+def _end_reason(result: ResultMessage) -> EndReason:
+    if is_max_turns_result(result):
+        return "max_tool_rounds"
+    if result.stop_reason == "max_tokens":
+        return "max_tokens"
+    # Includes `stop_reason=None` (older CLIs report none): a clean-finish
+    # `ResultMessage` with no contrary signal ended the turn itself.
+    return "end_turn"
+
+
 def turn_result_from_result_message(result: ResultMessage, turn_id: str) -> TurnResult:
     """Build the `TurnCompleted.result` a clean-finish `ResultMessage` maps
     to (task-10 brief: usage from `.usage`, cost_usd from
-    `.total_cost_usd`, final_text from `.result`). Not called for an
-    aborted result (`is_aborted_result`) -- those end the turn with no
-    `TurnCompleted` at all, per `Backend.run`'s contract."""
+    `.total_cost_usd`, final_text from `.result`; FR-6.5: `end_reason`
+    from `terminal_reason`/`stop_reason` via `_end_reason`). Not called
+    for an aborted result (`is_aborted_result`) -- those end the turn with
+    no `TurnCompleted` at all, per `Backend.run`'s contract."""
     return TurnResult(
         turn_id=turn_id,
         status="completed",
+        end_reason=_end_reason(result),
         final_text=result.result,
         usage=_usage_ints(result.usage),
         cost_usd=result.total_cost_usd,
@@ -500,6 +523,10 @@ class ClaudeBackend(Backend):
             supports_native_resume=True,
             supports_fork=True,
             supports_transcript_read=True,
+            # Enforced natively via `ClaudeAgentOptions.max_turns` (FR-6.5):
+            # see `_build_options` for the rounds->turns mapping and
+            # `_drive_client` for the honest `max_tool_rounds` completion.
+            supports_tool_round_cap=True,
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -562,6 +589,14 @@ class ClaudeBackend(Backend):
             system_prompt=cast(Any, system_prompt),
             model=ctx.model_spec.model,
             cwd=ctx.session.cwd,
+            # FR-6.5 rounds->turns mapping: the CLI's `max_turns` counts
+            # assistant responses in the query loop (`ResultMessage.
+            # num_turns`), and a run that executes N tool rounds takes N+1
+            # assistant responses (each round's response plus the final
+            # one), so a cap of N tool rounds is `max_turns = N + 1`.
+            # None (uncapped) stays None -- the CLI applies no cap of its
+            # own.
+            max_turns=None if ctx.max_tool_rounds is None else ctx.max_tool_rounds + 1,
             resume=ctx.session.native_session_id,
         )
 
@@ -626,7 +661,12 @@ class ClaudeBackend(Backend):
                     # itself once this generator ends with no terminal
                     # event.
                     return
-                if message.is_error:
+                if message.is_error and not is_max_turns_result(message):
+                    # `is_max_turns_result` is excluded from the failure
+                    # path: the CLI flags its own `max_turns` stop as an
+                    # error, but that cap only exists because the caller
+                    # set `ctx.max_tool_rounds` -- it completes honestly
+                    # with `end_reason="max_tool_rounds"` instead (FR-6.5).
                     yield TurnFailed(turn_id=ctx.turn_id, error=_result_error(message))
                 else:
                     yield TurnCompleted(

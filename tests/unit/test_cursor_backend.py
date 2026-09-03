@@ -74,6 +74,10 @@ def test_capabilities_match_the_brief() -> None:
     assert caps.supports_native_resume is True
     assert caps.supports_fork is False
     assert caps.supports_transcript_read is False
+    # The agentic loop runs inside Cursor's own engine, which exposes no
+    # round/turn cap (`AgentOptions` has none) -- the flag must say so
+    # honestly rather than advertise a cap this adapter could only fake.
+    assert caps.supports_tool_round_cap is False
 
 
 # --- run(): output_schema capability guard (mirrors supports_structured_
@@ -92,6 +96,23 @@ async def test_run_with_output_schema_raises_unsupported_before_turn_started() -
 
     # No TurnStarted (or anything else, and in particular no bridge
     # subprocess spawn attempt) happened before the raise.
+    assert events == []
+
+
+# --- run(): max_tool_rounds capability guard (mirrors
+# supports_tool_round_cap=False; same shape as the output_schema guard) ---
+
+
+async def test_run_with_max_tool_rounds_raises_unsupported_before_turn_started() -> None:
+    backend = CursorBackend(_profile(), NativeStoreConfig())
+    ctx = _make_ctx(output_schema=None)
+    ctx.max_tool_rounds = 1
+
+    events: list[object] = []
+    with pytest.raises(Unsupported):
+        async for event in backend.run(ctx):
+            events.append(event)
+
     assert events == []
 
 

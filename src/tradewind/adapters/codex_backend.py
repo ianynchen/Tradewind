@@ -194,7 +194,7 @@ from openai_codex.models import JsonObject, Notification
 
 from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import Backend, TurnContext
-from tradewind.domain.errors import ConfigError
+from tradewind.domain.errors import ConfigError, Unsupported
 from tradewind.domain.events import (
     Event,
     ItemCompleted,
@@ -860,6 +860,12 @@ class CodexBackend(Backend):
             supports_native_resume=True,
             supports_fork=True,
             supports_transcript_read=True,
+            # The agentic loop runs inside the `codex app-server` engine,
+            # which exposes no round/turn cap (`TurnStartParams` has none) --
+            # a cap could only be faked (counting socket calls, then
+            # interrupting), so the flag stays honest and `run()` raises
+            # `Unsupported` when `ctx.max_tool_rounds` is set (FR-6.5).
+            supports_tool_round_cap=False,
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -938,6 +944,11 @@ class CodexBackend(Backend):
             _logger.exception("TurnHandle.interrupt() failed", extra={"session_id": session_id})
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        if ctx.max_tool_rounds is not None:
+            # Raised before `TurnStarted`, matching `LangchainBackend.run`'s
+            # own capability-mismatch handling for `ctx.output_schema`
+            # (`supports_tool_round_cap` is False -- see `capabilities()`).
+            raise Unsupported("max_tool_rounds is not enforceable on the codex backend")
         async for event in self._run_turn(ctx):
             yield event
 
@@ -1079,6 +1090,13 @@ class CodexBackend(Backend):
                         result=TurnResult(
                             turn_id=turn_id,
                             status="completed",
+                            # The engine reports `completed` only when the
+                            # model genuinely ended its turn (truncation or
+                            # a mid-loop stop surfaces as `failed` with a
+                            # `TurnError` instead), and `max_tool_rounds`
+                            # can never be the reason here -- `run()` raises
+                            # `Unsupported` before any cap could apply.
+                            end_reason="end_turn",
                             final_text=_final_text_from_items(agent_messages),
                             usage=_usage_dict(usage) if usage is not None else {},
                             # Codex's own `Turn`/`TurnCompletedNotification`

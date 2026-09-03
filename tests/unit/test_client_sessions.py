@@ -288,6 +288,7 @@ class _FakeBackend(Backend):
             supports_native_resume=False,
             supports_fork=False,
             supports_transcript_read=False,
+            supports_tool_round_cap=False,
         )
 
     async def run(self, ctx: object) -> AsyncIterator[Event]:  # noqa: ARG002 -- Backend interface
@@ -319,7 +320,12 @@ def _seed_backend(
 def _completed(text: str = "ok") -> TurnCompleted:
     return TurnCompleted(
         result=TurnResult(
-            turn_id="fake-turn", status="completed", final_text=text, usage={}, cost_usd=None
+            turn_id="fake-turn",
+            status="completed",
+            end_reason="end_turn",
+            final_text=text,
+            usage={},
+            cost_usd=None,
         )
     )
 

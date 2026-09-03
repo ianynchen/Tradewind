@@ -105,7 +105,9 @@ class SessionOptions(BaseModel):          # declarative parts snapshot into opti
 
 # Running a turn — one call, streamed or collected:
 async for event in s.stream(prompt): ...            # normalized events (FR-7)
-result = await s.run(prompt)                        # TurnResult: text, usage, cost, status
+result = await s.run(prompt)                        # TurnResult: text, usage, cost, status, end_reason (FR-6.5)
+result = await s.run(prompt, max_tool_rounds=3)     # per-call tool-round cap (FR-6.5); Unsupported where
+                                                    # capabilities().supports_tool_round_cap is False
 await s.stop()                                      # interrupt the in-flight turn (FR-6.2)
 
 # History (FR-5.5):

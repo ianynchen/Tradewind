@@ -125,6 +125,24 @@ def _effective_system_prompt(session: SessionRow, overrides: dict[str, object]) 
     return session.system_prompt
 
 
+def _effective_max_tool_rounds(overrides: dict[str, object]) -> int | None:
+    """Validate the per-call `max_tool_rounds` override (FR-6.5).
+
+    Per-call only — deliberately not merged from `TurnDefaults`/snapshot
+    layers: the cap is a property of one call's budget, not of a session.
+    `0` is meaningful (one model response, no tool execution permitted).
+
+    Failure modes:
+        ConfigError: the value is not a non-negative int (bool excluded).
+    """
+    value = overrides.get("max_tool_rounds")
+    if value is None:
+        return None
+    if type(value) is not int or value < 0:
+        raise ConfigError(f"max_tool_rounds must be a non-negative int, got {value!r}")
+    return value
+
+
 def _effective_output_schema(
     snapshot: dict[str, object], overrides: dict[str, object]
 ) -> dict[str, object] | None:
@@ -279,8 +297,9 @@ class TurnRunner:
 
         Failure modes:
             SessionNotFound: `session_id` does not exist.
-            ConfigError: the session's profile is no longer registered, or
-                the effective tier is not one of its models.
+            ConfigError: the session's profile is no longer registered, the
+                effective tier is not one of its models, or a
+                `max_tool_rounds` override is not a non-negative int.
             TurnInProgress: `session_id` already has an in-flight turn
                 (raised by `store.begin_turn`, propagates untouched -- I-5).
         """
@@ -292,6 +311,9 @@ class TurnRunner:
         snapshot = cast("dict[str, object]", session_row.options_snapshot)
         tier = _effective_tier(profile, snapshot, overrides, self._config.defaults.tier)
         model_spec = profile.models[tier]
+        # Validated here, with tier -- before `begin_turn` opens a turn a
+        # bad value would only fail.
+        max_tool_rounds = _effective_max_tool_rounds(overrides)
 
         turn_id = str(uuid.uuid4())
         self._interrupt_requested.discard(session_id)
@@ -398,6 +420,7 @@ class TurnRunner:
                     tools=tool_host,
                     broker=broker,
                     load_history=lambda: history,
+                    max_tool_rounds=max_tool_rounds,
                 )
 
                 # `aclosing` (not a bare `async for`) so that if THIS
@@ -446,6 +469,7 @@ class TurnRunner:
                             result=TurnResult(
                                 turn_id=turn_id,
                                 status="interrupted",
+                                end_reason="interrupted",
                                 final_text=None,
                                 usage={},
                                 cost_usd=None,

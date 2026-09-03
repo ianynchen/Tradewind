@@ -65,14 +65,15 @@ with honest capability reporting and durable, backend-neutral session history.
 - **FR-6.2** A running turn MUST be cancellable (Claude `interrupt()`, Codex `TurnHandle.interrupt()`, Cursor `run.cancel()`, langchain stream close). Turn status is recorded as `completed | interrupted | cancelled | failed | in_progress`.
 - **FR-6.3** Native-store durability hazards are mitigated without breaking FR-6.4: the mirror is the durability floor; `cleanupPeriodDays` is raised on managed hosts; store relocation (Codex `CODEX_HOME`, Cursor `LocalAgentStore`) is an opt-in isolation mode, off by default.
 - **FR-6.4 CLI interop.** SDK backends record to their standard native locations so the vendor CLIs can resume the same conversation directly (`claude --resume`, `codex resume`; Cursor pending verification). Turns added out-of-band (from a CLI) MUST be reconciled into the mirror on Tradewind's next contact with the session, by diffing the native transcript against the mirror's last known native id. Not applicable to `langchain` (no native store, no CLI).
+- **FR-6.5 Honest turn end.** `TurnResult` carries a machine-readable `end_reason` — `end_turn` (model finished cleanly) | `max_tokens` (provider truncated the output) | `max_tool_rounds` (the caller's cap stopped the tool loop) | `interrupted` — so a consumer can distinguish a clean finish from truncation from a cap without parsing text; truncated output MUST NOT be reported as a clean finish. A per-call `max_tool_rounds` option (non-negative int; 0 = one model response, no tool execution) caps tool-execution rounds; hitting the cap completes the turn as an honest partial (`status="completed"`, `end_reason="max_tool_rounds"`), never as a failure. Adapters that cannot enforce the cap honestly (`supports_tool_round_cap = False`) raise `Unsupported` when it is set rather than approximating one with timers.
 
 ### FR-7 Streaming events
 - **FR-7.1** All backends emit through one normalized event model (text delta, thinking, tool call, tool result, permission request, turn complete, error), with the verbatim native event carried alongside for consumers that need it.
 - **FR-7.2** Deltas are for live consumers only; the mirror stores completed items, never deltas.
 
 ### FR-8 Capability flags
-- **FR-8.1** Each backend declares machine-readable capabilities, at minimum: `supports_system_prompt`, `supports_structured_output`, `supports_interactive_permissions`, `supports_in_process_tools`, `supports_native_resume`, `supports_fork`, `supports_transcript_read`.
-- **FR-8.2** Known deficits (Cursor: no system prompt, no structured output, no permission callback; Codex: no in-process tools) are encoded here, not worked around silently.
+- **FR-8.1** Each backend declares machine-readable capabilities, at minimum: `supports_system_prompt`, `supports_structured_output`, `supports_interactive_permissions`, `supports_in_process_tools`, `supports_native_resume`, `supports_fork`, `supports_transcript_read`, `supports_tool_round_cap`.
+- **FR-8.2** Known deficits (Cursor: no system prompt, no structured output, no permission callback, no tool-round cap; Codex: no in-process tools, no tool-round cap) are encoded here, not worked around silently.
 
 ### FR-9 Subagents
 - **FR-9.1** Caller-orchestrated subagents are the portable core: spawn a child session (own prompt set, clean context, optional model override), run, return the result to the caller. This works identically on all four backends.

@@ -44,6 +44,7 @@ supports_in_process_tools       True
 supports_native_resume          False   # resume is always mirror-rebuild (lossless here)
 supports_fork                   False   # no native fork; Tradewind.fork covers it above the port
 supports_transcript_read        False   # nothing native to read
+supports_tool_round_cap         True    # the loop is Tradewind's own, so the cap is exact (FR-6.5)
 ```
 
 ## Turn algorithm
@@ -58,8 +59,11 @@ supports_transcript_read        False   # nothing native to read
 4. On tool calls: consult broker (`allow` → execute via ToolHost; `deny` →
    synthesized error tool_result; `ask` → emit `permission_request` event, await
    verdict). Append tool results; loop to 2's request step.
-5. Terminate on final response, max-iteration guard, interrupt, or error;
-   finalize the turn row.
+5. Terminate on final response (`end_reason="end_turn"`), provider
+   truncation (`stop_reason="max_tokens"` → `end_reason="max_tokens"`; any
+   tool calls on the truncated response are NOT executed), the caller's
+   `max_tool_rounds` cap (honest partial, `end_reason="max_tool_rounds"` —
+   FR-6.5), max-iteration guard, interrupt, or error; finalize the turn row.
 
 MCP servers on this backend are client-side: `ToolHost` connects as an MCP client
 and presents the servers' tools alongside caller tools (FR-3.1).

@@ -220,6 +220,27 @@ library) — they are read only by the test files that need real credentials to 
   on 3.12 unchanged. Keep the floor as low as the code actually needs, and when changing it,
   update `pyproject.toml` (`requires-python`, mypy `python_version`, ruff `target-version`),
   `uv.lock`, README, and ARCHITECTURE §6 together.
+- **Check a spec's numbering before citing a new requirement id.** FR-6.5's first draft
+  cited "FR-6.3" in fourteen code comments — but FR-6.3 already existed (native-store
+  durability); grep REQUIREMENTS.md for the id before writing it into code. Caught
+  before commit this time.
+- **A "reserved" enum member needs an emitter or a definition before it spreads to new
+  contracts.** `TurnStatus`'s `"cancelled"` has neither: no backend distinguishes cancel
+  from interrupt (each SDK has exactly one abort primitive — claude `interrupt()`,
+  codex `TurnInterruptRequest`, cursor `run.cancel()` — and the runner normalizes all of
+  them to `"interrupted"`, including cursor's own wire word "cancelled"). `EndReason`
+  (FR-6.5) therefore deliberately does NOT mirror it; user-confirmed 2026-09-02. Open
+  follow-up: decide whether `TurnStatus."cancelled"` gets defined semantics or is
+  dropped at the next breaking rev.
+- **The claude CLI reports its `max_turns` stop as an *error* result** (`subtype=
+  "error_max_turns"`, `is_error=True`, `terminal_reason="max_turns"`). Since tradewind
+  only ever sets `max_turns` from the caller's own `max_tool_rounds`, that "error" is the
+  caller's requested cap working — `_drive_client` must reclassify it as an honest
+  `max_tool_rounds` completion BEFORE the generic `is_error` → `TurnFailed` branch.
+- `tests/unit/test_store_history.py::test_history_flat_no_raw_10k_messages_under_50ms`
+  failed once under concurrent machine load (wall-clock 50ms budget) and passed on every
+  solo and full-suite re-run — a latent flake per GUIDELINES §10; not quarantined in the
+  FR-6.5 change (out of scope), flagged here for a follow-up.
 - `CHANGELOG.md` started and first version bump applied (0.1.0 → 0.2.0, user-confirmed) with
   the 3.12-floor change — the flag in the bullet below is resolved; versioning now follows
   GUIDELINES §11 as written. `PROJECT.md` still absent.

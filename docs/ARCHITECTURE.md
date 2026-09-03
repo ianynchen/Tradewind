@@ -88,7 +88,8 @@ class Backend(ABC):
     def capabilities(self) -> Capabilities: ...
         # supports_system_prompt, supports_structured_output,
         # supports_interactive_permissions, supports_in_process_tools,
-        # supports_native_resume, supports_fork, supports_transcript_read (FR-8)
+        # supports_native_resume, supports_fork, supports_transcript_read,
+        # supports_tool_round_cap (FR-8)
 
     @abstractmethod
     async def run(
@@ -145,7 +146,7 @@ this list.
 | `TextDelta` | A streamed text chunk, ahead of the `ItemCompleted` it assembles into. | no (SDK hands messages over whole, not incrementally) | yes |
 | `ItemCompleted` | One normalized message (`text`/`thinking`/`tool_use`/`tool_result`) is complete and mirrored. | yes | yes |
 | `PermissionRequested` | A tool call's broker verdict is `"deny"` — **deny-only, by design**: an `"allow"` verdict has no side effect distinct from the call itself proceeding, so it is not separately eventized. | yes | yes |
-| `TurnCompleted` | A turn finishes cleanly or is interrupted (`result.status` distinguishes the two). | yes | yes |
+| `TurnCompleted` | A turn finishes cleanly or is interrupted (`result.status` distinguishes the two; `result.end_reason` says *why* it ended — clean `end_turn`, provider `max_tokens` truncation, the caller's `max_tool_rounds` cap, or `interrupted` — FR-6.5). | yes | yes |
 | `TurnFailed` | A turn ends in an unrecoverable error. | yes | yes |
 
 `ThinkingDelta` (a streamed reasoning chunk) was removed from the draft

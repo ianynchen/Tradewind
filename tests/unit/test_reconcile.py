@@ -69,6 +69,7 @@ class _FakeTranscriptBackend(Backend):
             supports_native_resume=True,
             supports_fork=True,
             supports_transcript_read=self._supports_transcript_read,
+            supports_tool_round_cap=False,
         )
 
     async def run(

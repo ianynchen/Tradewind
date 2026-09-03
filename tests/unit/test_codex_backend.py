@@ -29,7 +29,7 @@ from tradewind.adapters.codex_backend import (
 from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import TurnContext
 from tradewind.application.tool_host import ToolHost
-from tradewind.domain.errors import ConfigError
+from tradewind.domain.errors import ConfigError, Unsupported
 from tradewind.domain.events import PermissionRequested, TurnStarted
 from tradewind.domain.models import ModelSpec, Profile, SessionRow, SubscriptionAuth, Verdict
 
@@ -355,6 +355,10 @@ def test_capabilities_match_the_brief() -> None:
     assert caps.supports_native_resume is True
     assert caps.supports_fork is True
     assert caps.supports_transcript_read is True
+    # The agentic loop runs inside the codex engine, which exposes no
+    # round/turn cap (`TurnStartParams` has none) -- the flag must say so
+    # honestly rather than advertise a cap this adapter could only fake.
+    assert caps.supports_tool_round_cap is False
 
 
 # --- probe_native: cheap id-truthiness check ---------------------------
@@ -501,3 +505,25 @@ def test_sandbox_explicit_backend_option_wins_regardless_of_broker() -> None:
         _sandbox_mode_from_options(explicit, allow_all_broker=False)
         == SandboxMode.danger_full_access
     )
+
+
+# --- max_tool_rounds is rejected up front, matching
+# supports_tool_round_cap=False (same shape as the cursor/langchain
+# output_schema guard tests) ---
+
+
+async def test_run_with_max_tool_rounds_raises_unsupported_before_turn_started() -> None:
+    backend = CodexBackend(_profile(), NativeStoreConfig())
+    ctx = _make_turn_context(
+        broker=_ScriptedBroker("allow"), tools=ToolHost([], [], lambda ref: ref)
+    )
+    ctx.max_tool_rounds = 1
+
+    events: list[object] = []
+    with pytest.raises(Unsupported):
+        async for event in backend.run(ctx):
+            events.append(event)
+
+    # No TurnStarted (and in particular no `codex app-server` subprocess
+    # attempt) happened before the raise.
+    assert events == []

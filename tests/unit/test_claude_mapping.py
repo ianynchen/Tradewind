@@ -26,6 +26,7 @@ from tradewind.adapters.claude_backend import (
     _normalize_input_schema,
     assistant_message_items,
     is_aborted_result,
+    is_max_turns_result,
     native_transcript_items,
     turn_result_from_result_message,
     user_message_items,
@@ -426,3 +427,50 @@ def test_normalize_input_schema_without_type_key_is_left_to_sdk_shorthand() -> N
     schema = {"text": str}
 
     assert _normalize_input_schema(schema) is schema
+
+
+# --- end_reason (FR-6.5) and is_max_turns_result ---
+
+
+def test_turn_result_end_reason_defaults_to_end_turn() -> None:
+    # Includes stop_reason=None (older CLIs report none): a clean-finish
+    # ResultMessage with no contrary signal ended the turn itself.
+    assert turn_result_from_result_message(_result(), turn_id="turn-1").end_reason == "end_turn"
+
+
+def test_turn_result_end_reason_max_tokens_from_stop_reason() -> None:
+    # Truncation must never be reported as a clean end_turn -- the lie
+    # FR-6.5 exists to prevent.
+    result = turn_result_from_result_message(_result(stop_reason="max_tokens"), turn_id="turn-1")
+    assert result.end_reason == "max_tokens"
+
+
+def test_turn_result_end_reason_max_tool_rounds_for_a_max_turns_result() -> None:
+    # The CLI reports its max_turns stop as an error result; tradewind only
+    # ever sets max_turns from the caller's own cap, so this is the cap
+    # doing its job -- an honest partial completion.
+    result = turn_result_from_result_message(
+        _result(subtype="error_max_turns", is_error=True, terminal_reason="max_turns"),
+        turn_id="turn-1",
+    )
+    assert result.status == "completed"
+    assert result.end_reason == "max_tool_rounds"
+
+
+def test_is_max_turns_result_true_for_terminal_reason_max_turns() -> None:
+    assert is_max_turns_result(_result(terminal_reason="max_turns")) is True
+
+
+def test_is_max_turns_result_true_for_error_max_turns_subtype() -> None:
+    # Older CLIs may report the subtype without a terminal_reason.
+    assert is_max_turns_result(_result(subtype="error_max_turns", is_error=True)) is True
+
+
+def test_is_max_turns_result_false_for_a_plain_success() -> None:
+    assert is_max_turns_result(_result()) is False
+
+
+def test_is_max_turns_result_false_for_an_ordinary_error() -> None:
+    # A genuine failure must keep failing -- only the caller's own cap is
+    # reclassified as completion.
+    assert is_max_turns_result(_result(subtype="error_during_execution", is_error=True)) is False
