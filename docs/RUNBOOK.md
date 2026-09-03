@@ -220,6 +220,23 @@ library) — they are read only by the test files that need real credentials to 
   on 3.12 unchanged. Keep the floor as low as the code actually needs, and when changing it,
   update `pyproject.toml` (`requires-python`, mypy `python_version`, ruff `target-version`),
   `uv.lock`, README, and ARCHITECTURE §6 together.
+- **Phase-2c LIVE VALIDATION PASSED (2026-09-03)** — the first real-model exercise of
+  compaction, and the "prompt quality unproven" caveat from the Phase-1 report is
+  RESOLVED. Setup: haiku (`claude-haiku-4-5`) with declared `context_window=3000`
+  (the cheap-window trick), reserve 700 / keep_recent 400, 10 fact-bearing turns of
+  ~400 tokens each (`tests/integration/test_compaction_live.py`, gated, re-runnable
+  via `scripts/live-tests.sh`). Evidence: TWO chained compaction records (both
+  structured `##` checkpoints, ~0.9–1.1k chars); the trigger fired at threshold on
+  provider-reported numbers both times (context 2017→trip at est. 2390→1096 after;
+  regrow 1893→trip→1186) — **no calibration change needed**; the memory probe
+  recalled fact #1's codeword EXACTLY after it had been summarized away through two
+  chained checkpoints; `tw.usage()` on live traffic: turns $0.0152 + summarizer
+  $0.0063, disjoint. Whole run ≈ $0.022.
+- **Codex cost-mapping assumption VERIFIED live (2026-09-03)** — two real codex turns:
+  `cached_input_tokens ⊆ input_tokens` held on both (4352≤15956, then 19968≤36250
+  with the cache warming turn-over-turn), and `total_tokens = input + output` with
+  reasoning a subset of output. The FR-10.5 mapping (`input − cached` at input rate,
+  `cached` at cache-read rate) stands as written.
 - **`turn_usages()[-1]` during a turn is the turn ITSELF** — the runner opens the
   turn row before fetching, so the trigger upgrade initially read its own empty
   in-progress row instead of the last finished turn. Filter `status != "in_progress"`
