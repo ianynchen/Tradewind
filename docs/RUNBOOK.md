@@ -220,6 +220,26 @@ library) — they are read only by the test files that need real credentials to 
   on 3.12 unchanged. Keep the floor as low as the code actually needs, and when changing it,
   update `pyproject.toml` (`requires-python`, mypy `python_version`, ruff `target-version`),
   `uv.lock`, README, and ARCHITECTURE §6 together.
+- **Never hold an anyio `CancelScope` (or task group) open across a `yield` in an
+  async generator.** `LangchainBackend.run`'s `with scope: async for ...: yield`
+  passed every in-repo test yet failed sextant's first real integration: a consumer
+  that abandons the stream (e.g. `Session.run` raising on `TurnFailed`) leaves the
+  generator to asyncio's async-generator finalizer, which delivers `GeneratorExit`
+  from ITS OWN task — the scope then exits in a task it wasn't entered in. The safe
+  shape: run the work in a dedicated task that owns the scope end-to-end, stream
+  events out through a memory channel; an anyio task group is NOT a fix (it is
+  itself a scope across the yields). Regression-locked by
+  `test_run_survives_being_closed_from_a_different_task` (proved failing pre-fix).
+- **A `TurnFailed` whose error is `str(exc)` is only as good as the exception's
+  message** — `str(NotImplementedError())` is empty, so `bind_tools` on a model
+  without tool support produced `TurnFailed("")`. When wrapping third-party raises
+  into event errors, catch the specific case and write the message yourself (§9).
+- **Scripting langchain fakes: `GenericFakeChatModel` cannot script tool-call
+  turns** — it streams by splitting message *content*, so a content-empty
+  tool-call message yields zero chunks ("No generation chunks were returned"),
+  and it has no `bind_tools`. Use `FakeMessagesListChatModel` (invoke-based; the
+  whole message, tool_calls included, arrives as one chunk) subclassed with a
+  no-op `bind_tools` returning `self` — the repo's `_ScriptedChatModel` pattern.
 - **Never batch-rewrite code with a bare-substring regex.** The `StoreConfig`
   migration's `re.sub("StoreConfig, ", ...)` also matched *inside*
   `NativeStoreConfig, ` — producing `NativeTradewindConfig` imports and
@@ -253,10 +273,18 @@ library) — they are read only by the test files that need real credentials to 
   only ever sets `max_turns` from the caller's own `max_tool_rounds`, that "error" is the
   caller's requested cap working — `_drive_client` must reclassify it as an honest
   `max_tool_rounds` completion BEFORE the generic `is_error` → `TurnFailed` branch.
-- `tests/unit/test_store_history.py::test_history_flat_no_raw_10k_messages_under_50ms`
-  failed once under concurrent machine load (wall-clock 50ms budget) and passed on every
-  solo and full-suite re-run — a latent flake per GUIDELINES §10; not quarantined in the
-  FR-6.5 change (out of scope), flagged here for a follow-up.
+- **RESOLVED (PR #2): the 50ms wall-clock perf test is rewritten as deterministic
+  invariants.** Root cause of the flake (three occurrences: twice under local load, once on
+  a shared CI runner at 163ms): an absolute stopwatch budget only ~3x above the ~17ms median
+  runtime, when scheduler noise alone spans more than that — 58.9ms was observed on an IDLE
+  dev machine within 15 runs. A wall clock measures the machine's momentary load, not the
+  code. The rewrite asserts what the budget was a proxy for: exactly one SQL statement
+  (trace callback), `raw_json` absent from that statement (NFR-1), an index SEARCH not a
+  SCAN (`EXPLAIN QUERY PLAN`), plus a 2s catastrophic bound (~100x headroom). Lesson:
+  **a perf assertion whose budget is within one order of magnitude of the typical runtime
+  on dedicated hardware WILL flake on shared hardware — assert the mechanism (statement
+  count, plan, selected columns), keep wall-clock only as a catastrophic bound.** The
+  `perf` pytest marker is now unused; kept for future genuine benchmarks.
 - `CHANGELOG.md` started and first version bump applied (0.1.0 → 0.2.0, user-confirmed) with
   the 3.12-floor change — the flag in the bullet below is resolved; versioning now follows
   GUIDELINES §11 as written. `PROJECT.md` still absent.

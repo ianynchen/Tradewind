@@ -40,7 +40,7 @@ config = TradewindConfig.model_validate(
             }
         },
         "default_profile": "default",
-        "store": {"sqlite_path": Path("./sessions.db")},
+        "store": "./sessions.db",  # omit entirely for an ephemeral in-memory store (see Configuration)
     }
 )
 
@@ -108,7 +108,7 @@ config = TradewindConfig(
         ),
     },
     default_profile="local",
-    store={"sqlite_path": "./tradewind.db"},        # or store=<your SessionStorePort impl>
+    store=Path("./tradewind.db"),                   # a path, a SessionStorePort impl, or omitted
     permission_broker=my_broker,                    # optional default broker (see Tools)
     native_stores=NativeStoreConfig(),              # isolation_mode=True to relocate native stores
     defaults=TurnDefaults(tier="standard"),
@@ -122,7 +122,7 @@ Key fields:
 | Field | Meaning |
 |---|---|
 | `profiles` / `default_profile` | Backend + auth + tier→model mapping; per-session override via `SessionOptions.profile`. |
-| `store` | `sqlite_path` for the built-in store, or a caller-built `SessionStorePort` (e.g. Postgres later). Exactly one. |
+| `store` | One union field: a `Path` (built-in sqlite store there), a caller-built `SessionStorePort` (e.g. Postgres later), or **omitted/`None` for an ephemeral in-memory store** — sessions and history work normally for the life of the instance, nothing touches disk, everything is gone at exit. SDK backends still persist natively either way; a `langchain` session's context then lives only as long as the instance. |
 | `permission_broker` | Default broker consulted before tool execution. **Absent broker = all caller-registered tools allowed.** |
 | `native_stores` | `isolation_mode=True` relocates Codex/Cursor native stores (cloud hosts); default off preserves vendor-CLI interop. |
 | `defaults` | Default tier and timeouts (option layering: defaults < session options < per-call overrides). |
@@ -154,7 +154,11 @@ child = await s.spawn("summarize the findings", tier="light")   # subagent: fres
 ```python
 # Collected:
 result = await session.run("Refactor the parser", tier="strong")
-# result: TurnResult(turn_id, status, final_text, usage, cost_usd)
+# result: TurnResult(turn_id, status, end_reason, final_text, usage, cost_usd)
+
+# Cap the number of tool-execution rounds for one call:
+result = await session.run("Investigate, max two probes", max_tool_rounds=2)
+# hitting the cap is an HONEST partial: status="completed", end_reason="max_tool_rounds"
 
 # Streamed:
 async for event in session.stream("Refactor the parser"):
@@ -172,7 +176,25 @@ await session.stop()                              # turn finalizes with status "
 The frozen event taxonomy (`tradewind.domain.events`): `TurnStarted`, `TextDelta`,
 `ItemCompleted` (carries a `NormalizedMessage` — the unit the mirror stores), `PermissionRequested`
 (emitted on deny), `TurnCompleted`, `TurnFailed`. Per-call overrides accepted by
-`run`/`stream`: `tier`, `system_prompt`, `output_schema`.
+`run`/`stream`: `tier`, `system_prompt`, `output_schema`, `max_tool_rounds`.
+
+### Why the turn ended — `end_reason`
+
+`TurnResult.end_reason` states machine-readably *why* the turn ended, so truncated output can
+never be mistaken for a clean finish:
+
+| `end_reason` | Meaning |
+|---|---|
+| `end_turn` | The model finished cleanly. |
+| `max_tokens` | The provider truncated the output — an honest partial, not a clean finish. |
+| `max_tool_rounds` | Your per-call cap stopped the tool loop — honest partial. |
+| `interrupted` | `stop()` cut the turn off. |
+
+`max_tool_rounds` (non-negative int; `0` = one model response, no tool execution) is enforced
+only where an adapter can do so honestly — `supports_tool_round_cap` in the capability matrix.
+`langchain` caps its own loop exactly; `claude` maps it to the SDK's native `max_turns`.
+`codex`/`cursor` run their loops engine-side with no cap surface and raise `Unsupported` when
+one is requested — never a timer-faked cap.
 
 ## Tools — plug in your own
 
@@ -296,10 +318,53 @@ emulates silently — an unsupported call raises `Unsupported`.
 | `supports_native_resume` | no (mirror rebuild) | yes | yes | yes |
 | `supports_fork` | no (`tw.fork` covers it) | yes | yes | no |
 | `supports_transcript_read` | no | yes | yes | no |
+| `supports_tool_round_cap` | yes (own loop) | yes (native `max_turns`) | no | no |
 
 **NATIVE→REPLAY degrade is not implemented** (ARCHITECTURE §7 P-7): a reaped or expired native
 session on `claude`/`codex`/`cursor` currently surfaces as `TurnFailed` rather than degrading
 to a mirror-replay turn.
+
+## Testing your integration — no network
+
+Embedders' test suites can script whole turns without any network or credentials, through the
+public constructor: `Tradewind(config, backend_factories=...)` takes per-instance factory
+overrides, consulted before the built-in registry (names you don't override keep their real
+factories; the override never touches other instances or module state).
+
+```python
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+from langchain_core.messages import AIMessage
+
+from tradewind import Tradewind
+from tradewind.adapters.langchain_backend import LangchainBackend
+
+
+class ScriptedModel(FakeMessagesListChatModel):
+    """FakeMessagesListChatModel replays scripted AIMessages verbatim (tool_calls included);
+    the base class has no bind_tools, so a no-op override is needed when tools are registered."""
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+
+scripted = ScriptedModel(responses=[
+    AIMessage(content="", tool_calls=[{"name": "probe", "args": {"q": "one"}, "id": "t1"}]),
+    AIMessage(content="done"),
+])
+
+tw = Tradewind(config, backend_factories={
+    "langchain": lambda profile, native: LangchainBackend(
+        profile, native, chat_model_factory=lambda _spec: scripted
+    ),
+})
+# session.run(...) now drives the real tool loop, broker, and mirror against the script.
+```
+
+Two fake-model gotchas (both fail loudly if hit): a model without `bind_tools` plus registered
+tools is rejected with a message naming the model — hence the two-line subclass above; and
+`GenericFakeChatModel` cannot script tool-call turns at all (it streams by splitting message
+*content*, so a content-empty tool-call message produces zero chunks) — use
+`FakeMessagesListChatModel` as shown.
 
 ## Security defaults
 

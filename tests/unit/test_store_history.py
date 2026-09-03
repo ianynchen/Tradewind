@@ -344,11 +344,23 @@ def test_last_native_id_no_native_messages_returns_none(tmp_path: Path) -> None:
     assert store.last_native_id("sess-1") is None
 
 
-# --- perf: flat read without raw stays well under budget at scale (Step 1) ---
+# --- flat read at scale: one indexed query, raw_json never selected (NFR-1)
+# (Step 1; rewritten from a 50ms wall-clock assertion, PR #2 follow-up).
+# The old form asserted an absolute stopwatch number whose budget (50ms) sat
+# only ~3x above the typical runtime (~17ms median measured locally), so
+# ordinary scheduler noise crossed it -- 58.9ms observed on an IDLE dev
+# machine within 15 runs, 163ms routine on shared CI runners. A wall clock
+# measures the machine's momentary load, not the code. What the budget was a
+# proxy for is asserted deterministically instead: the read is exactly ONE
+# SQL statement, that statement never touches raw_json (NFR-1), and the
+# plan uses the (session_id, seq) index rather than scanning. A loose 2s
+# catastrophic bound remains -- ~100x headroom no loaded runner approaches,
+# but an accidentally quadratic decode of 10k rows would still trip it. ---
 
 
-@pytest.mark.perf
-def test_history_flat_no_raw_10k_messages_under_50ms(tmp_path: Path) -> None:
+def test_history_flat_no_raw_at_10k_is_one_indexed_query_never_touching_raw(
+    tmp_path: Path,
+) -> None:
     db_path = tmp_path / "sessions.db"
     store = SqliteSessionStore(db_path)
     store.migrate()
@@ -374,10 +386,26 @@ def test_history_flat_no_raw_10k_messages_under_50ms(tmp_path: Path) -> None:
     finally:
         conn.close()
 
+    executed: list[str] = []
+    store._conn.set_trace_callback(executed.append)
     start = time.perf_counter()
     messages = store.history("perf-sess", include_raw=False)
     elapsed_ms = (time.perf_counter() - start) * 1000
+    store._conn.set_trace_callback(None)
 
     assert len(messages) == 10_000
     assert all(m.raw is None for m in messages)
-    assert elapsed_ms < 50, f"flat history read took {elapsed_ms:.2f}ms (budget: 50ms)"
+
+    # One statement -- no N+1, no per-row round trips.
+    assert len(executed) == 1, f"expected exactly one SQL statement, got {executed}"
+    # NFR-1: raw payloads are not merely dropped after the fact -- the
+    # column is never selected at all.
+    assert "raw_json" not in executed[0]
+    # The one statement is an index search on (session_id, seq), not a scan.
+    plan_rows = store._conn.execute(f"EXPLAIN QUERY PLAN {executed[0]}").fetchall()
+    plan = " | ".join(str(row) for row in plan_rows)
+    assert "idx_messages_session_seq" in plan, plan
+    assert "SCAN" not in plan, plan
+    # Catastrophic-blowup bound only (see section comment): deterministic
+    # asserts above carry the real contract.
+    assert elapsed_ms < 2000, f"flat history read took {elapsed_ms:.2f}ms (bound: 2000ms)"

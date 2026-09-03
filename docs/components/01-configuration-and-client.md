@@ -79,6 +79,8 @@ phase 1.
 
 ```python
 tw = Tradewind(config)                    # opens store, validates profiles; no network
+tw = Tradewind(config, backend_factories={"langchain": my_factory})  # per-instance factory
+                                          # overrides for no-network tests (ADR-0002)
 await tw.aclose()                         # or: async with Tradewind(config) as tw
 
 # Session acquisition — caller mints the UUID (FR-5.6); three intents:
@@ -123,7 +125,9 @@ adapter receives and what `options_json` snapshots.
 
 ## Contract points
 
-- `Tradewind(config)` performs store open/migration and profile validation only —
+- `Tradewind(config)` performs store open/migration and profile validation only
+  (`backend_factories=`, keyword-only, injects per-instance factory overrides
+  consulted before the module registry — ADR-0002) —
   no SDK construction, no network. Adapters are built lazily per profile on first
   use and cached on the instance.
 - `resume()` on a session whose profile/backend differs from its recorded one does
