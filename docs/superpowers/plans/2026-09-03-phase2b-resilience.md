@@ -1,6 +1,6 @@
 # Phase 2b: Resilience — retry, turn timeouts, provider-usage trigger
 
-Date: 2026-09-03 · Status: PROPOSED (awaiting approval) · Parent:
+Date: 2026-09-03 · Status: APPROVED (user, 2026-09-03) · Parent:
 `2026-09-03-improvement-roadmap.md` (path AGREED; items A + B plus the 2a
 follow-through). Research basis: Pi implementation notes §2 (auto-retry)
 and §1.1 (trigger), with the roadmap's per-backend honesty matrix binding.

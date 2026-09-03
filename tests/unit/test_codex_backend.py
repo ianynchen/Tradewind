@@ -472,6 +472,8 @@ async def test_run_interrupts_the_handle_when_abandoned_before_a_terminal_event(
         out_queue: queue.Queue[object],
         record_native_id: Any,
         record_handle: Any,
+        retry_max: Any,  # noqa: ARG001 -- matches _drive_turn's real signature
+        retry_delay_s: Any,  # noqa: ARG001 -- matches _drive_turn's real signature
     ) -> None:
         record_native_id("thread-1")
         record_handle(_FakeTurnHandle())
@@ -544,3 +546,33 @@ async def test_run_with_max_tool_rounds_raises_unsupported_before_turn_started()
     # No TurnStarted (and in particular no `codex app-server` subprocess
     # attempt) happened before the raise.
     assert events == []
+
+
+# --- FR-6.6: the worker thread's connect-retry notice reaches the event
+# stream as a mirrored retry item ---
+
+
+async def test_connect_retry_notice_maps_to_event_item() -> None:
+    backend = CodexBackend(_profile(), NativeStoreConfig())
+    out_queue: queue.Queue[object] = queue.Queue()
+    out_queue.put(
+        codex_backend._ConnectRetryNotice(
+            attempt=1, max_attempts=3, delay_s=2.0, error="engine spawn failed"
+        )
+    )
+    out_queue.put(codex_backend._DONE)
+
+    events = [
+        event
+        async for event in backend._consume("turn-1", out_queue, ModelSpec(model="gpt-5.4-mini"))
+    ]
+
+    from tradewind.domain.events import ItemCompleted
+
+    assert len(events) == 1
+    item = events[0]
+    assert isinstance(item, ItemCompleted)
+    assert item.message.kind == "event"
+    assert item.message.content["type"] == "retry_scheduled"
+    assert item.message.content["phase"] == "connect"
+    assert item.message.content["error"] == "engine spawn failed"

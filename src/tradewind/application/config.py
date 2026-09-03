@@ -46,10 +46,27 @@ class CompactionSettings(BaseModel):
     keep_recent_tokens: int = 20000
 
 
+class RetrySettings(BaseModel):
+    """Model-call retry policy (FR-6.6), config-wide. Full-strength only
+    where the backend owns its turn loop (`supports_turn_retry`:
+    langchain); SDK backends apply it to the pre-turn connect/spawn step
+    only -- re-running a started turn could duplicate tool side effects.
+    `max_attempts=0` disables retrying entirely. Backoff is Pi's schedule:
+    `base_delay_s * 2**(attempt-1)`."""
+
+    max_attempts: int = 3
+    base_delay_s: float = 2.0
+
+
 class TurnDefaults(BaseModel):
     tier: TierName = "standard"
+    # Enforced since FR-6.6 (previously accepted-but-inert): a turn
+    # exceeding this wall-clock deadline is interrupted via the backend's
+    # own interrupt() and ends status="interrupted", end_reason="timeout".
+    # No disable knob -- raise it instead.
     request_timeout_s: float = 600.0
     compaction: CompactionSettings = CompactionSettings()
+    retry: RetrySettings = RetrySettings()
 
 
 EventHook = Callable[[Event], None]

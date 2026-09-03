@@ -238,6 +238,7 @@ class _ScriptedBackend(Backend):
             supports_fork=False,
             supports_transcript_read=False,
             supports_tool_round_cap=False,
+            supports_turn_retry=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:  # noqa: ARG002 -- Backend interface
@@ -330,6 +331,7 @@ class _ToolCallingBackend(Backend):
             supports_fork=False,
             supports_transcript_read=False,
             supports_tool_round_cap=False,
+            supports_turn_retry=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
@@ -424,6 +426,7 @@ class _HangingBackend(Backend):
             supports_fork=False,
             supports_transcript_read=False,
             supports_tool_round_cap=False,
+            supports_turn_retry=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
@@ -544,6 +547,7 @@ class _ReconcilingBackend(Backend):
             supports_fork=False,
             supports_transcript_read=True,
             supports_tool_round_cap=False,
+            supports_turn_retry=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
@@ -666,6 +670,7 @@ class _RehomingBackend(Backend):
             supports_fork=True,
             supports_transcript_read=False,
             supports_tool_round_cap=False,
+            supports_turn_retry=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
@@ -822,6 +827,7 @@ class _NoSystemPromptBackend(Backend):
             supports_fork=False,
             supports_transcript_read=False,
             supports_tool_round_cap=False,
+            supports_turn_retry=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
@@ -858,6 +864,7 @@ def test_emulate_system_prompt_is_a_noop_when_the_backend_supports_it(tmp_path: 
                 supports_fork=False,
                 supports_transcript_read=False,
                 supports_tool_round_cap=False,
+                supports_turn_retry=False,
             )
 
     row = SessionRow(
@@ -1344,9 +1351,10 @@ async def test_native_resume_backend_turn_issues_no_history_query(tmp_path: Path
     await session.run("hi one")  # seed one turn so a second HAS history to skip
 
     def must_not_read(*_args: object, **_kwargs: object) -> list[object]:
-        raise AssertionError("store.history() must not be called for a native-resume turn")
+        raise AssertionError("store reads must not happen for a native-resume turn")
 
     tw._store.history = must_not_read  # type: ignore[method-assign]
+    tw._store.turn_usages = must_not_read  # type: ignore[method-assign]
 
     result = await session.run("hi two")
 
@@ -1730,10 +1738,12 @@ async def test_usage_rollup_sums_turns_and_reports_summarizer_separately(
     summarizer spend (tokens AND cost) lives on the compaction record and
     is rolled up separately -- the two sum to the session total exactly
     once."""
+    # Turn 2 reports total 90 (> window 100 - reserve 20), so turn 3
+    # compacts on the REPORTED number (the FR-6.6 trigger upgrade).
     model = _RecordingChatModel(
         responses=[
             AIMessage(content="reply one " * 10, usage_metadata=_um(10, 10)),
-            AIMessage(content="reply two " * 10, usage_metadata=_um(20, 20)),
+            AIMessage(content="reply two " * 10, usage_metadata=_um(45, 45)),
             AIMessage(content=_CHECKPOINT, usage_metadata=_um(100, 7)),  # summarizer
             AIMessage(content="reply three", usage_metadata=_um(30, 30)),
         ]
@@ -1755,9 +1765,9 @@ async def test_usage_rollup_sums_turns_and_reports_summarizer_separately(
 
     assert rollup.turns == 3
     # Turn tokens only -- the summarizer's 100/7 never leaks into these.
-    assert rollup.usage == {"input_tokens": 60, "output_tokens": 60, "total_tokens": 120}
+    assert rollup.usage == {"input_tokens": 85, "output_tokens": 85, "total_tokens": 170}
     assert rollup.summarizer_usage == {"input_tokens": 100, "output_tokens": 7, "total_tokens": 107}
-    assert rollup.cost_usd == pytest.approx((60 * 3.0 + 60 * 15.0) / 1e6)
+    assert rollup.cost_usd == pytest.approx((85 * 3.0 + 85 * 15.0) / 1e6)
     assert rollup.summarizer_cost_usd == pytest.approx((100 * 3.0 + 7 * 15.0) / 1e6)
     # And the record itself carries its own cost (computed at compact time).
     record = next(m for m in await tw.history(_VALID_ID) if m.kind == "compaction")
@@ -1865,3 +1875,111 @@ async def test_manual_compact_spend_lands_on_record_and_in_the_rollup(tmp_path: 
     assert rollup.summarizer_usage == {"input_tokens": 50, "output_tokens": 4, "total_tokens": 54}
     assert rollup.summarizer_cost_usd is None
     assert rollup.cost_usd is None  # no cost table anywhere
+
+
+# --- FR-6.6: turn timeout + provider-usage trigger ---
+
+
+async def test_turn_times_out_with_end_reason_timeout(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _InterruptibleBackend(profile, NativeStoreConfig())
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    result = await session.run("hi", request_timeout_s=0.2)
+
+    assert result.status == "interrupted"
+    assert result.end_reason == "timeout"
+    # Finalized in the store as interrupted, not left in_progress.
+    assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == ["interrupted"]
+
+
+async def test_invalid_request_timeout_raises_config_error_without_opening_a_turn(
+    tmp_path: Path,
+) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _CtxRecordingBackend(
+        profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), _completed()]
+    )
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    for bad in (-1, 0, "60", True):
+        with pytest.raises(ConfigError, match="request_timeout_s"):
+            await session.run("hi", request_timeout_s=bad)
+
+    assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == []
+
+
+async def test_completed_turn_is_untouched_by_the_watchdog(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _CtxRecordingBackend(
+        profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), _completed()]
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    result = await session.run("hi", request_timeout_s=30)
+
+    assert result.status == "completed"
+    assert result.end_reason == "end_turn"
+
+
+async def test_reported_usage_triggers_compaction_when_estimate_would_not(
+    tmp_path: Path,
+) -> None:
+    """The trigger upgrade: turn 1 reports total_tokens=95 (window 100,
+    reserve 20 -> threshold 80) while the TEXT is tiny (chars/4 estimate
+    nowhere near 80). Turn 2 must compact on the reported number."""
+    model = _RecordingChatModel(
+        responses=[
+            AIMessage(content="tiny", usage_metadata=_um(90, 5)),
+            AIMessage(content=_CHECKPOINT),  # summarizer, turn 2
+            AIMessage(content="after"),
+        ]
+    )
+    tw = _langchain_tw(
+        tmp_path,
+        _meta_profile(context_window=100),
+        model,
+        defaults=TurnDefaults(
+            compaction=CompactionSettings(auto=True, reserve_tokens=20, keep_recent_tokens=2)
+        ),
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("small prompt")
+    await session.run("next")
+
+    records = [m for m in await tw.history(_VALID_ID) if m.kind == "compaction"]
+    assert len(records) == 1
+
+
+async def test_stale_pre_compaction_usage_never_retriggers(tmp_path: Path) -> None:
+    """Pi's staleness guard in seq-space: right after a compaction, the
+    last turn's reported usage describes the PRE-compaction context; a
+    compaction record newer than that turn's rows means the number is
+    ignored -- otherwise every compaction would immediately re-trigger."""
+    model = _RecordingChatModel(
+        responses=[
+            AIMessage(content="reply one " * 10, usage_metadata=_um(90, 5)),  # big report
+            AIMessage(content=_CHECKPOINT),  # summarizer for turn 2's auto-compaction
+            AIMessage(content="reply two", usage_metadata=_um(10, 5)),  # turn 2, small
+            AIMessage(content="reply three"),  # turn 3 -- must NOT compact again
+        ]
+    )
+    tw = _langchain_tw(
+        tmp_path,
+        _meta_profile(context_window=100),
+        model,
+        defaults=TurnDefaults(
+            compaction=CompactionSettings(auto=True, reserve_tokens=20, keep_recent_tokens=2)
+        ),
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("prompt one " * 9)
+    await session.run("prompt two")  # triggers on turn 1's reported 95
+    await session.run("prompt three")  # turn 2's report is small AND fresh; no re-trigger
+
+    records = [m for m in await tw.history(_VALID_ID) if m.kind == "compaction"]
+    assert len(records) == 1

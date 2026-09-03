@@ -69,7 +69,11 @@ supports_tool_round_cap         True    # the loop is Tradewind's own, so the ca
 4. On tool calls: consult broker (`allow` → execute via ToolHost; `deny` →
    synthesized error tool_result; `ask` → emit `permission_request` event, await
    verdict). Append tool results; loop to 2's request step.
-5. Terminate on final response (`end_reason="end_turn"`), provider
+5. Each model call runs under the FR-6.6 retry policy (typed-first
+   classification, exponential backoff, visible `retry_scheduled` items;
+   a context-overflow error compacts once and retries — completed tool
+   executions are NEVER re-run, the retry unit is one model call).
+6. Terminate on final response (`end_reason="end_turn"`), provider
    truncation (`stop_reason="max_tokens"` → `end_reason="max_tokens"`; any
    tool calls on the truncated response are NOT executed), the caller's
    `max_tool_rounds` cap (honest partial, `end_reason="max_tool_rounds"` —

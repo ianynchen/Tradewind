@@ -33,7 +33,11 @@ if TYPE_CHECKING:
     # `from __future__ import annotations` already makes it a lazily
     # evaluated string, and this guard keeps that string resolvable for
     # static type checkers without ever executing at import time.
-    from tradewind.application.config import CompactionSettings, NativeStoreConfig
+    from tradewind.application.config import (
+        CompactionSettings,
+        NativeStoreConfig,
+        RetrySettings,
+    )
 
 
 class SessionStorePort(ABC):
@@ -312,6 +316,19 @@ class TurnContext:
     # compaction entirely (test contexts, and a safe default for direct
     # `TurnContext` construction).
     compaction: CompactionSettings | None = None
+    # Retry policy for this turn (FR-6.6), from
+    # `TradewindConfig.defaults.retry`; None disables retrying (test
+    # contexts, and the safe default for direct construction). Consumed at
+    # full strength only by `supports_turn_retry` backends; SDK adapters
+    # apply it to their pre-turn connect/spawn step only.
+    retry: RetrySettings | None = None
+    # The session's last recorded turn accounting (FR-5.8 trigger upgrade,
+    # via `SessionStorePort.turn_usages`): provider-reported tokens beat
+    # the chars/4 estimate where available. Populated only for
+    # mirror-rebuilding backends (the runner's `feeds_mirror_context`
+    # gate), so native-resume turns still cost zero store reads.
+    last_turn_usage: dict[str, int] | None = None
+    last_turn_id: str | None = None
     # Per-call cap on tool-execution rounds (FR-6.5): None means uncapped
     # (today's behavior). A backend whose
     # `capabilities().supports_tool_round_cap` is False raises `Unsupported`

@@ -220,6 +220,20 @@ library) — they are read only by the test files that need real credentials to 
   on 3.12 unchanged. Keep the floor as low as the code actually needs, and when changing it,
   update `pyproject.toml` (`requires-python`, mypy `python_version`, ruff `target-version`),
   `uv.lock`, README, and ARCHITECTURE §6 together.
+- **`turn_usages()[-1]` during a turn is the turn ITSELF** — the runner opens the
+  turn row before fetching, so the trigger upgrade initially read its own empty
+  in-progress row instead of the last finished turn. Filter `status != "in_progress"`
+  when "last turn" means "last FINISHED turn"; caught by the trigger test.
+- **An accuracy upgrade can 'break' tests that depended on the old inaccuracy** —
+  the provider-usage trigger stopped a rollup test's compaction from firing because
+  the reported 40 tokens (correct) replaced a chars/4 estimate of ~101 (conservative
+  overcount). When replacing an estimate with ground truth, audit every test that
+  relied on the estimate's bias, and re-tune scenarios rather than loosening asserts.
+- **Split turns keep eating scripted responses** (third occurrence): the overflow
+  tests' 2-row single-turn history forced the split-turn path and its second
+  summarizer call consumed the scripted 'recovered' response. The lesson is now a
+  checklist item: any compaction-adjacent scripted test budgets summarizer calls
+  FIRST (split turn = two), then turn replies.
 - **When strict mypy blocks a content-dict read in the application layer, the read
   usually belongs in the domain** — `tw.usage()`'s summarizer extraction tripped
   `disallow_any_expr` in client.py; moving it to `domain/compaction.summarizer_spend`

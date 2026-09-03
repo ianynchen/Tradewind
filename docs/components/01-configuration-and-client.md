@@ -109,6 +109,8 @@ async for event in s.stream(prompt): ...            # normalized events (FR-7)
 result = await s.run(prompt)                        # TurnResult: text, usage, cost, status, end_reason (FR-6.5)
 result = await s.run(prompt, max_tool_rounds=3)     # per-call tool-round cap (FR-6.5); Unsupported where
                                                     # capabilities().supports_tool_round_cap is False
+result = await s.run(prompt, request_timeout_s=120)  # per-call deadline (FR-6.6); default
+                                                    # TurnDefaults.request_timeout_s=600, ENFORCED
 result = await s.run(prompt, history_scope="tree")  # per-call context scope (FR-9.3): none | flat | tree;
                                                     # defaults per-backend (flat = mirror-rebuild, none =
                                                     # native-resume); explicit flat/tree on a native-resume
