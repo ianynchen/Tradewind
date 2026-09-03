@@ -1,0 +1,24 @@
+# Pre-commit gate: secrets never enter history, and lint/format problems
+# are caught at commit time instead of in CI. Install once per clone:
+#   uv run pre-commit install
+# Ruff runs through `uv run` deliberately so the hook uses the SAME pinned
+# ruff as scripts/check.sh and CI (no second, drifting version from a
+# pre-commit mirror repo).
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      - id: ruff-check
+        name: ruff check
+        entry: uv run ruff check --force-exclude
+        language: system
+        types_or: [python, pyi]
+      - id: ruff-format
+        name: ruff format --check
+        entry: uv run ruff format --check --force-exclude
+        language: system
+        types_or: [python, pyi]

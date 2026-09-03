@@ -26,6 +26,7 @@ dev = [
     "ruff",
     "import-linter",
     "langchain-groq>=1.1.3",
+    "pre-commit",
 ]
 
 [tool.hatch.build.targets.wheel]
