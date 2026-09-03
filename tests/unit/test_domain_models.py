@@ -34,6 +34,7 @@ def _capabilities_kwargs(**overrides: bool) -> dict[str, bool]:
         "supports_transcript_read": True,
         "supports_tool_round_cap": True,
         "supports_turn_retry": True,
+        "supports_deny_reason": True,
     }
     base.update(overrides)
     return base
@@ -188,3 +189,18 @@ def test_snapshot_cwd_none_stays_none() -> None:
     options = SessionOptions()
     snap = options.snapshot()
     assert snap["cwd"] is None
+
+
+# --- broker decision normalization (FR-4.4) ---
+
+
+def test_normalize_decision_accepts_both_forms() -> None:
+    from tradewind.domain.models import Denial, normalize_decision
+
+    # Existing string brokers are untouched: strings normalize losslessly.
+    assert normalize_decision("allow") == ("allow", None, False)
+    assert normalize_decision("deny") == ("deny", None, False)
+    # A bare Denial() is exactly equivalent to "deny".
+    assert normalize_decision(Denial()) == ("deny", None, False)
+    assert normalize_decision(Denial(reason="not in scope")) == ("deny", "not in scope", False)
+    assert normalize_decision(Denial(reason="stop", terminate=True)) == ("deny", "stop", True)

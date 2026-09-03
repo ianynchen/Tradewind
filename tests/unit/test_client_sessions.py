@@ -293,6 +293,7 @@ class _FakeBackend(Backend):
             supports_transcript_read=False,
             supports_tool_round_cap=False,
             supports_turn_retry=False,
+            supports_deny_reason=False,
         )
 
     async def run(self, ctx: object) -> AsyncIterator[Event]:  # noqa: ARG002 -- Backend interface

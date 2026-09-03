@@ -239,6 +239,7 @@ class _ScriptedBackend(Backend):
             supports_transcript_read=False,
             supports_tool_round_cap=False,
             supports_turn_retry=False,
+            supports_deny_reason=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:  # noqa: ARG002 -- Backend interface
@@ -332,6 +333,7 @@ class _ToolCallingBackend(Backend):
             supports_transcript_read=False,
             supports_tool_round_cap=False,
             supports_turn_retry=False,
+            supports_deny_reason=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
@@ -427,6 +429,7 @@ class _HangingBackend(Backend):
             supports_transcript_read=False,
             supports_tool_round_cap=False,
             supports_turn_retry=False,
+            supports_deny_reason=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
@@ -548,6 +551,7 @@ class _ReconcilingBackend(Backend):
             supports_transcript_read=True,
             supports_tool_round_cap=False,
             supports_turn_retry=False,
+            supports_deny_reason=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
@@ -671,6 +675,7 @@ class _RehomingBackend(Backend):
             supports_transcript_read=False,
             supports_tool_round_cap=False,
             supports_turn_retry=False,
+            supports_deny_reason=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
@@ -828,6 +833,7 @@ class _NoSystemPromptBackend(Backend):
             supports_transcript_read=False,
             supports_tool_round_cap=False,
             supports_turn_retry=False,
+            supports_deny_reason=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
@@ -865,6 +871,7 @@ def test_emulate_system_prompt_is_a_noop_when_the_backend_supports_it(tmp_path: 
                 supports_transcript_read=False,
                 supports_tool_round_cap=False,
                 supports_turn_retry=False,
+                supports_deny_reason=False,
             )
 
     row = SessionRow(

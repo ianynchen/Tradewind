@@ -120,6 +120,7 @@ from tradewind.domain.models import (
     Profile,
     SessionRow,
     TurnResult,
+    normalize_decision,
     retry_notice,
 )
 
@@ -457,18 +458,28 @@ def _build_mcp_servers(host: ToolHost) -> dict[str, McpSdkServerConfig]:
     return {_MCP_SERVER_NAME: create_sdk_mcp_server(name=_MCP_SERVER_NAME, tools=tools)}
 
 
-def _make_can_use_tool(broker: PermissionBroker, pending_events: list[Event]) -> CanUseTool:
+def _make_can_use_tool(
+    broker: PermissionBroker, pending_events: list[Event], terminate_flag: list[bool]
+) -> CanUseTool:
     async def can_use_tool(
         tool_name: str, tool_input: dict[str, Any], _context: ToolPermissionContext
     ) -> PermissionResult:
         bare_name = _strip_server_prefix(tool_name)
         input_dict = cast("dict[str, object]", tool_input)
-        verdict = await broker.decide(bare_name, input_dict)
+        decision = await broker.decide(bare_name, input_dict)
+        verdict, reason, terminate = normalize_decision(decision)
         if verdict == "deny":
             pending_events.append(
-                PermissionRequested(tool_name=bare_name, tool_input=input_dict, verdict="deny")
+                PermissionRequested(
+                    tool_name=bare_name, tool_input=input_dict, verdict="deny", reason=reason
+                )
             )
-            return PermissionResultDeny(message="permission denied")
+            if terminate:
+                # Native terminate (FR-4.4): `interrupt=True` ends the CLI's
+                # query loop after this denial; `_drive_client` reclassifies
+                # the resulting aborted ResultMessage as broker_terminated.
+                terminate_flag[0] = True
+            return PermissionResultDeny(message=reason or "permission denied", interrupt=terminate)
         return PermissionResultAllow()
 
     return can_use_tool
@@ -532,6 +543,8 @@ class ClaudeBackend(Backend):
             # duplicate tool side effects (FR-6.6): pre-turn connect retry
             # only, and the CLI retries API errors internally.
             supports_turn_retry=False,
+            # FR-4.4: PermissionResultDeny.message is native.
+            supports_deny_reason=True,
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -581,7 +594,9 @@ class ClaudeBackend(Backend):
                 extra={"session_id": session_id},
             )
 
-    def _build_options(self, ctx: TurnContext, pending_events: list[Event]) -> ClaudeAgentOptions:
+    def _build_options(
+        self, ctx: TurnContext, pending_events: list[Event], terminate_flag: list[bool]
+    ) -> ClaudeAgentOptions:
         system_prompt = (
             {"type": "preset", "preset": "claude_code", "append": ctx.system_prompt}
             if ctx.system_prompt is not None
@@ -590,7 +605,7 @@ class ClaudeBackend(Backend):
         return ClaudeAgentOptions(
             tools=[],
             mcp_servers=cast("dict[str, Any]", _build_mcp_servers(ctx.tools)),
-            can_use_tool=_make_can_use_tool(ctx.broker, pending_events),
+            can_use_tool=_make_can_use_tool(ctx.broker, pending_events, terminate_flag),
             system_prompt=cast(Any, system_prompt),
             model=ctx.model_spec.model,
             cwd=ctx.session.cwd,
@@ -617,10 +632,11 @@ class ClaudeBackend(Backend):
         yield TurnStarted(turn_id=ctx.turn_id)
         session_id = ctx.session.session_id
         pending_events: list[Event] = []
-        client = ClaudeSDKClient(self._build_options(ctx, pending_events))
+        terminate_flag = [False]
+        client = ClaudeSDKClient(self._build_options(ctx, pending_events, terminate_flag))
         self._clients[session_id] = client
         try:
-            async for event in self._drive_client(client, ctx, pending_events):
+            async for event in self._drive_client(client, ctx, pending_events, terminate_flag):
                 yield event
         except Exception as exc:
             yield TurnFailed(turn_id=ctx.turn_id, error=str(exc))
@@ -644,7 +660,11 @@ class ClaudeBackend(Backend):
                 )
 
     async def _drive_client(
-        self, client: ClaudeSDKClient, ctx: TurnContext, pending_events: list[Event]
+        self,
+        client: ClaudeSDKClient,
+        ctx: TurnContext,
+        pending_events: list[Event],
+        terminate_flag: list[bool],
     ) -> AsyncIterator[Event]:
         # FR-6.6 pre-turn retry: connect/spawn failures are the one class
         # provably free of duplicated tool side effects (nothing ran yet).
@@ -684,6 +704,22 @@ class ClaudeBackend(Backend):
             elif isinstance(message, ResultMessage):
                 self._native_ids[ctx.session.session_id] = message.session_id
                 if is_aborted_result(message):
+                    if terminate_flag[0]:
+                        # FR-4.4: this abort was OUR PermissionResultDeny(
+                        # interrupt=True) -- the broker ending the turn, not
+                        # a caller stop(). Honest completion, batch results
+                        # already delivered.
+                        yield TurnCompleted(
+                            result=TurnResult(
+                                turn_id=ctx.turn_id,
+                                status="completed",
+                                end_reason="broker_terminated",
+                                final_text=message.result,
+                                usage=_usage_ints(message.usage),
+                                cost_usd=message.total_cost_usd,
+                            )
+                        )
+                        return
                     # `Backend.run`'s contract (ports.py): an interrupted
                     # turn ends with neither `TurnCompleted` nor
                     # `TurnFailed` -- the turn runner assigns `interrupted`

@@ -576,3 +576,67 @@ async def test_connect_retry_notice_maps_to_event_item() -> None:
     assert item.message.content["type"] == "retry_scheduled"
     assert item.message.content["phase"] == "connect"
     assert item.message.content["error"] == "engine spawn failed"
+
+
+# --- broker verdict enrichment (FR-4.4): reason recorded (no codex
+# channel), terminate approximated via handle interrupt ---
+
+
+def test_denial_reason_is_recorded_and_terminate_queued() -> None:
+    from tradewind.domain.models import Denial
+
+    class _Broker:
+        async def decide(self, _tool_name: str, _tool_input: dict[str, object]) -> object:
+            return Denial(reason="no shell for you", terminate=True)
+
+    result, drained = _run_handler_on_a_real_loop(
+        _Broker(),
+        lambda handler: handler("item/commandExecution/requestApproval", {"command": "rm -rf /"}),
+    )
+
+    assert result["value"] == {"decision": "reject"}
+    permission = next(e for e in drained if isinstance(e, PermissionRequested))
+    assert permission.reason == "no shell for you"  # recorded; model never sees it
+    assert any(isinstance(e, codex_backend._TerminateRequested) for e in drained)
+
+
+async def test_terminate_request_interrupts_and_reclassifies() -> None:
+    from openai_codex.generated.v2_all import Turn, TurnCompletedNotification, TurnStatus
+
+    backend = CodexBackend(_profile(), NativeStoreConfig())
+    interrupts: list[bool] = []
+
+    async def request_interrupt() -> None:
+        interrupts.append(True)
+
+    out_queue: queue.Queue[object] = queue.Queue()
+    out_queue.put(codex_backend._TerminateRequested())
+
+    class _FakeNotification:
+        def __init__(self, payload: object) -> None:
+            self.payload = payload
+
+    out_queue.put(
+        _FakeNotification(
+            TurnCompletedNotification(
+                thread_id="t-1",
+                turn=Turn(id="turn-native-1", items=[], status=TurnStatus.interrupted),
+            )
+        )
+    )
+    out_queue.put(codex_backend._DONE)
+
+    events = [
+        event
+        async for event in backend._consume(
+            "turn-1", out_queue, ModelSpec(model="gpt-5.4-mini"), request_interrupt
+        )
+    ]
+
+    assert interrupts == [True]
+    from tradewind.domain.events import TurnCompleted
+
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert len(completed) == 1
+    assert completed[0].result.status == "completed"
+    assert completed[0].result.end_reason == "broker_terminated"

@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-03
+
+### Added
+
+- Rich broker verdicts (FR-4.4): `decide()` may return `Denial(reason,
+  terminate)` alongside the unchanged `"allow"`/`"deny"` strings. The
+  reason reaches the model on langchain (error tool_result text) and
+  claude (native `PermissionResultDeny.message`), declared via the new
+  required `Capabilities.supports_deny_reason`; codex's approval protocol
+  has no reason channel (verified) — recorded in `PermissionRequested.
+  reason` (new optional field) and the mirror instead. `terminate=True`
+  delivers the batch's denials, then ends the turn honestly
+  (`end_reason="broker_terminated"`; native interrupt on claude,
+  reject-then-interrupt approximation on codex). Known limitation: no
+  terminate on codex's shim-socket path.
+
+### Changed
+
+- **Breaking (Capabilities constructors):** `supports_deny_reason` is a
+  required field.
+
 ## [0.9.0] - 2026-09-03
 
 ### Added

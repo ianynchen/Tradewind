@@ -220,6 +220,17 @@ library) — they are read only by the test files that need real credentials to 
   on 3.12 unchanged. Keep the floor as low as the code actually needs, and when changing it,
   update `pyproject.toml` (`requires-python`, mypy `python_version`, ruff `target-version`),
   `uv.lock`, README, and ARCHITECTURE §6 together.
+- **Automated string-replaces anchored on comments are fragile across formatter
+  runs** (Phase 3): the langchain terminate-break block silently failed to insert
+  because its anchor comment had been re-wrapped since Phase 1 — the script printed
+  success (other replacements matched) and only the behavior test caught the hole.
+  After any scripted multi-replacement, grep for EACH inserted marker, not just
+  exit status.
+- **FR-4.4 shim-socket limitation (recorded, not silent):** a broker
+  `Denial(terminate=True)` on codex's in-process-tool path (ToolHost over the unix
+  socket) delivers the deny + reason but cannot end the turn — ToolHost has no
+  handle to interrupt. The approval-handler paths (exec/patch/external MCP) do
+  terminate. Revisit if sextant needs socket-path terminate.
 - **Phase-2c LIVE VALIDATION PASSED (2026-09-03)** — the first real-model exercise of
   compaction, and the "prompt quality unproven" caveat from the Phase-1 report is
   RESOLVED. Setup: haiku (`claude-haiku-4-5`) with declared `context_window=3000`

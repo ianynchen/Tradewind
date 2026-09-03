@@ -94,6 +94,7 @@ from tradewind.domain.models import (
     StoredMessage,
     TurnResult,
     calculate_cost,
+    normalize_decision,
     retry_notice,
 )
 
@@ -399,6 +400,8 @@ class LangchainBackend(Backend):
             # is tradewind's own, and the retry unit is one model call --
             # completed tool executions are never re-run.
             supports_turn_retry=True,
+            # FR-4.4: the denial reason is the synthesized tool_result text.
+            supports_deny_reason=True,
         )
 
     async def probe_native(
@@ -625,8 +628,10 @@ class LangchainBackend(Backend):
                     end_reason = "max_tool_rounds"
                     break
 
+                terminate_requested = False
                 for call in tool_calls:
-                    verdict = await ctx.broker.decide(call["name"], call["args"])
+                    decision = await ctx.broker.decide(call["name"], call["args"])
+                    verdict, deny_reason, terminate = normalize_decision(decision)
                     # `PermissionRequested` fires only on "deny", per the task-8
                     # brief's literal wording ("'deny' -> synthesized error
                     # ToolMessage + PermissionRequested event with verdict;
@@ -635,9 +640,14 @@ class LangchainBackend(Backend):
                     # typed to carry "allow" too.
                     if verdict == "deny":
                         yield PermissionRequested(
-                            tool_name=call["name"], tool_input=call["args"], verdict="deny"
+                            tool_name=call["name"],
+                            tool_input=call["args"],
+                            verdict="deny",
+                            reason=deny_reason,
                         )
-                        content, is_error = "permission denied", True
+                        # FR-4.4: the reason IS what the model reads.
+                        content, is_error = (deny_reason or "permission denied"), True
+                        terminate_requested = terminate_requested or terminate
                     else:
                         outcome = await ctx.tools.call(call["name"], call["args"])
                         content, is_error = outcome.content, outcome.is_error
@@ -665,6 +675,13 @@ class LangchainBackend(Backend):
                 # `break` above exits before the increment, so at the cap
                 # check it equals rounds actually executed, not iterations.
                 rounds_executed += 1
+                if terminate_requested:
+                    # FR-4.4 terminate, Pi's after-the-batch rule: every
+                    # result in the batch (denials included) was delivered
+                    # and mirrored; the turn then ends as an honest partial.
+                    final_text = _final_text(gathered)
+                    end_reason = "broker_terminated"
+                    break
             else:
                 yield TurnFailed(
                     turn_id=ctx.turn_id,

@@ -460,3 +460,30 @@ async def test_aenter_failure_on_second_server_leaves_host_with_no_mcp_tools(
     assert host.schemas() == []
     outcome = await host.call("mcp__ok__echo", {"text": "hi"})
     assert outcome.is_error is True
+
+
+# --- FR-4.4: the socket-path broker honors a Denial's reason (terminate is
+# a recorded limitation on this path -- no handle to interrupt from here) ---
+
+
+async def test_denial_reason_becomes_the_error_result_on_the_socket_path() -> None:
+    from tradewind.domain.models import Denial
+
+    class _Broker:
+        async def decide(self, _tool_name: str, _tool_input: dict[str, object]) -> object:
+            return Denial(reason="quota exhausted for this tool")
+
+    async def handler(**_: object) -> str:
+        raise AssertionError("denied tool must not run")
+
+    host = ToolHost(
+        [Tool(name="t", description="d", input_schema={"type": "object"}, handler=handler)],
+        [],
+        lambda ref: ref,
+        broker=_Broker(),  # type: ignore[arg-type]
+    )
+
+    outcome = await host.call("t", {})
+
+    assert outcome.is_error is True
+    assert outcome.content == "quota exhausted for this tool"

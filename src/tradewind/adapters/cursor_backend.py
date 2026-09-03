@@ -450,6 +450,9 @@ class CursorBackend(Backend):
             supports_tool_round_cap=False,
             # Same reasoning as claude/codex (FR-6.6).
             supports_turn_retry=False,
+            # FR-4.4: no interception at all (see supports_interactive_
+            # permissions above) -- nothing to carry a reason on.
+            supports_deny_reason=False,
         )
 
     async def probe_native(self, session: SessionRow) -> bool:

@@ -46,6 +46,11 @@ class PermissionRequested:
     tool_name: str
     tool_input: dict[str, Any]
     verdict: Verdict
+    # The broker's `Denial.reason` (FR-4.4), recorded on EVERY consulted
+    # path -- including backends whose engines have no channel to show it
+    # to the model (`supports_deny_reason=False`). Additive with a default:
+    # existing constructions and equality assertions are untouched.
+    reason: str | None = None
 
 
 @dataclass(frozen=True)

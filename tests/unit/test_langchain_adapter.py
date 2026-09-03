@@ -905,3 +905,99 @@ async def test_second_overflow_in_one_turn_fails() -> None:
     failed = [e for e in events if isinstance(e, TurnFailed)]
     assert len(failed) == 1
     assert "too long even now" in failed[0].error
+
+
+# --- broker verdict enrichment (FR-4.4) ---
+
+
+class _RichBroker:
+    """Denies `denied_tool` with a reason; terminates on `fatal_tool`."""
+
+    async def decide(self, tool_name: str, _tool_input: dict[str, object]) -> object:
+        from tradewind.domain.models import Denial
+
+        if tool_name == "denied_tool":
+            return Denial(reason="finance tools are off-limits in this session")
+        if tool_name == "fatal_tool":
+            return Denial(reason="policy violation", terminate=True)
+        return "allow"
+
+
+async def test_denial_reason_reaches_the_model_and_the_event() -> None:
+    tool_host = ToolHost([], [], lambda ref: ref)
+    model = _ScriptedChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "denied_tool", "args": {}, "id": "c1", "type": "tool_call"}],
+            ),
+            AIMessage(content="understood"),
+        ]
+    )
+    ctx = _make_ctx(tools=tool_host, broker=_RichBroker())
+
+    events = [event async for event in _backend(model).run(ctx)]
+
+    permission = next(e for e in events if isinstance(e, PermissionRequested))
+    assert permission.reason == "finance tools are off-limits in this session"
+    denial_result = next(
+        e.message.content
+        for e in events
+        if isinstance(e, ItemCompleted) and e.message.kind == "tool_result"
+    )
+    # FR-4.4: the reason IS what the model reads.
+    assert denial_result["content"] == "finance tools are off-limits in this session"
+    assert denial_result["is_error"] is True
+    # Non-terminating denial: the turn continues to a normal finish.
+    assert cast(TurnCompleted, events[-1]).result.end_reason == "end_turn"
+
+
+async def test_terminate_ends_the_turn_after_the_batch_is_delivered() -> None:
+    calls: list[object] = []
+
+    async def counting(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return "ok"
+
+    tool_host = ToolHost(
+        [
+            Tool(
+                name="fine_tool", description="d", input_schema={"type": "object"}, handler=counting
+            )
+        ],
+        [],
+        lambda ref: ref,
+    )
+    model = _ScriptedChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {"name": "fine_tool", "args": {}, "id": "c1", "type": "tool_call"},
+                    {"name": "fatal_tool", "args": {}, "id": "c2", "type": "tool_call"},
+                ],
+            ),
+            AIMessage(content="unreachable"),
+        ]
+    )
+    ctx = _make_ctx(tools=tool_host, broker=_RichBroker())
+
+    events = [event async for event in _backend(model).run(ctx)]
+
+    result = cast(TurnCompleted, events[-1]).result
+    # Pi's after-the-batch rule: the allowed tool in the same batch RAN,
+    # both results were delivered/mirrored, THEN the turn ended honestly.
+    assert result.status == "completed"
+    assert result.end_reason == "broker_terminated"
+    assert len(calls) == 1
+    tool_results = [
+        e.message.content["tool_use_id"]
+        for e in events
+        if isinstance(e, ItemCompleted) and e.message.kind == "tool_result"
+    ]
+    assert tool_results == ["c1", "c2"]
+
+
+def test_capabilities_declare_deny_reason_support() -> None:
+    caps = _backend(_ScriptedChatModel(responses=[AIMessage(content="x")])).capabilities()
+    assert caps.supports_deny_reason is True
