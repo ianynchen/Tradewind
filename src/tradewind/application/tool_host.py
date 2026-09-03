@@ -51,7 +51,7 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
 from mcp_types import TextContent
 
-from tradewind.domain.models import McpServerDef, PermissionBroker, Tool
+from tradewind.domain.models import McpServerDef, PermissionBroker, Tool, normalize_decision
 from tradewind.toolproxy import protocol
 
 
@@ -436,9 +436,14 @@ class ToolHost:
         if name not in self._tools and name not in self._mcp_targets:
             return ToolOutcome(content=f"unknown tool: {name!r}", is_error=True)
         if self._broker is not None:
-            verdict = await self._broker.decide(name, arguments)
+            decision = await self._broker.decide(name, arguments)
+            verdict, reason, _terminate = normalize_decision(decision)
             if verdict == "deny":
-                return ToolOutcome(content="permission denied", is_error=True)
+                # FR-4.4: the reason reaches the model as the error result.
+                # `terminate` is NOT deliverable on this socket path (no
+                # handle to interrupt from here) -- a recorded Phase-3
+                # limitation, not a silent drop (spec + RUNBOOK).
+                return ToolOutcome(content=reason or "permission denied", is_error=True)
         if name in self._tools:
             return await self._call_local(self._tools[name], arguments)
         return await self._call_mcp(name, arguments)

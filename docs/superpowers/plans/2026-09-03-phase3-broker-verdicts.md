@@ -1,6 +1,6 @@
 # Phase 3: Broker verdict enrichment — deny-reason and terminate
 
-Date: 2026-09-03 · Status: PROPOSED (awaiting approval) · Parent:
+Date: 2026-09-03 · Status: APPROVED (user, 2026-09-03) · Parent:
 `2026-09-03-improvement-roadmap.md` (item F). SDK wire shapes VERIFIED
 before speccing, per the roadmap's own precondition:
 

@@ -104,6 +104,10 @@ class SessionOptions(BaseModel):          # declarative parts snapshot into opti
     permission_broker: PermissionBroker | None = None   # live; never snapshotted
     cwd: Path | None = None
 
+# Broker verdicts (FR-4.4): decide() may return "allow"/"deny" (unchanged) or
+# Denial(reason=..., terminate=...) — reason shown to the model where
+# supports_deny_reason, terminate ends the turn (end_reason="broker_terminated").
+
 # Running a turn — one call, streamed or collected:
 async for event in s.stream(prompt): ...            # normalized events (FR-7)
 result = await s.run(prompt)                        # TurnResult: text, usage, cost, status, end_reason (FR-6.5)

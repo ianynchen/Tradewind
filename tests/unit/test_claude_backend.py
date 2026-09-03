@@ -341,3 +341,73 @@ async def test_connect_retry_exhaustion_fails_the_turn(monkeypatch: pytest.Monke
     failed = [e for e in events if isinstance(e, TurnFailed)]
     assert len(failed) == 1
     assert "spawn failed" in failed[0].error
+
+
+# --- broker verdict enrichment (FR-4.4): native reason + native terminate ---
+
+
+async def test_can_use_tool_maps_denial_reason_and_terminate_natively() -> None:
+    from claude_agent_sdk import PermissionResultDeny
+
+    from tradewind.adapters.claude_backend import _make_can_use_tool
+    from tradewind.domain.events import PermissionRequested
+    from tradewind.domain.models import Denial
+
+    class _Broker:
+        async def decide(self, _tool_name: str, _tool_input: dict[str, object]) -> object:
+            return Denial(reason="not on my watch", terminate=True)
+
+    pending: list[object] = []
+    flag = [False]
+    can_use_tool = _make_can_use_tool(cast(Any, _Broker()), cast(Any, pending), flag)
+
+    result = await can_use_tool("mcp__tradewind__probe", {"q": 1}, cast(Any, None))
+
+    assert isinstance(result, PermissionResultDeny)
+    assert result.message == "not on my watch"  # native reason channel
+    assert result.interrupt is True  # native terminate
+    assert flag == [True]
+    event = pending[0]
+    assert isinstance(event, PermissionRequested)
+    assert event.reason == "not on my watch"
+
+
+async def test_broker_terminated_abort_completes_honestly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The aborted ResultMessage that OUR PermissionResultDeny(interrupt=True)
+    # caused must become a broker_terminated completion, not the generic
+    # interrupted synthesis. Driven through run() with the terminate flag
+    # forced via a broker that denies-with-terminate is not reachable on the
+    # fake client (no tool calls flow), so the flag half is covered above
+    # and the reclassification half here via _drive_client directly.
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+    aborted = _success_result(terminal_reason="aborted_streaming", result=None)
+    captured = _install_fake_sdk_client(monkeypatch, [aborted])
+    del captured
+
+    class _FakeClient:
+        async def connect(self, _prompt: str) -> None:
+            pass
+
+        async def receive_response(self) -> Any:
+            yield aborted
+
+    events = [
+        event
+        async for event in backend._drive_client(
+            cast(Any, _FakeClient()), _make_ctx(output_schema=None), [], [True]
+        )
+    ]
+
+    assert len(events) == 1
+    completed = events[0]
+    assert isinstance(completed, TurnCompleted)
+    assert completed.result.status == "completed"
+    assert completed.result.end_reason == "broker_terminated"
+
+
+def test_capabilities_declare_native_deny_reason() -> None:
+    assert (
+        ClaudeBackend(_profile(), NativeStoreConfig()).capabilities().supports_deny_reason is True
+    )

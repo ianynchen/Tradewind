@@ -249,6 +249,8 @@ never be mistaken for a clean finish:
 | `max_tokens` | The provider truncated the output — an honest partial, not a clean finish. |
 | `max_tool_rounds` | Your per-call cap stopped the tool loop — honest partial. |
 | `interrupted` | `stop()` cut the turn off. |
+| `timeout` | The enforced `request_timeout_s` deadline ended the turn. |
+| `broker_terminated` | Your broker returned `Denial(terminate=True)`: denials were delivered, then the turn ended. |
 
 `max_tool_rounds` (non-negative int; `0` = one model response, no tool execution) is enforced
 only where an adapter can do so honestly — `supports_tool_round_cap` in the capability matrix.
@@ -308,7 +310,25 @@ class ConfirmingBroker:
 Set it per config (`TradewindConfig.permission_broker`) or per session
 (`SessionOptions.permission_broker`). "Ask the user" semantics live inside your broker — it may
 block as long as it needs; the turn waits. A deny produces a `PermissionRequested` event and an
-error tool-result the model sees. **With no broker configured, all caller-registered tools are
+error tool-result the model sees.
+
+Beyond the strings, `decide()` may return a rich denial:
+
+```python
+from tradewind.domain.models import Denial
+
+async def decide(self, tool_name, tool_input):
+    if tool_name.startswith("payments_"):
+        return Denial(reason="payment tools are disabled in this session")   # the model READS this
+    if tool_name == "rm_rf":
+        return Denial(reason="absolutely not", terminate=True)               # ends the turn
+    return "allow"
+```
+
+The reason reaches the model on `langchain` and `claude` (`supports_deny_reason`); on `codex`
+it is recorded in the event stream and mirror only (the approval protocol has no reason
+channel — verified, not guessed). `terminate=True` delivers the batch's denials first, then
+ends the turn honestly: `status="completed"`, `end_reason="broker_terminated"`. **With no broker configured, all caller-registered tools are
 allowed** (you registered them, after all) — see Security defaults below for what that means on
 each backend.
 

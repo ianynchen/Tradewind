@@ -51,6 +51,7 @@ with honest capability reporting and durable, backend-neutral session history.
 - **FR-4.1** A permission broker interface MUST be consulted before tool execution wherever the backend allows interception: Claude `can_use_tool`, langchain's own tool loop, Codex approval events.
 - **FR-4.2** Where interception is impossible (Cursor: file-based hooks only), the limitation MUST be declared via capability flags and the closest static mechanism configured; Tradewind MUST NOT claim enforcement it cannot deliver.
 - **FR-4.3** When a required tool or permission is absent, the broker's `ask` path surfaces the request to the caller (which may prompt a human) rather than failing the turn outright.
+- **FR-4.4 Rich verdicts.** `decide()` MAY return, besides the `"allow"`/`"deny"` strings (unchanged forever), a `Denial(reason, terminate)`. The reason reaches the MODEL where a channel exists — langchain (the synthesized error tool_result), claude (native `PermissionResultDeny.message`) — declared via `supports_deny_reason`; codex's approval protocol has no reason channel (verified) and cursor no interception: there the reason is recorded only in `PermissionRequested.reason` and the mirror, never faked. `terminate=True` ends the turn after the batch's denials are delivered (`status="completed"`, `end_reason="broker_terminated"`; native on claude via `interrupt=True`, approximate on codex via reject-then-interrupt, documented). Known limitation: terminate is not deliverable on codex's shim-socket path (`ToolHost` has no handle to interrupt).
 
 ### FR-5 Sessions and history
 - **FR-5.1** Tradewind owns a canonical, backend-neutral transcript in its own database (SQLite default; Postgres capable). For `langchain` it is the system of record; for the three SDK backends it is a mirror and the native store remains authoritative for native resume.
@@ -77,7 +78,7 @@ with honest capability reporting and durable, backend-neutral session history.
 - **FR-7.2** Deltas are for live consumers only; the mirror stores completed items, never deltas.
 
 ### FR-8 Capability flags
-- **FR-8.1** Each backend declares machine-readable capabilities, at minimum: `supports_system_prompt`, `supports_structured_output`, `supports_interactive_permissions`, `supports_in_process_tools`, `supports_native_resume`, `supports_fork`, `supports_transcript_read`, `supports_tool_round_cap`, `supports_turn_retry`.
+- **FR-8.1** Each backend declares machine-readable capabilities, at minimum: `supports_system_prompt`, `supports_structured_output`, `supports_interactive_permissions`, `supports_in_process_tools`, `supports_native_resume`, `supports_fork`, `supports_transcript_read`, `supports_tool_round_cap`, `supports_turn_retry`, `supports_deny_reason`.
 - **FR-8.2** Known deficits (Cursor: no system prompt, no structured output, no permission callback, no tool-round cap; Codex: no in-process tools, no tool-round cap) are encoded here, not worked around silently.
 
 ### FR-9 Subagents

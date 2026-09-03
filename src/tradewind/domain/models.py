@@ -40,7 +40,9 @@ TurnStatus = Literal["completed", "interrupted", "cancelled", "failed", "in_prog
 # adding a Literal member later is backward-compatible for consumers
 # ("timeout" was added exactly this way: FR-6.6, the enforced
 # request_timeout_s deadline).
-EndReason = Literal["end_turn", "max_tokens", "max_tool_rounds", "interrupted", "timeout"]
+EndReason = Literal[
+    "end_turn", "max_tokens", "max_tool_rounds", "interrupted", "timeout", "broker_terminated"
+]
 # What stored context tradewind feeds to a turn (FR-9.3): "flat" replays
 # this session's own history; "tree" additionally folds each descendant
 # session's transcript in as one wrapped block positioned after the parent
@@ -85,6 +87,14 @@ class Capabilities(BaseModel):
     # connect/spawn retry only, and their engines retry API errors
     # internally.
     supports_turn_retry: bool
+    # Whether a broker `Denial.reason` REACHES THE MODEL here (FR-4.4):
+    # langchain writes it into the synthesized error tool_result; claude
+    # passes it natively (`PermissionResultDeny.message`). Codex's approval
+    # protocol has no reason channel (verified against the shipped SDK) and
+    # cursor has no interception at all — False there; the reason is still
+    # recorded in `PermissionRequested.reason` and the mirror everywhere a
+    # broker is consulted.
+    supports_deny_reason: bool
 
 
 class ModelCostTier(BaseModel):
@@ -208,9 +218,33 @@ class McpServerDef(BaseModel):
 Verdict = Literal["allow", "deny"]
 
 
+@dataclass(frozen=True)
+class Denial:
+    """A rich broker deny (FR-4.4). `reason` is shown to the MODEL where
+    the backend has a channel for it (`Capabilities.supports_deny_reason`)
+    and always recorded in the `PermissionRequested` event; `terminate=True`
+    ends the turn after this denial is delivered
+    (`end_reason="broker_terminated"`; approximate on codex — documented).
+    Returning the plain `"deny"` string remains exactly equivalent to
+    `Denial()` — existing brokers never need to change."""
+
+    reason: str | None = None
+    terminate: bool = False
+
+
+BrokerDecision = Verdict | Denial
+
+
+def normalize_decision(decision: BrokerDecision) -> tuple[Verdict, str | None, bool]:
+    """(verdict, reason, terminate) from either broker return form."""
+    if isinstance(decision, Denial):
+        return "deny", decision.reason, decision.terminate
+    return decision, None, False
+
+
 @runtime_checkable
 class PermissionBroker(Protocol):
-    async def decide(self, tool_name: str, tool_input: dict[str, Any]) -> Verdict:
+    async def decide(self, tool_name: str, tool_input: dict[str, Any]) -> BrokerDecision:
         """ "ask" semantics: the broker itself blocks on the human; the
         adapter just awaits the result."""
         ...

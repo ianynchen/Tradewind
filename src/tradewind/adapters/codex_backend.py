@@ -155,7 +155,7 @@ import queue
 import re
 import threading
 import time
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, ClassVar, Final, cast
 
@@ -219,6 +219,7 @@ from tradewind.domain.models import (
     TurnResult,
     Verdict,
     calculate_cost,
+    normalize_decision,
     retry_notice,
 )
 
@@ -628,7 +629,7 @@ def _decide(
     loop: asyncio.AbstractEventLoop,
     tool_name: str,
     tool_input: dict[str, object],
-) -> Verdict:
+) -> tuple[Verdict, str | None, bool]:
     """Bridge the sync `approval_handler` callback (running on `CodexClient`'s
     own reader thread) into `broker.decide()` (an `async def`) via
     `run_coroutine_threadsafe` against the loop captured before the client
@@ -638,7 +639,7 @@ def _decide(
     future = asyncio.run_coroutine_threadsafe(
         broker.decide(tool_name, cast("dict[str, Any]", tool_input)), loop
     )
-    return future.result()
+    return normalize_decision(future.result())
 
 
 def _decide_exec_or_patch(
@@ -648,15 +649,21 @@ def _decide_exec_or_patch(
     tool_name: str,
     tool_input: dict[str, object],
 ) -> JsonObject:
-    verdict = _decide(broker, loop, tool_name, tool_input)
+    verdict, reason, terminate = _decide(broker, loop, tool_name, tool_input)
     if verdict == "deny":
         out_queue.put(
             PermissionRequested(
                 tool_name=tool_name,
                 tool_input=cast("dict[str, Any]", tool_input),
                 verdict="deny",
+                # FR-4.4: codex's approval protocol has NO reason channel
+                # (supports_deny_reason=False) -- recorded here and in the
+                # mirror; the model sees only the engine's own denial.
+                reason=reason,
             )
         )
+        if terminate:
+            out_queue.put(_TerminateRequested())
         return {"decision": "reject"}
     return {"decision": "accept"}
 
@@ -697,13 +704,18 @@ def _decide_mcp_elicitation(
             )
         )
         return {"action": "decline", "content": {}}
-    verdict = _decide(broker, loop, bare_name, tool_input)
+    verdict, reason, terminate = _decide(broker, loop, bare_name, tool_input)
     if verdict == "deny":
         out_queue.put(
             PermissionRequested(
-                tool_name=bare_name, tool_input=cast("dict[str, Any]", tool_input), verdict="deny"
+                tool_name=bare_name,
+                tool_input=cast("dict[str, Any]", tool_input),
+                verdict="deny",
+                reason=reason,  # recorded only; no codex reason channel (FR-4.4)
             )
         )
+        if terminate:
+            out_queue.put(_TerminateRequested())
         return {"action": "decline", "content": {}}
     return {"action": "accept", "content": {}}
 
@@ -762,6 +774,14 @@ def _sandbox_mode_from_options(
 def _approval_policy_value_from_options(backend_options: dict[str, Any]) -> AskForApprovalValue:
     value = backend_options.get("approval_policy", _DEFAULT_APPROVAL_POLICY_VALUE.value)
     return AskForApprovalValue(value)
+
+
+@dataclass
+class _TerminateRequested:
+    """Queue payload: a broker `Denial(terminate=True)` was delivered on
+    this backend (FR-4.4). Codex has no in-protocol terminate, so `_consume`
+    approximates by interrupting the turn handle; the interrupted turn is
+    then reclassified `broker_terminated`."""
 
 
 @dataclass
@@ -934,6 +954,8 @@ class CodexBackend(Backend):
             # Same reasoning as claude (FR-6.6): engine-owned turn, no
             # honest mid-turn retry; pre-turn spawn retry only.
             supports_turn_retry=False,
+            # FR-4.4: verified -- the approval protocol has no reason channel.
+            supports_deny_reason=False,
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -1078,7 +1100,14 @@ class CodexBackend(Backend):
             worker.start()
             terminal_event_observed = False
             try:
-                async for event in self._consume(ctx.turn_id, out_queue, ctx.model_spec):
+
+                async def _request_interrupt() -> None:
+                    if handle_ref:
+                        await anyio.to_thread.run_sync(handle_ref[0].interrupt)
+
+                async for event in self._consume(
+                    ctx.turn_id, out_queue, ctx.model_spec, _request_interrupt
+                ):
                     if isinstance(event, (TurnCompleted, TurnFailed)):
                         terminal_event_observed = True
                     yield event
@@ -1123,16 +1152,28 @@ class CodexBackend(Backend):
             yield TurnFailed(turn_id=ctx.turn_id, error=str(exc))
 
     async def _consume(
-        self, turn_id: str, out_queue: queue.Queue[object], model_spec: ModelSpec
+        self,
+        turn_id: str,
+        out_queue: queue.Queue[object],
+        model_spec: ModelSpec,
+        request_interrupt: Callable[[], Awaitable[None]] | None = None,
     ) -> AsyncIterator[Event]:
         agent_messages: list[AgentMessageThreadItem] = []
         usage: ThreadTokenUsage | None = None
+        broker_terminated = False
         while True:
             item = await anyio.to_thread.run_sync(out_queue.get)
             if item is _DONE:
                 return
             if isinstance(item, PermissionRequested):
                 yield item
+                continue
+            if isinstance(item, _TerminateRequested):
+                # FR-4.4 approximate terminate: reject was already sent;
+                # interrupting the handle ends the engine's turn.
+                broker_terminated = True
+                if request_interrupt is not None:
+                    await request_interrupt()
                 continue
             if isinstance(item, _ConnectRetryNotice):
                 yield ItemCompleted(
@@ -1164,6 +1205,24 @@ class CodexBackend(Backend):
             elif isinstance(payload, TurnCompletedNotification):
                 turn = payload.turn
                 if turn.status == TurnStatus.interrupted:
+                    if broker_terminated:
+                        # FR-4.4: this interrupt was OUR terminate
+                        # approximation -- honest broker_terminated
+                        # completion, batch results already delivered.
+                        yield TurnCompleted(
+                            result=TurnResult(
+                                turn_id=turn_id,
+                                status="completed",
+                                end_reason="broker_terminated",
+                                final_text=_final_text_from_items(agent_messages),
+                                usage=_usage_dict(usage) if usage is not None else {},
+                                cost_usd=_computed_cost(
+                                    model_spec,
+                                    _usage_dict(usage) if usage is not None else {},
+                                ),
+                            )
+                        )
+                        return
                     # `Backend.run`'s contract (ports.py): an interrupted
                     # turn ends with neither `TurnCompleted` nor
                     # `TurnFailed` -- the turn runner assigns `interrupted`
