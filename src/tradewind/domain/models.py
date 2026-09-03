@@ -30,6 +30,15 @@ Kind = Literal[
     "event",
 ]
 TurnStatus = Literal["completed", "interrupted", "cancelled", "failed", "in_progress"]
+# Why a `TurnResult` ended, machine-readably (FR-6.5): `status` alone cannot
+# distinguish "model finished cleanly" from "output truncated at max_tokens"
+# from "tradewind stopped the tool loop at the caller's cap". Deliberately
+# NOT mirroring `TurnStatus`'s "cancelled": no backend distinguishes a cancel
+# from an interrupt (each SDK has exactly one abort primitive, and the turn
+# runner normalizes all of them to status "interrupted"), so a "cancelled"
+# member would be a value nothing can emit. Grows if that ever changes —
+# adding a Literal member later is backward-compatible for consumers.
+EndReason = Literal["end_turn", "max_tokens", "max_tool_rounds", "interrupted"]
 SpawnKind = Literal["fork", "subagent"]
 
 
@@ -44,6 +53,12 @@ class Capabilities(BaseModel):
     supports_native_resume: bool
     supports_fork: bool
     supports_transcript_read: bool
+    # Whether the adapter can honestly enforce `max_tool_rounds` (FR-6.5):
+    # True only where the tool loop is cappable — an in-process loop
+    # (langchain) or a native SDK cap (claude `max_turns`). Codex/Cursor run
+    # their loops inside their own engines with no cap surface; they raise
+    # `Unsupported` when a cap is requested rather than fake one with timers.
+    supports_tool_round_cap: bool
 
 
 class ModelSpec(BaseModel):
@@ -202,6 +217,13 @@ class StoredMessage(NormalizedMessage):
 class TurnResult:
     turn_id: str
     status: TurnStatus
+    # Required, no default (FR-6.5): every producer must state why the turn
+    # ended — "end_turn" (model finished cleanly), "max_tokens" (provider
+    # truncated the output), "max_tool_rounds" (the caller's cap stopped the
+    # tool loop; output is an honest partial), "interrupted" (cut off by
+    # `stop()`). A default would let truncation silently masquerade as a
+    # clean finish, the exact lie this field exists to prevent.
+    end_reason: EndReason
     final_text: str | None
     usage: dict[str, int]
     cost_usd: float | None

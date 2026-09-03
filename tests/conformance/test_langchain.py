@@ -40,7 +40,7 @@ from pydantic import ConfigDict
 from tests.conformance import matrix
 from tradewind.adapters.langchain_backend import LangchainBackend
 from tradewind.application.client import Tradewind
-from tradewind.application.config import NativeStoreConfig, StoreConfig, TradewindConfig
+from tradewind.application.config import NativeStoreConfig, TradewindConfig
 from tradewind.domain.models import ApiKeyAuth, Capabilities, ModelSpec, Profile, SessionOptions
 
 # --- fake chat models (reuse of test_langchain_adapter.py's patterns, made
@@ -178,7 +178,7 @@ def harness(tmp_path: Path) -> LangchainHarness:
     config = TradewindConfig(
         profiles={"default": profile},
         default_profile="default",
-        store=StoreConfig(sqlite_path=tmp_path / "sessions.db"),
+        store=tmp_path / "sessions.db",
     )
     return _wire_harness(Tradewind(config), profile)
 
@@ -237,7 +237,9 @@ async def test_embedding_from_plain_dict_config_runs_a_turn_without_touching_ext
             }
         },
         "default_profile": "default",
-        "store": {"sqlite_path": db_path},
+        # A plain string path (ADR-0001's collapsed union field): the host's
+        # dict stays JSON-shaped; pydantic coerces str -> Path.
+        "store": str(db_path),
     }
     config = TradewindConfig.model_validate(plain_config)
     harness = _wire_harness(Tradewind(config), config.profiles["default"])

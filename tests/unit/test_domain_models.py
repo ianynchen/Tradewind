@@ -32,6 +32,7 @@ def _capabilities_kwargs(**overrides: bool) -> dict[str, bool]:
         "supports_native_resume": True,
         "supports_fork": True,
         "supports_transcript_read": True,
+        "supports_tool_round_cap": True,
     }
     base.update(overrides)
     return base

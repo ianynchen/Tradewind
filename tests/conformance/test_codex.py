@@ -51,7 +51,7 @@ from tests.conformance import matrix
 from tradewind.adapters.codex_backend import CodexBackend
 from tradewind.application import client as _client_module
 from tradewind.application.client import Session, Tradewind
-from tradewind.application.config import NativeStoreConfig, StoreConfig, TradewindConfig
+from tradewind.application.config import NativeStoreConfig, TradewindConfig
 from tradewind.domain.errors import SessionNotFound
 from tradewind.domain.events import Event, ItemCompleted
 from tradewind.domain.models import (
@@ -145,7 +145,7 @@ class CodexHarness:
         config = TradewindConfig(
             profiles={"default": _profile()},
             default_profile="default",
-            store=StoreConfig(sqlite_path=tmp_path / "sessions.db"),
+            store=tmp_path / "sessions.db",
             on_event=self._on_event,
         )
         self.tradewind: Tradewind = _ScriptedTradewind(config, self)

@@ -73,6 +73,7 @@ from tradewind.domain.models import (
     ApiKeyAuth,
     BackendName,
     Capabilities,
+    EndReason,
     ModelSpec,
     NormalizedMessage,
     Profile,
@@ -249,6 +250,14 @@ def _final_text(message: AIMessage) -> str | None:
     return joined if joined else None
 
 
+def _stop_reason(message: AIMessage) -> str | None:
+    """The provider's own stop reason off a gathered response
+    (`response_metadata["stop_reason"]` -- langchain-anthropic sets it on
+    the final streamed chunk; None when the provider reported none)."""
+    value = message.response_metadata.get("stop_reason")
+    return value if isinstance(value, str) else None
+
+
 def _bind_tools(chat_model: BaseChatModel, schemas: list[dict[str, object]]) -> BaseChatModel:
     """Bind `schemas` (Anthropic-format tool dicts, `ToolHost.schemas()`'s
     own output) to `chat_model`, or return it unchanged when there are none.
@@ -307,6 +316,10 @@ class LangchainBackend(Backend):
             supports_native_resume=False,
             supports_fork=False,
             supports_transcript_read=False,
+            # The tool loop is this adapter's own (`_run_turn`), so the cap
+            # is enforced exactly: `ctx.max_tool_rounds` executed rounds,
+            # then an honest `end_reason="max_tool_rounds"` completion.
+            supports_tool_round_cap=True,
         )
 
     async def probe_native(
@@ -374,6 +387,8 @@ class LangchainBackend(Backend):
 
             usage_totals: dict[str, int] = {}
             final_text: str | None = None
+            end_reason: EndReason = "end_turn"
+            rounds_executed = 0
 
             for _ in range(_MAX_ITERATIONS):
                 gathered: AIMessageChunk | None = None
@@ -391,9 +406,28 @@ class LangchainBackend(Backend):
                 for item in _completed_items(gathered):
                     yield ItemCompleted(message=item)
 
+                if _stop_reason(gathered) == "max_tokens":
+                    # The provider truncated this response mid-generation
+                    # (FR-6.5): any tool calls on it may themselves be
+                    # truncated, so none are executed. An honest
+                    # `max_tokens` completion, never reported as a clean
+                    # `end_turn`.
+                    final_text = _final_text(gathered)
+                    end_reason = "max_tokens"
+                    break
+
                 tool_calls = gathered.tool_calls
                 if not tool_calls:
                     final_text = _final_text(gathered)
+                    break
+
+                if ctx.max_tool_rounds is not None and rounds_executed >= ctx.max_tool_rounds:
+                    # The caller's cap stops the loop before another round
+                    # executes (FR-6.5): the requested-but-unexecuted
+                    # `tool_use` items above were already emitted/mirrored,
+                    # and the turn completes as an honest partial.
+                    final_text = _final_text(gathered)
+                    end_reason = "max_tool_rounds"
                     break
 
                 for call in tool_calls:
@@ -431,6 +465,11 @@ class LangchainBackend(Backend):
                             status="error" if is_error else "success",
                         )
                     )
+                # Not `enumerate()` (SIM113): the loop variable counts model
+                # calls, while this counts *completed tool rounds* -- every
+                # `break` above exits before the increment, so at the cap
+                # check it equals rounds actually executed, not iterations.
+                rounds_executed += 1  # noqa: SIM113
             else:
                 yield TurnFailed(
                     turn_id=ctx.turn_id,
@@ -442,6 +481,7 @@ class LangchainBackend(Backend):
                 result=TurnResult(
                     turn_id=ctx.turn_id,
                     status="completed",
+                    end_reason=end_reason,
                     final_text=final_text,
                     usage=usage_totals,
                     cost_usd=None,

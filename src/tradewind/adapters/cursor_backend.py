@@ -423,6 +423,12 @@ class CursorBackend(Backend):
             supports_native_resume=True,
             supports_fork=False,
             supports_transcript_read=False,
+            # The agentic loop runs inside Cursor's own engine, which
+            # exposes no round/turn cap (`AgentOptions` has none) -- same
+            # honesty rule as `CodexBackend`: the flag stays False and
+            # `run()` raises `Unsupported` when `ctx.max_tool_rounds` is
+            # set (FR-6.5).
+            supports_tool_round_cap=False,
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -465,6 +471,10 @@ class CursorBackend(Backend):
             # Raised before `TurnStarted`, matching `LangchainBackend.run`'s/
             # `ClaudeBackend.run`'s own capability-mismatch handling.
             raise Unsupported("structured output not yet implemented for cursor backend")
+        if ctx.max_tool_rounds is not None:
+            # Same capability-mismatch handling (`supports_tool_round_cap`
+            # is False -- see `capabilities()`).
+            raise Unsupported("max_tool_rounds is not enforceable on the cursor backend")
         async for event in self._run_turn(ctx):
             yield event
 
@@ -530,6 +540,13 @@ class CursorBackend(Backend):
                 result=DomainTurnResult(
                     turn_id=turn_id,
                     status="completed",
+                    # `RunResult` reports only a terminal status: `finished`
+                    # means the engine's own loop reached its natural end
+                    # (truncation/expiry surface as `error`/`expired`), and
+                    # `max_tool_rounds` can never be the reason here --
+                    # `run()` raises `Unsupported` before any cap could
+                    # apply.
+                    end_reason="end_turn",
                     final_text=result.result,
                     usage=_usage_dict(result.usage) if result.usage is not None else {},
                     # `RunResult` carries no per-run dollar cost (unlike

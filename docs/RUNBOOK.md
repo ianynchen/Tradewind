@@ -212,6 +212,54 @@ library) — they are read only by the test files that need real credentials to 
   keeping two variables (`backend_prompt` vs. the caller's original `prompt`) and gating the
   fold on `is_first_turn`. Emulation logic that touches what gets sent to a backend must never
   share a variable with what gets persisted as the caller's own words.
+- **`requires-python` metadata gates downstream resolvers on the declared *range*, not the
+  interpreter actually in use.** Sextant (declares `>=3.12`, runs 3.14) could not resolve
+  tradewind at `>=3.13` even though every interpreter involved satisfied it — uv resolves for
+  the whole declared range. Confirmed the floor was pure metadata: no 3.13-only construct in
+  source, deps resolve on 3.12, and the full suite + mypy strict + ruff + import-linter pass
+  on 3.12 unchanged. Keep the floor as low as the code actually needs, and when changing it,
+  update `pyproject.toml` (`requires-python`, mypy `python_version`, ruff `target-version`),
+  `uv.lock`, README, and ARCHITECTURE §6 together.
+- **Never batch-rewrite code with a bare-substring regex.** The `StoreConfig`
+  migration's `re.sub("StoreConfig, ", ...)` also matched *inside*
+  `NativeStoreConfig, ` — producing `NativeTradewindConfig` imports and
+  `native_config: Nativeevents:` signatures across six test files. Use word
+  boundaries (`\bStoreConfig\b`) or AST-aware edits, and always run the suite
+  immediately after a mechanical rewrite (which is what caught it).
+- **`sqlite3` `":memory:"` + a single-connection store = a free ephemeral
+  `SessionStorePort`.** `SqliteSessionStore` holds one connection for its
+  lifetime, so `SqliteSessionStore(":memory:")` is a complete in-memory
+  implementation (FR-5.7/ADR-0001) — no new store class, per-instance
+  isolation guaranteed by sqlite's per-connection memory databases
+  (test-locked by `test_two_ephemeral_instances_never_share_sessions`).
+- **`__version__` in `__init__.py` drifts silently from `pyproject.toml`** —
+  it sat at 0.1.0 through two confirmed bumps because nothing checks the two
+  agree. Caught while touching the file for ADR-0001. When bumping, grep for
+  the version string repo-wide; a follow-up could assert equality in a test.
+- **Check a spec's numbering before citing a new requirement id.** FR-6.5's first draft
+  cited "FR-6.3" in fourteen code comments — but FR-6.3 already existed (native-store
+  durability); grep REQUIREMENTS.md for the id before writing it into code. Caught
+  before commit this time.
+- **A "reserved" enum member needs an emitter or a definition before it spreads to new
+  contracts.** `TurnStatus`'s `"cancelled"` has neither: no backend distinguishes cancel
+  from interrupt (each SDK has exactly one abort primitive — claude `interrupt()`,
+  codex `TurnInterruptRequest`, cursor `run.cancel()` — and the runner normalizes all of
+  them to `"interrupted"`, including cursor's own wire word "cancelled"). `EndReason`
+  (FR-6.5) therefore deliberately does NOT mirror it; user-confirmed 2026-09-02. Open
+  follow-up: decide whether `TurnStatus."cancelled"` gets defined semantics or is
+  dropped at the next breaking rev.
+- **The claude CLI reports its `max_turns` stop as an *error* result** (`subtype=
+  "error_max_turns"`, `is_error=True`, `terminal_reason="max_turns"`). Since tradewind
+  only ever sets `max_turns` from the caller's own `max_tool_rounds`, that "error" is the
+  caller's requested cap working — `_drive_client` must reclassify it as an honest
+  `max_tool_rounds` completion BEFORE the generic `is_error` → `TurnFailed` branch.
+- `tests/unit/test_store_history.py::test_history_flat_no_raw_10k_messages_under_50ms`
+  failed once under concurrent machine load (wall-clock 50ms budget) and passed on every
+  solo and full-suite re-run — a latent flake per GUIDELINES §10; not quarantined in the
+  FR-6.5 change (out of scope), flagged here for a follow-up.
+- `CHANGELOG.md` started and first version bump applied (0.1.0 → 0.2.0, user-confirmed) with
+  the 3.12-floor change — the flag in the bullet below is resolved; versioning now follows
+  GUIDELINES §11 as written. `PROJECT.md` still absent.
 - No `CHANGELOG.md`/`PROJECT.md`/version bump exist in this repo as of phase 1 close-out
   (confirmed absent since task 9, unchanged through task 16) — GUIDELINES §5/§11 name them as
   house conventions; flagged again here in case phase 2 wants them started, matching the

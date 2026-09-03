@@ -283,6 +283,14 @@ class TurnContext:
     tools: ToolHost
     broker: PermissionBroker
     load_history: Callable[[], list[StoredMessage]]
+    # Per-call cap on tool-execution rounds (FR-6.5): None means uncapped
+    # (today's behavior). A backend whose
+    # `capabilities().supports_tool_round_cap` is False raises `Unsupported`
+    # when this is set — same capability-mismatch handling as
+    # `output_schema`. A capped turn that hits the cap ends with
+    # `TurnCompleted` carrying `end_reason="max_tool_rounds"`, an honest
+    # partial — never `failed`, never a fake clean finish.
+    max_tool_rounds: int | None = None
 
 
 class Backend(ABC):

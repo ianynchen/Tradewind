@@ -5,7 +5,7 @@ sub-models, and `Session`. This module sits outside the import-linter
 `layers` contract (which only covers `tradewind.adapters` /
 `tradewind.application` / `tradewind.domain`), so — unlike
 `tradewind.application.client` — it may import the adapters that back
-`StoreConfig.sqlite_path` and each `Profile.backend` and, exactly once at
+a path-valued `TradewindConfig.store` and each `Profile.backend` and, exactly once at
 import time, assign the application layer's private factory seams
 (`client._set_default_store_factory`, `client._set_backend_factories`) to
 build them (see `tradewind.application.client` module docstring for the
@@ -24,7 +24,6 @@ from tradewind.application.client import Session, Tradewind
 from tradewind.application.config import (
     EventHook,
     NativeStoreConfig,
-    StoreConfig,
     ToolHostConfig,
     TradewindConfig,
     TurnDefaults,
@@ -32,7 +31,7 @@ from tradewind.application.config import (
 from tradewind.application.ports import Backend, SessionStorePort
 from tradewind.domain.models import Profile
 
-__version__ = "0.1.0"
+__version__ = "0.4.0"
 
 
 def _build_default_store(path: Path) -> SessionStorePort:
@@ -69,7 +68,6 @@ __all__ = [
     "EventHook",
     "NativeStoreConfig",
     "Session",
-    "StoreConfig",
     "ToolHostConfig",
     "Tradewind",
     "TradewindConfig",

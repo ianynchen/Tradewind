@@ -19,7 +19,7 @@ uv add "tradewind @ git+https://github.com/ianynchen/Tradewind.git"
 pip install "tradewind @ git+https://github.com/ianynchen/Tradewind.git"
 ```
 
-Requires Python ≥3.13. No PyPI release yet.
+Requires Python ≥3.12. No PyPI release yet.
 
 ## Quick start
 

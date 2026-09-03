@@ -397,3 +397,135 @@ async def test_max_iterations_exceeded_yields_turnfailed_not_turncompleted() -> 
 class _AllowAllBroker:
     async def decide(self, _tool_name: str, _tool_input: dict[str, object]) -> Verdict:
         return "allow"
+
+
+# --- end_reason (FR-6.5): status alone must not conflate a clean finish,
+# provider truncation, and the caller's tool-round cap ---
+
+
+async def test_clean_finish_completes_with_end_reason_end_turn() -> None:
+    model = _ScriptedChatModel(responses=[AIMessage(content="Done!")])
+
+    events = [event async for event in _backend(model).run(_make_ctx())]
+
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.status == "completed"
+    assert result.end_reason == "end_turn"
+
+
+async def test_max_tokens_stop_reason_completes_as_max_tokens_and_executes_no_tools() -> None:
+    """A response the provider truncated at max_tokens must not be reported
+    as a clean `end_turn` (the lie FR-6.5 exists to prevent), and any tool
+    calls on it are potentially truncated themselves -- none may execute."""
+
+    async def must_not_run(**_: object) -> str:
+        raise AssertionError("a truncated response's tool call was executed")
+
+    tool_host = ToolHost(
+        [Tool(name="t", description="d", input_schema={"type": "object"}, handler=must_not_run)],
+        [],
+        lambda ref: ref,
+    )
+    truncated = AIMessage(
+        content="partial tex",
+        tool_calls=[{"name": "t", "args": {}, "id": "call_1", "type": "tool_call"}],
+        response_metadata={"stop_reason": "max_tokens"},
+    )
+    ctx = _make_ctx(tools=tool_host, broker=_AllowAllBroker())
+
+    events = [event async for event in _backend(_ScriptedChatModel(responses=[truncated])).run(ctx)]
+
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.status == "completed"
+    assert result.end_reason == "max_tokens"
+    assert result.final_text == "partial tex"
+
+
+async def test_max_tool_rounds_cap_completes_honestly_after_the_capped_rounds() -> None:
+    """`max_tool_rounds=1` on a model that would loop forever: exactly one
+    round executes, then the turn completes as an honest partial
+    (`end_reason="max_tool_rounds"`) -- never `TurnFailed`, never a fake
+    clean finish."""
+    calls: list[object] = []
+
+    async def counting_handler(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return "again"
+
+    tool_host = ToolHost(
+        [
+            Tool(
+                name="t", description="d", input_schema={"type": "object"}, handler=counting_handler
+            )
+        ],
+        [],
+        lambda ref: ref,
+    )
+    looping = AIMessage(
+        content="",
+        tool_calls=[{"name": "t", "args": {}, "id": "call_loop", "type": "tool_call"}],
+    )
+    ctx = _make_ctx(tools=tool_host, broker=_AllowAllBroker())
+    ctx.max_tool_rounds = 1
+
+    events = [event async for event in _backend(_ScriptedChatModel(responses=[looping])).run(ctx)]
+
+    assert not any(isinstance(e, TurnFailed) for e in events)
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.status == "completed"
+    assert result.end_reason == "max_tool_rounds"
+    assert len(calls) == 1
+
+
+async def test_max_tool_rounds_zero_permits_one_model_response_and_no_tool_execution() -> None:
+    async def must_not_run(**_: object) -> str:
+        raise AssertionError("max_tool_rounds=0 must not execute any tool")
+
+    tool_host = ToolHost(
+        [Tool(name="t", description="d", input_schema={"type": "object"}, handler=must_not_run)],
+        [],
+        lambda ref: ref,
+    )
+    wants_tools = AIMessage(
+        content="",
+        tool_calls=[{"name": "t", "args": {}, "id": "call_1", "type": "tool_call"}],
+    )
+    ctx = _make_ctx(tools=tool_host, broker=_AllowAllBroker())
+    ctx.max_tool_rounds = 0
+
+    events = [
+        event async for event in _backend(_ScriptedChatModel(responses=[wants_tools])).run(ctx)
+    ]
+
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.end_reason == "max_tool_rounds"
+
+
+async def test_uncapped_turn_still_hits_the_max_iterations_backstop() -> None:
+    """No `max_tool_rounds` keeps today's behavior byte-for-byte: the
+    `_MAX_ITERATIONS` runaway guard fails the turn rather than quietly
+    completing it -- an uncapped caller never asked for a partial."""
+    looping = AIMessage(
+        content="",
+        tool_calls=[{"name": "t", "args": {}, "id": "call_loop", "type": "tool_call"}],
+    )
+
+    async def loop_handler(**_: object) -> str:
+        return "again"
+
+    tool_host = ToolHost(
+        [Tool(name="t", description="d", input_schema={"type": "object"}, handler=loop_handler)],
+        [],
+        lambda ref: ref,
+    )
+    ctx = _make_ctx(tools=tool_host, broker=_AllowAllBroker())
+
+    events = [event async for event in _backend(_ScriptedChatModel(responses=[looping])).run(ctx)]
+
+    assert not any(isinstance(e, TurnCompleted) for e in events)
+    assert any(isinstance(e, TurnFailed) for e in events)
+
+
+def test_capabilities_declare_tool_round_cap_support() -> None:
+    caps = _backend(_ScriptedChatModel(responses=[AIMessage(content="x")])).capabilities()
+    assert caps.supports_tool_round_cap is True

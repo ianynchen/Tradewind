@@ -30,15 +30,17 @@ from typing import Any, ClassVar, cast
 
 import anyio
 import pytest
+from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
-from langchain_core.messages import AIMessage
+from langchain_core.messages import AIMessage, BaseMessage
+from langchain_core.outputs import ChatResult
 from langchain_core.runnables import Runnable
-from pydantic import ConfigDict, SecretStr
+from pydantic import ConfigDict, Field, SecretStr
 
 from tradewind.adapters.langchain_backend import LangchainBackend
 from tradewind.application import client as _client
 from tradewind.application.client import Tradewind
-from tradewind.application.config import NativeStoreConfig, StoreConfig, TradewindConfig
+from tradewind.application.config import NativeStoreConfig, TradewindConfig
 from tradewind.application.ports import Backend, TurnContext
 from tradewind.application.turn_runner import (
     _emulate_system_prompt,
@@ -82,7 +84,7 @@ def _config(tmp_path: Path, profile: Profile, **kwargs: object) -> TradewindConf
     return TradewindConfig(
         profiles={"default": profile},
         default_profile="default",
-        store=StoreConfig(sqlite_path=tmp_path / "sessions.db"),
+        store=tmp_path / "sessions.db",
         **kwargs,  # type: ignore[arg-type]
     )
 
@@ -224,6 +226,7 @@ class _ScriptedBackend(Backend):
             supports_native_resume=False,
             supports_fork=False,
             supports_transcript_read=False,
+            supports_tool_round_cap=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:  # noqa: ARG002 -- Backend interface
@@ -247,7 +250,12 @@ class _ScriptedBackend(Backend):
 def _completed(text: str = "ok") -> TurnCompleted:
     return TurnCompleted(
         result=TurnResult(
-            turn_id="fake-turn", status="completed", final_text=text, usage={}, cost_usd=None
+            turn_id="fake-turn",
+            status="completed",
+            end_reason="end_turn",
+            final_text=text,
+            usage={},
+            cost_usd=None,
         )
     )
 
@@ -310,6 +318,7 @@ class _ToolCallingBackend(Backend):
             supports_native_resume=False,
             supports_fork=False,
             supports_transcript_read=False,
+            supports_tool_round_cap=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
@@ -335,6 +344,7 @@ class _ToolCallingBackend(Backend):
             result=TurnResult(
                 turn_id=ctx.turn_id,
                 status="completed",
+                end_reason="end_turn",
                 final_text=final_text,
                 usage={},
                 cost_usd=None,
@@ -402,6 +412,7 @@ class _HangingBackend(Backend):
             supports_native_resume=False,
             supports_fork=False,
             supports_transcript_read=False,
+            supports_tool_round_cap=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
@@ -521,6 +532,7 @@ class _ReconcilingBackend(Backend):
             supports_native_resume=True,
             supports_fork=False,
             supports_transcript_read=True,
+            supports_tool_round_cap=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
@@ -642,6 +654,7 @@ class _RehomingBackend(Backend):
             supports_native_resume=True,
             supports_fork=True,
             supports_transcript_read=False,
+            supports_tool_round_cap=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
@@ -797,6 +810,7 @@ class _NoSystemPromptBackend(Backend):
             supports_native_resume=False,
             supports_fork=False,
             supports_transcript_read=False,
+            supports_tool_round_cap=False,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
@@ -832,6 +846,7 @@ def test_emulate_system_prompt_is_a_noop_when_the_backend_supports_it(tmp_path: 
                 supports_native_resume=False,
                 supports_fork=False,
                 supports_transcript_read=False,
+                supports_tool_round_cap=False,
             )
 
     row = SessionRow(
@@ -1075,3 +1090,158 @@ async def test_execute_writes_rules_file_every_turn_and_always_persists_original
     # this path was never buggy, but was previously unasserted here).
     history = await tw.history(_VALID_ID)
     assert _prompt_texts(history) == ["hi one", "hi two"]
+
+
+# --- max_tool_rounds override (FR-6.5): validated per-call, threaded to
+# the backend's TurnContext, and honest end_reason on a stop-interrupted
+# turn whose backend ends with no terminal event ---
+
+
+class _CtxRecordingBackend(_ScriptedBackend):
+    """`_ScriptedBackend` that also records every `TurnContext` handed to
+    `run()`, so a test can assert what the runner actually threads
+    through the port."""
+
+    def __init__(
+        self, profile: Profile, native_config: NativeStoreConfig, events: list[Event]
+    ) -> None:
+        super().__init__(profile, native_config, events)
+        self.contexts: list[TurnContext] = []
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        self.contexts.append(ctx)
+        for event in self._events:
+            yield event
+
+
+async def test_max_tool_rounds_override_reaches_the_backend_context(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _CtxRecordingBackend(
+        profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), _completed()]
+    )
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    await session.run("hi", max_tool_rounds=2)
+    await session.run("hi again")
+
+    # Per-call means per-call: the second, uncapped run must not inherit
+    # the first call's cap.
+    assert [ctx.max_tool_rounds for ctx in fake.contexts] == [2, None]
+
+
+@pytest.mark.parametrize("bad_value", [-1, "2", 1.5, True])
+async def test_invalid_max_tool_rounds_raises_config_error_without_opening_a_turn(
+    tmp_path: Path, bad_value: object
+) -> None:
+    # `True` is the classic footgun: `bool` is an `int` subclass, but a
+    # caller passing `max_tool_rounds=True` did not mean "cap at 1".
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _CtxRecordingBackend(
+        profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), _completed()]
+    )
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    with pytest.raises(ConfigError, match="max_tool_rounds"):
+        await session.run("hi", max_tool_rounds=bad_value)
+
+    # Validation happened before `begin_turn`: no turn row exists at all,
+    # in_progress or otherwise, and the backend was never invoked.
+    assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == []
+    assert fake.contexts == []
+
+
+class _InterruptibleBackend(_ScriptedBackend):
+    """Yields `TurnStarted`, then waits until `interrupt()` fires and ends
+    its stream with NO terminal event -- exactly `Backend.run`'s documented
+    mid-turn-interrupt shape, forcing the runner's synthesized terminal
+    event path."""
+
+    def __init__(self, profile: Profile, native_config: NativeStoreConfig) -> None:
+        super().__init__(profile, native_config, [])
+        self._interrupted = anyio.Event()
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        yield TurnStarted(turn_id=ctx.turn_id)
+        await self._interrupted.wait()
+
+    async def interrupt(self, session_id: str) -> None:  # noqa: ARG002 -- Backend interface
+        self._interrupted.set()
+
+
+async def test_synthesized_interrupt_result_carries_end_reason_interrupted(
+    tmp_path: Path,
+) -> None:
+    # Sextant-facing honesty (FR-6.5): a consumer switching on
+    # `TurnResult.end_reason` alone -- without also consulting `status` --
+    # must still see the interrupt for what it is.
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _InterruptibleBackend(profile, NativeStoreConfig())
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    events: list[Event] = []
+    async for event in session.stream("hi"):
+        events.append(event)
+        if isinstance(event, TurnStarted):
+            await session.stop()
+
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert len(completed) == 1
+    assert completed[0].result.status == "interrupted"
+    assert completed[0].result.end_reason == "interrupted"
+
+
+# --- FR-5.7: no store configured -> ephemeral in-memory mirror; a
+# langchain session still gets its conversation context across turns
+# within the process (the whole point of the mirror), with nothing
+# touching disk ---
+
+
+class _RecordingChatModel(_ScriptedChatModel):
+    """`_ScriptedChatModel` plus a record of every messages list it was
+    invoked with, for asserting what context the rebuild handed it."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    calls: list[list[BaseMessage]] = Field(default_factory=list)
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: object,
+    ) -> ChatResult:
+        self.calls.append(list(messages))
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+async def test_no_store_langchain_session_keeps_context_across_turns(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _RecordingChatModel(
+        responses=[AIMessage(content="pong one"), AIMessage(content="pong two")]
+    )
+
+    def fake_langchain_factory(p: Profile, native_config: NativeStoreConfig) -> Backend:
+        return LangchainBackend(p, native_config, chat_model_factory=lambda _spec: model)
+
+    monkeypatch.setattr(_client, "_backend_factories", {"langchain": fake_langchain_factory})
+
+    # No `store=` at all (FR-5.7): the ephemeral in-memory mirror.
+    tw = Tradewind(TradewindConfig(profiles={"default": _profile()}, default_profile="default"))
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    first = await session.run("ping one")
+    second = await session.run("ping two")
+
+    assert (first.final_text, second.final_text) == ("pong one", "pong two")
+    # The second turn's request contained the first turn's full exchange --
+    # the in-memory mirror fed the rebuild exactly like a sqlite one would.
+    second_request_texts = [str(message.content) for message in model.calls[1]]
+    assert "ping one" in second_request_texts
+    assert "pong one" in second_request_texts
+    assert second_request_texts[-1] == "ping two"
