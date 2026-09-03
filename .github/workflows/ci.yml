@@ -1,0 +1,32 @@
+name: CI
+
+# Every PR must pass the build and the full check gauntlet before merge.
+# The matrix pins BOTH supported Python floors deliberately (sextant's own
+# CI lesson: a newer local version can't be allowed to hide a break on the
+# oldest supported one).
+on:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Sync dependencies (dev group)
+        run: uv sync --python ${{ matrix.python-version }}
+
+      - name: Build (wheel + sdist)
+        run: uv build
+
+      - name: Checks (format, lint, mypy, import-linter, tests)
+        run: ./scripts/check.sh
