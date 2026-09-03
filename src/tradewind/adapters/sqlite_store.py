@@ -22,8 +22,14 @@ from pathlib import Path
 from typing import cast
 
 from tradewind.application.ports import SessionStorePort
-from tradewind.domain.errors import SessionExists, SessionNotFound, TurnInProgress
+from tradewind.domain.errors import (
+    ConfigError,
+    SessionExists,
+    SessionNotFound,
+    TurnInProgress,
+)
 from tradewind.domain.models import (
+    CONTENT_SHAPE_VERSION,
     BackendName,
     Kind,
     NormalizedMessage,
@@ -32,6 +38,7 @@ from tradewind.domain.models import (
     SpawnKind,
     StoredMessage,
     TurnStatus,
+    TurnUsage,
 )
 
 _SCHEMA_SQL = """
@@ -195,6 +202,38 @@ class SqliteSessionStore(SessionStorePort):
                 self._conn.executescript(_SCHEMA_SQL)
                 self._conn.execute("PRAGMA user_version = 1")
                 self._conn.commit()
+            if version < 2:
+                # v2 (FR-5.9): the meta key-value table, recording the
+                # mirror's CONTENT-shape version (the JSON inside
+                # content_json) -- orthogonal to this TABLE-schema version.
+                self._conn.execute(
+                    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+                )
+                self._conn.execute(
+                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('content_shape_version', ?)",
+                    (str(CONTENT_SHAPE_VERSION),),
+                )
+                self._conn.execute("PRAGMA user_version = 2")
+                self._conn.commit()
+            shape_row = cast(
+                "tuple[object, ...] | None",
+                self._conn.execute(
+                    "SELECT value FROM meta WHERE key = 'content_shape_version'"
+                ).fetchone(),
+            )
+            recorded_shape = (
+                int(cast(str, shape_row[0])) if shape_row is not None else CONTENT_SHAPE_VERSION
+            )
+            if recorded_shape > CONTENT_SHAPE_VERSION:
+                # A newer tradewind wrote this store: refuse loudly rather
+                # than risk corrupting shapes this version cannot read.
+                raise ConfigError(
+                    f"store content_shape_version={recorded_shape} is newer than this "
+                    f"tradewind's supported version {CONTENT_SHAPE_VERSION}; upgrade "
+                    "tradewind before opening this store"
+                )
+            # recorded_shape < CONTENT_SHAPE_VERSION is the future
+            # shape-migration hook; empty today (v1 IS the current shapes).
 
     def _select_session_row(self, session_id: str) -> SessionRow | None:
         cur = self._conn.execute(
@@ -380,6 +419,33 @@ class SqliteSessionStore(SessionStorePort):
                 self._conn.rollback()
                 raise ValueError(f"unknown turn_id: {turn_id!r}")
             self._conn.commit()
+
+    def turn_usages(self, session_id: str) -> list[TurnUsage]:
+        with self._lock:
+            rows = cast(
+                "list[tuple[object, ...]]",
+                self._conn.execute(
+                    "SELECT turn_id, status, usage_json, cost_usd FROM turns "
+                    "WHERE session_id = ? ORDER BY seq",
+                    (session_id,),
+                ).fetchall(),
+            )
+        usages: list[TurnUsage] = []
+        for turn_id, status, usage_json, cost_usd in rows:
+            decoded = (
+                cast("dict[str, object]", json.loads(cast(str, usage_json)))
+                if usage_json is not None
+                else {}
+            )
+            usages.append(
+                TurnUsage(
+                    turn_id=cast(str, turn_id),
+                    status=cast(TurnStatus, status),
+                    usage={k: v for k, v in decoded.items() if isinstance(v, int)},
+                    cost_usd=cast("float | None", cost_usd),
+                )
+            )
+        return usages
 
     def sweep_stale_turns(self, session_id: str) -> int:
         with self._lock:

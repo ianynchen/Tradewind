@@ -38,11 +38,12 @@ def _user_version(db_path: Path) -> int:
 # --- migrate: schema lands whole, idempotent (Step 1) ---
 
 
-def test_migrate_on_fresh_file_sets_user_version_1(tmp_path: Path) -> None:
+def test_migrate_on_fresh_file_sets_current_user_version(tmp_path: Path) -> None:
     db_path = tmp_path / "sessions.db"
     store = SqliteSessionStore(db_path)
     store.migrate()
-    assert _user_version(db_path) == 1
+    # v2 (FR-5.9): the meta table records the mirror's content-shape version.
+    assert _user_version(db_path) == 2
 
 
 def test_migrate_is_idempotent(tmp_path: Path) -> None:
@@ -50,7 +51,7 @@ def test_migrate_is_idempotent(tmp_path: Path) -> None:
     store = SqliteSessionStore(db_path)
     store.migrate()
     store.migrate()  # must not raise, must not touch existing data
-    assert _user_version(db_path) == 1
+    assert _user_version(db_path) == 2
 
 
 # --- create_session: duplicate id raises SessionExists (Step 1) ---
@@ -173,3 +174,61 @@ def test_rehome_native_unknown_session_raises_session_not_found(tmp_path: Path) 
     store.migrate()
     with pytest.raises(SessionNotFound):
         store.rehome_native("does-not-exist", "codex", "native-new")
+
+
+# --- content-shape versioning (FR-5.9) ---
+
+
+def test_fresh_store_records_the_current_content_shape_version(tmp_path: Path) -> None:
+    from tradewind.domain.models import CONTENT_SHAPE_VERSION
+
+    db_path = tmp_path / "sessions.db"
+    SqliteSessionStore(db_path).migrate()
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'content_shape_version'").fetchone()
+    finally:
+        conn.close()
+    assert row is not None and int(row[0]) == CONTENT_SHAPE_VERSION
+
+
+def test_v1_store_migrates_forward_to_v2_with_meta(tmp_path: Path) -> None:
+    # Simulate a store written before FR-5.9: v1 tables, user_version 1,
+    # no meta table. migrate() must carry it forward without touching data.
+    db_path = tmp_path / "sessions.db"
+    store = SqliteSessionStore(db_path)
+    store.migrate()
+    store.create_session(_row("sess-1"))
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("DROP TABLE meta")
+        conn.execute("PRAGMA user_version = 1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    reopened = SqliteSessionStore(db_path)
+    reopened.migrate()
+
+    assert _user_version(db_path) == 2
+    assert reopened.get_session("sess-1") is not None
+
+
+def test_store_written_by_a_newer_tradewind_is_refused(tmp_path: Path) -> None:
+    # Refuse-loudly rule: a recorded shape version above this library's
+    # constant means a newer writer owns the data -- never risk corrupting
+    # shapes this version cannot read.
+    from tradewind.domain.errors import ConfigError
+
+    db_path = tmp_path / "sessions.db"
+    SqliteSessionStore(db_path).migrate()
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("UPDATE meta SET value = '99' WHERE key = 'content_shape_version'")
+        conn.commit()
+    finally:
+        conn.close()
+
+    with pytest.raises(ConfigError, match="newer"):
+        SqliteSessionStore(db_path).migrate()

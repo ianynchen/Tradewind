@@ -43,6 +43,7 @@ import anyio
 from tradewind.application.config import NativeStoreConfig, TradewindConfig
 from tradewind.application.ports import Backend, SessionStorePort
 from tradewind.application.turn_runner import TurnRunner
+from tradewind.domain.compaction import summarizer_spend
 from tradewind.domain.errors import (
     ConfigError,
     SessionNotFound,
@@ -55,6 +56,7 @@ from tradewind.domain.models import (
     Profile,
     SessionOptions,
     SessionRow,
+    SessionUsage,
     StoredMessage,
     TierName,
     TurnResult,
@@ -332,6 +334,46 @@ class Tradewind:
         )
         await anyio.to_thread.run_sync(self._store.copy_history, src_session_id, dst_row, None)
         return Session(id=dst_session_id, _client=self)
+
+    async def usage(self, session_id: str) -> SessionUsage:
+        """Roll up one session's accounting (FR-5.9): token totals and cost
+        across its turns, plus summarizer spend from `kind="compaction"`
+        records — reported separately, so the two sum to the session total
+        with no double counting (turn `cost_usd` never contains summarizer
+        spend). Flat scope: this session's own turns and records only.
+
+        `cost_usd` is None only when EVERY turn's cost is None — a
+        zero-cost session and an unknown-cost session must not look alike;
+        same rule for `summarizer_cost_usd` over the records.
+
+        Failure modes:
+            SessionNotFound: `session_id` does not exist.
+        """
+        _validate_session_id(session_id)
+        row = await anyio.to_thread.run_sync(self._store.get_session, session_id)
+        if row is None:
+            raise SessionNotFound(session_id)
+        turns = await anyio.to_thread.run_sync(self._store.turn_usages, session_id)
+        messages = await anyio.to_thread.run_sync(
+            lambda: self._store.history(session_id, include_children=False, include_raw=False)
+        )
+
+        usage_totals: dict[str, int] = {}
+        cost_total: float | None = None
+        for turn in turns:
+            for key, value in turn.usage.items():
+                usage_totals[key] = usage_totals.get(key, 0) + value
+            if turn.cost_usd is not None:
+                cost_total = (cost_total or 0.0) + turn.cost_usd
+
+        summarizer_totals, summarizer_cost = summarizer_spend(messages)
+        return SessionUsage(
+            turns=len(turns),
+            usage=usage_totals,
+            cost_usd=cost_total,
+            summarizer_usage=summarizer_totals,
+            summarizer_cost_usd=summarizer_cost,
+        )
 
     async def history(
         self, session_id: str, *, include_children: bool = False, include_raw: bool = False

@@ -55,6 +55,7 @@ from tradewind.application.turn_runner import (
 from tradewind.domain.errors import (
     CompactionFailed,
     ConfigError,
+    SessionNotFound,
     TurnInProgress,
     Unsupported,
 )
@@ -1713,3 +1714,154 @@ async def test_manual_compact_splits_a_turn_with_prefix_summary(tmp_path: Path) 
     assert summary.index("## Goal") < summary.index("prefix part")
     # Two summarizer calls happened (main + prefix): 2 turns + 2 = 4.
     assert len(model.calls) == 4
+
+
+# --- tw.usage() rollup (FR-5.9 / Phase 2a) ---
+
+
+def _um(inp: int, out: int) -> dict[str, int]:
+    return {"input_tokens": inp, "output_tokens": out, "total_tokens": inp + out}
+
+
+async def test_usage_rollup_sums_turns_and_reports_summarizer_separately(
+    tmp_path: Path,
+) -> None:
+    """The no-double-count contract: turn costs cover turn tokens only;
+    summarizer spend (tokens AND cost) lives on the compaction record and
+    is rolled up separately -- the two sum to the session total exactly
+    once."""
+    model = _RecordingChatModel(
+        responses=[
+            AIMessage(content="reply one " * 10, usage_metadata=_um(10, 10)),
+            AIMessage(content="reply two " * 10, usage_metadata=_um(20, 20)),
+            AIMessage(content=_CHECKPOINT, usage_metadata=_um(100, 7)),  # summarizer
+            AIMessage(content="reply three", usage_metadata=_um(30, 30)),
+        ]
+    )
+    tw = _langchain_tw(
+        tmp_path,
+        _meta_profile(context_window=100, with_cost=True),  # input=3.0, output=15.0 $/Mtok
+        model,
+        defaults=TurnDefaults(
+            compaction=CompactionSettings(auto=True, reserve_tokens=20, keep_recent_tokens=30)
+        ),
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("prompt one " * 9)
+    await session.run("prompt two " * 9)
+    await session.run("prompt three")  # triggers compaction
+
+    rollup = await tw.usage(_VALID_ID)
+
+    assert rollup.turns == 3
+    # Turn tokens only -- the summarizer's 100/7 never leaks into these.
+    assert rollup.usage == {"input_tokens": 60, "output_tokens": 60, "total_tokens": 120}
+    assert rollup.summarizer_usage == {"input_tokens": 100, "output_tokens": 7, "total_tokens": 107}
+    assert rollup.cost_usd == pytest.approx((60 * 3.0 + 60 * 15.0) / 1e6)
+    assert rollup.summarizer_cost_usd == pytest.approx((100 * 3.0 + 7 * 15.0) / 1e6)
+    # And the record itself carries its own cost (computed at compact time).
+    record = next(m for m in await tw.history(_VALID_ID) if m.kind == "compaction")
+    assert record.content["summarizer_cost_usd"] == pytest.approx((100 * 3.0 + 7 * 15.0) / 1e6)
+
+
+class _ScriptedRunsBackend(_ScriptedBackend):
+    """Replays a DIFFERENT event list per run() call, so one session can
+    have turns with different results."""
+
+    def __init__(
+        self, profile: Profile, native_config: NativeStoreConfig, runs: list[list[Event]]
+    ) -> None:
+        super().__init__(profile, native_config, [])
+        self._runs_events = runs
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:  # noqa: ARG002 -- Backend interface
+        for event in self._runs_events.pop(0):
+            yield event
+
+
+def _completed_with(turn_usage: dict[str, int], cost_usd: float | None) -> TurnCompleted:
+    return TurnCompleted(
+        result=TurnResult(
+            turn_id="fake-turn",
+            status="completed",
+            end_reason="end_turn",
+            final_text="ok",
+            usage=turn_usage,
+            cost_usd=cost_usd,
+        )
+    )
+
+
+async def test_usage_cost_is_none_only_when_every_turn_cost_is_none(tmp_path: Path) -> None:
+    # A zero-cost session and an unknown-cost session must not look alike.
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _ScriptedRunsBackend(
+        profile,
+        NativeStoreConfig(),
+        [
+            [TurnStarted(turn_id="t"), _completed_with({"input_tokens": 1}, None)],
+            [TurnStarted(turn_id="t"), _completed_with({"input_tokens": 2}, 0.0)],
+        ],
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("one")
+    await session.run("two")
+
+    rollup = await tw.usage(_VALID_ID)
+
+    assert rollup.usage == {"input_tokens": 3}
+    assert rollup.cost_usd == 0.0  # one known zero beats "unknown"
+
+    tw_b = Tradewind(
+        TradewindConfig(
+            profiles={"default": profile}, default_profile="default", store=tmp_path / "b.db"
+        )
+    )
+    tw_b._backends["default"] = _ScriptedRunsBackend(
+        profile,
+        NativeStoreConfig(),
+        [[TurnStarted(turn_id="t"), _completed_with({}, None)]],
+    )
+    unknown_cost_id = "44444444-4444-4444-4444-444444444444"
+    session_b = await tw_b.create(unknown_cost_id, SessionOptions())
+    await session_b.run("one")
+
+    assert (await tw_b.usage(unknown_cost_id)).cost_usd is None
+
+
+async def test_usage_unknown_session_raises(tmp_path: Path) -> None:
+    tw = Tradewind(_config(tmp_path, _profile()))
+
+    with pytest.raises(SessionNotFound):
+        await tw.usage("99999999-9999-9999-9999-999999999999")
+
+
+async def test_manual_compact_spend_lands_on_record_and_in_the_rollup(tmp_path: Path) -> None:
+    # No cost table: tokens are recorded, cost is honest None -- not zero.
+    model = _RecordingChatModel(
+        responses=[
+            AIMessage(content="reply one " * 10, usage_metadata=_um(5, 5)),
+            AIMessage(content="reply two " * 10, usage_metadata=_um(6, 6)),
+            AIMessage(content=_CHECKPOINT, usage_metadata=_um(50, 4)),  # summarizer
+        ]
+    )
+    tw = _langchain_tw(
+        tmp_path,
+        _profile(),
+        model,
+        defaults=TurnDefaults(
+            compaction=CompactionSettings(auto=False, reserve_tokens=20, keep_recent_tokens=30)
+        ),
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("prompt one " * 9)
+    await session.run("prompt two " * 9)
+    record = await session.compact()
+
+    rollup = await tw.usage(_VALID_ID)
+
+    assert record.content["summarizer_cost_usd"] is None
+    assert rollup.summarizer_usage == {"input_tokens": 50, "output_tokens": 4, "total_tokens": 54}
+    assert rollup.summarizer_cost_usd is None
+    assert rollup.cost_usd is None  # no cost table anywhere

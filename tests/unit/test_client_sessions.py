@@ -101,6 +101,9 @@ class _SpyStore(SessionStorePort):
     def finalize_turn(self, turn_id, *, status, final_text, usage, cost_usd, error):
         raise NotImplementedError
 
+    def turn_usages(self, session_id):  # noqa: ARG002 -- SessionStorePort interface
+        raise AssertionError("turn_usages should not be called")
+
     def sweep_stale_turns(self, session_id):
         raise NotImplementedError
 

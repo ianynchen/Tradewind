@@ -52,6 +52,13 @@ EndReason = Literal["end_turn", "max_tokens", "max_tool_rounds", "interrupted"]
 HistoryScope = Literal["none", "flat", "tree"]
 SpawnKind = Literal["fork", "subagent"]
 
+# Version of the per-kind `content` JSON shapes stored in the mirror
+# (FR-5.9; the v1 shape table lives in docs/components/02-session-store.md).
+# Any change to those shapes bumps this AND ships a shape migration in the
+# same commit; a store recorded at a HIGHER version than this constant is
+# refused loudly (a newer tradewind wrote it) rather than risk corruption.
+CONTENT_SHAPE_VERSION = 1
+
 
 class Capabilities(BaseModel):
     """What a backend adapter can and cannot do; adapters raise `Unsupported`
@@ -313,6 +320,38 @@ class TurnResult:
     final_text: str | None
     usage: dict[str, int]
     cost_usd: float | None
+
+
+@dataclass
+class TurnUsage:
+    """One turn's accounting row (FR-5.9 companion verb): what
+    `SessionStorePort.turn_usages()` returns, ordered by turn seq. `usage`
+    is the turn's token counts exactly as finalized (int fields only);
+    `cost_usd` is the turn's own cost — reported (claude) or computed
+    (FR-10.5), None when neither exists."""
+
+    turn_id: str
+    status: TurnStatus
+    usage: dict[str, int]
+    cost_usd: float | None
+
+
+class SessionUsage(BaseModel):
+    """`Tradewind.usage()`'s rollup for one session (flat scope).
+
+    `usage` sums each token field across the session's turns; `cost_usd`
+    sums the non-None turn costs and is None only when EVERY turn's cost
+    is None — a zero-cost session and an unknown-cost session must not
+    look alike. Summarizer spend (compaction, FR-5.8) is reported
+    SEPARATELY from `kind="compaction"` records — turns and records never
+    overlap by construction, so `cost_usd` + `summarizer_cost_usd` is the
+    session total without double counting."""
+
+    turns: int
+    usage: dict[str, int]
+    cost_usd: float | None
+    summarizer_usage: dict[str, int]
+    summarizer_cost_usd: float | None
 
 
 @dataclass

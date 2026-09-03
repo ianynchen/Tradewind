@@ -210,3 +210,24 @@ def compacted_view(messages: list[StoredMessage]) -> tuple[str | None, list[Stor
     summary = str(record.content["summary"])
     retained = [m for m in messages if m.seq >= first_kept_seq and m.kind != "compaction"]
     return summary, retained
+
+
+def summarizer_spend(messages: list[StoredMessage]) -> tuple[dict[str, int], float | None]:
+    """Sum summarizer token usage and recorded cost across a session's
+    `kind="compaction"` records (FR-5.9 rollup input). Cost is None only
+    when NO record carries one -- a known-zero and an unknown must not
+    look alike (same rule as turn costs)."""
+    totals: dict[str, int] = {}
+    cost: float | None = None
+    for message in messages:
+        if message.kind != "compaction":
+            continue
+        usage = message.content.get("summarizer_usage")
+        if isinstance(usage, dict):
+            for key, value in usage.items():
+                if isinstance(key, str) and isinstance(value, int):
+                    totals[key] = totals.get(key, 0) + value
+        recorded = message.content.get("summarizer_cost_usd")
+        if isinstance(recorded, int | float):
+            cost = (cost or 0.0) + float(recorded)
+    return totals, cost

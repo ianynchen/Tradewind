@@ -220,6 +220,11 @@ library) — they are read only by the test files that need real credentials to 
   on 3.12 unchanged. Keep the floor as low as the code actually needs, and when changing it,
   update `pyproject.toml` (`requires-python`, mypy `python_version`, ruff `target-version`),
   `uv.lock`, README, and ARCHITECTURE §6 together.
+- **When strict mypy blocks a content-dict read in the application layer, the read
+  usually belongs in the domain** — `tw.usage()`'s summarizer extraction tripped
+  `disallow_any_expr` in client.py; moving it to `domain/compaction.summarizer_spend`
+  (where record semantics live, under the domain's documented relaxation) was better
+  layering, not just a type-checker dodge.
 - **Scripted-fake compaction tests must budget a response per SUMMARIZER call, and
   `FakeMessagesListChatModel` cycles its list** — the first Phase-1 integration tests
   under-provisioned: an unexpected split-turn cut consumed a second summarizer response,
