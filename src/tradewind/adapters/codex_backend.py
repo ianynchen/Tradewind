@@ -148,12 +148,15 @@ native-fork path in a later task -- not that this adapter wires one up now
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import queue
 import re
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
+from dataclasses import dataclass
 from typing import Any, ClassVar, Final, cast
 
 import anyio
@@ -216,6 +219,7 @@ from tradewind.domain.models import (
     TurnResult,
     Verdict,
     calculate_cost,
+    retry_notice,
 )
 
 _logger = logging.getLogger(__name__)
@@ -760,8 +764,20 @@ def _approval_policy_value_from_options(backend_options: dict[str, Any]) -> AskF
     return AskForApprovalValue(value)
 
 
+@dataclass
+class _ConnectRetryNotice:
+    """Queue payload from `_drive_turn`'s worker thread: one scheduled
+    pre-turn connect retry (FR-6.6), mapped by `_consume` to the mirrored
+    `retry_notice` event item."""
+
+    attempt: int
+    max_attempts: int
+    delay_s: float
+    error: str
+
+
 def _drive_turn(
-    client: CodexClient,
+    make_client: Callable[[], CodexClient],
     session: SessionRow,
     prompt: str,
     model: str,
@@ -773,15 +789,44 @@ def _drive_turn(
     out_queue: queue.Queue[object],
     record_native_id: Callable[[str], None],
     record_handle: Callable[[TurnHandle], None],
+    retry_max: int,
+    retry_delay_s: float,
 ) -> None:
     """Runs entirely on its own `threading.Thread` (module docstring): starts
     `client`, opens/resumes the thread, starts the turn, and pumps every
     notification from `TurnHandle.stream()` onto `out_queue` until the
     stream ends (clean finish or exception) -- `_consume` (on the event
     loop) is the other half of this bridge."""
+    client = make_client()
     try:
-        client.start()
-        client.initialize()
+        # FR-6.6 pre-turn retry: start/initialize failures are provably
+        # side-effect free (the engine subprocess never took a turn). A
+        # fresh client is built per attempt -- a failed start leaves the
+        # old one unusable.
+        connect_retries = 0
+        while True:
+            try:
+                client.start()
+                client.initialize()
+                break
+            except Exception as exc:
+                if connect_retries >= retry_max:
+                    raise
+                connect_retries += 1
+                delay = retry_delay_s * 2 ** (connect_retries - 1)
+                out_queue.put(
+                    _ConnectRetryNotice(
+                        attempt=connect_retries,
+                        max_attempts=retry_max,
+                        delay_s=delay,
+                        error=str(exc),
+                    )
+                )
+                with contextlib.suppress(Exception):
+                    # a client that failed to start may have nothing to close
+                    client.close()
+                time.sleep(delay)
+                client = make_client()
         approval_policy = AskForApproval(root=approval_policy_value)
         if session.native_session_id is not None:
             resumed = client.thread_resume(
@@ -886,6 +931,9 @@ class CodexBackend(Backend):
             # interrupting), so the flag stays honest and `run()` raises
             # `Unsupported` when `ctx.max_tool_rounds` is set (FR-6.5).
             supports_tool_round_cap=False,
+            # Same reasoning as claude (FR-6.6): engine-owned turn, no
+            # honest mid-turn retry; pre-turn spawn retry only.
+            supports_turn_retry=False,
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -984,7 +1032,10 @@ class CodexBackend(Backend):
                 config_overrides=mcp_server_config_overrides(shim_def),
                 env=_codex_env(self.native_config),
             )
-            client = CodexClient(config=config, approval_handler=approval_handler)
+
+            def make_client() -> CodexClient:
+                return CodexClient(config=config, approval_handler=approval_handler)
+
             backend_options = self.profile.backend_options
             # Duck-typed marker check (module docstring, item 3a) -- see
             # `turn_runner._AllowAllBroker.is_default_allow_all`'s own
@@ -1007,7 +1058,7 @@ class CodexBackend(Backend):
             worker = threading.Thread(
                 target=_drive_turn,
                 args=(
-                    client,
+                    make_client,
                     ctx.session,
                     ctx.prompt,
                     ctx.model_spec.model,
@@ -1019,6 +1070,8 @@ class CodexBackend(Backend):
                     out_queue,
                     record_native_id,
                     record_handle,
+                    ctx.retry.max_attempts if ctx.retry is not None else 0,
+                    ctx.retry.base_delay_s if ctx.retry is not None else 0.0,
                 ),
                 daemon=True,
             )
@@ -1080,6 +1133,17 @@ class CodexBackend(Backend):
                 return
             if isinstance(item, PermissionRequested):
                 yield item
+                continue
+            if isinstance(item, _ConnectRetryNotice):
+                yield ItemCompleted(
+                    message=retry_notice(
+                        phase="connect",
+                        attempt=item.attempt,
+                        max_attempts=item.max_attempts,
+                        delay_s=item.delay_s,
+                        error=item.error,
+                    )
+                )
                 continue
             if isinstance(item, BaseException):
                 yield TurnFailed(turn_id=turn_id, error=str(item))

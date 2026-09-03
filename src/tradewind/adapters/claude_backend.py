@@ -120,6 +120,7 @@ from tradewind.domain.models import (
     Profile,
     SessionRow,
     TurnResult,
+    retry_notice,
 )
 
 _logger = logging.getLogger(__name__)
@@ -527,6 +528,10 @@ class ClaudeBackend(Backend):
             # see `_build_options` for the rounds->turns mapping and
             # `_drive_client` for the honest `max_tool_rounds` completion.
             supports_tool_round_cap=True,
+            # The engine owns the turn; re-running a started turn could
+            # duplicate tool side effects (FR-6.6): pre-turn connect retry
+            # only, and the CLI retries API errors internally.
+            supports_turn_retry=False,
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -641,7 +646,31 @@ class ClaudeBackend(Backend):
     async def _drive_client(
         self, client: ClaudeSDKClient, ctx: TurnContext, pending_events: list[Event]
     ) -> AsyncIterator[Event]:
-        await client.connect(ctx.prompt)
+        # FR-6.6 pre-turn retry: connect/spawn failures are the one class
+        # provably free of duplicated tool side effects (nothing ran yet).
+        # Any connect exception is retried (bounded by the budget) -- the
+        # same client object is reused; its subprocess never spawned.
+        connect_retries = 0
+        while True:
+            try:
+                await client.connect(ctx.prompt)
+                break
+            except Exception as exc:
+                retry_settings = ctx.retry
+                if retry_settings is None or connect_retries >= retry_settings.max_attempts:
+                    raise
+                connect_retries += 1
+                delay = retry_settings.base_delay_s * 2 ** (connect_retries - 1)
+                yield ItemCompleted(
+                    message=retry_notice(
+                        phase="connect",
+                        attempt=connect_retries,
+                        max_attempts=retry_settings.max_attempts,
+                        delay_s=delay,
+                        error=str(exc),
+                    )
+                )
+                await anyio.sleep(delay)
         async for message in client.receive_response():
             for event in pending_events:
                 yield event

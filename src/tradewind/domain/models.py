@@ -37,8 +37,10 @@ TurnStatus = Literal["completed", "interrupted", "cancelled", "failed", "in_prog
 # from an interrupt (each SDK has exactly one abort primitive, and the turn
 # runner normalizes all of them to status "interrupted"), so a "cancelled"
 # member would be a value nothing can emit. Grows if that ever changes —
-# adding a Literal member later is backward-compatible for consumers.
-EndReason = Literal["end_turn", "max_tokens", "max_tool_rounds", "interrupted"]
+# adding a Literal member later is backward-compatible for consumers
+# ("timeout" was added exactly this way: FR-6.6, the enforced
+# request_timeout_s deadline).
+EndReason = Literal["end_turn", "max_tokens", "max_tool_rounds", "interrupted", "timeout"]
 # What stored context tradewind feeds to a turn (FR-9.3): "flat" replays
 # this session's own history; "tree" additionally folds each descendant
 # session's transcript in as one wrapped block positioned after the parent
@@ -77,6 +79,12 @@ class Capabilities(BaseModel):
     # their loops inside their own engines with no cap surface; they raise
     # `Unsupported` when a cap is requested rather than fake one with timers.
     supports_tool_round_cap: bool
+    # Whether MID-TURN model-call retry is honest here (FR-6.6): True only
+    # where tradewind owns the turn loop (langchain) so a retry provably
+    # re-runs no tool. SDK backends are False — they get pre-turn
+    # connect/spawn retry only, and their engines retry API errors
+    # internally.
+    supports_turn_retry: bool
 
 
 class ModelCostTier(BaseModel):
@@ -370,3 +378,25 @@ class SessionRow:
     status: str = "active"
     native_meta: dict[str, Any] | None = None
     native_history: list[dict[str, Any]] = field(default_factory=list)
+
+
+def retry_notice(
+    *, phase: str, attempt: int, max_attempts: int, delay_s: float, error: str
+) -> NormalizedMessage:
+    """The mirrored `kind="event"` visibility item for one scheduled retry
+    (FR-6.6): every retry is visible in the event stream and the mirror,
+    with zero event-taxonomy growth (the compaction precedent). `phase` is
+    "model_call" (supports_turn_retry backends), "connect" (SDK pre-turn
+    transport retry), or "overflow_recovery"."""
+    return NormalizedMessage(
+        role="assistant",
+        kind="event",
+        content={
+            "type": "retry_scheduled",
+            "phase": phase,
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "delay_s": delay_s,
+            "error": error,
+        },
+    )

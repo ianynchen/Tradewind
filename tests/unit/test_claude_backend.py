@@ -22,7 +22,7 @@ from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import TurnContext
 from tradewind.application.tool_host import ToolHost
 from tradewind.domain.errors import Unsupported
-from tradewind.domain.events import TurnCompleted, TurnFailed
+from tradewind.domain.events import ItemCompleted, TurnCompleted, TurnFailed
 from tradewind.domain.models import (
     ModelSpec,
     Profile,
@@ -277,3 +277,67 @@ def test_capabilities_declare_tool_round_cap_support() -> None:
         ClaudeBackend(_profile(), NativeStoreConfig()).capabilities().supports_tool_round_cap
         is True
     )
+
+
+# --- FR-6.6 pre-turn connect retry ---
+
+
+def _install_flaky_connect_client(
+    monkeypatch: pytest.MonkeyPatch, messages: list[object], connect_failures: int
+) -> list[object]:
+    captured: list[object] = []
+    failures = [connect_failures]
+
+    class _FlakyConnectClient:
+        def __init__(self, options: object) -> None:
+            captured.append(options)
+
+        async def connect(self, _prompt: str) -> None:
+            if failures[0] > 0:
+                failures[0] -= 1
+                raise ConnectionError("spawn failed")
+
+        async def receive_response(self) -> Any:
+            for message in messages:
+                yield message
+
+        async def disconnect(self) -> None:
+            pass
+
+    monkeypatch.setattr(claude_backend_module, "ClaudeSDKClient", _FlakyConnectClient)
+    return captured
+
+
+def _retry_ctx(**kwargs: Any) -> TurnContext:
+    from tradewind.application.config import RetrySettings
+
+    ctx = _make_ctx(output_schema=None, **kwargs)
+    ctx.retry = RetrySettings(max_attempts=2, base_delay_s=0.001)
+    return ctx
+
+
+async def test_connect_failure_is_retried_pre_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_flaky_connect_client(monkeypatch, [_success_result()], connect_failures=1)
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_retry_ctx())]
+
+    assert any(isinstance(e, TurnCompleted) for e in events)
+    notices = [
+        e.message.content
+        for e in events
+        if isinstance(e, ItemCompleted) and e.message.content.get("type") == "retry_scheduled"
+    ]
+    assert len(notices) == 1
+    assert notices[0]["phase"] == "connect"
+
+
+async def test_connect_retry_exhaustion_fails_the_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install_flaky_connect_client(monkeypatch, [_success_result()], connect_failures=5)
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_retry_ctx())]
+
+    failed = [e for e in events if isinstance(e, TurnFailed)]
+    assert len(failed) == 1
+    assert "spawn failed" in failed[0].error

@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-03
+
+### Added
+
+- Resilience (FR-6.6): transient model-call failures retry with
+  exponential backoff on `langchain` (typed-first classification failing
+  closed; the retry unit is one model call, so completed tool executions
+  are never re-run); a context-overflow error compacts once and retries;
+  SDK backends retry the pre-turn connect/spawn step only, declared via
+  the new required `Capabilities.supports_turn_retry` flag. Every
+  scheduled retry is a mirrored `retry_scheduled` event item.
+- `TurnDefaults.request_timeout_s` is now ENFORCED on all four backends
+  (watchdog + the backend's own `interrupt()`): a turn exceeding the
+  deadline ends `status="interrupted"` with the new
+  `end_reason="timeout"`; per-call `request_timeout_s` override added.
+- Compaction trigger upgrade (FR-5.8): provider-reported token usage
+  (via `turn_usages`) beats the chars/4 estimate where fresh, with Pi's
+  staleness guard ported to seq-space; native-resume turns still issue
+  zero extra store reads.
+
+### Changed
+
+- **Breaking (Capabilities constructors):** `supports_turn_retry` is a
+  required field.
+- Hung turns that previously ran forever now end at 600 s by default
+  (the enforced timeout) — raise `request_timeout_s` if needed.
+
 ## [0.8.0] - 2026-09-03
 
 ### Added

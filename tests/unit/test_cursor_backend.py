@@ -267,3 +267,36 @@ async def test_build_custom_tools_reports_errors_via_is_error() -> None:
 
     assert result["isError"] is True
     assert "boom" in result["content"][0]["text"]
+
+
+# --- FR-6.6 pre-turn launch retry (exhaustion path; a working bridge fake
+# is out of unit scope -- P-5 keeps cursor live-unverified anyway) ---
+
+
+async def test_launch_failure_retries_then_fails_loudly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import tradewind.adapters.cursor_backend as cursor_module
+    from tradewind.application.config import RetrySettings
+
+    async def failing_launch(**_kwargs: object) -> object:
+        raise ConnectionError("bridge spawn failed")
+
+    monkeypatch.setattr(cursor_module.AsyncClient, "launch_bridge", staticmethod(failing_launch))
+    backend = CursorBackend(_profile(), NativeStoreConfig())
+    ctx = _make_ctx(output_schema=None)
+    ctx.retry = RetrySettings(max_attempts=2, base_delay_s=0.001)
+
+    events = [event async for event in backend.run(ctx)]
+
+    from tradewind.domain.events import ItemCompleted, TurnFailed
+
+    notices = [
+        e
+        for e in events
+        if isinstance(e, ItemCompleted) and e.message.content.get("type") == "retry_scheduled"
+    ]
+    assert len(notices) == 2  # both retries visible
+    failed = [e for e in events if isinstance(e, TurnFailed)]
+    assert len(failed) == 1
+    assert "bridge spawn failed" in failed[0].error

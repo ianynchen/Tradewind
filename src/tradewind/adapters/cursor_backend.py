@@ -162,6 +162,7 @@ import logging
 from collections.abc import AsyncIterator, Mapping
 from typing import Any, ClassVar, cast
 
+import anyio
 from cursor_sdk import (
     AgentOptions,
     CustomTool,
@@ -193,6 +194,7 @@ from tradewind.domain.models import (
     Profile,
     SessionRow,
     calculate_cost,
+    retry_notice,
 )
 from tradewind.domain.models import (
     TurnResult as DomainTurnResult,
@@ -446,6 +448,8 @@ class CursorBackend(Backend):
             # `run()` raises `Unsupported` when `ctx.max_tool_rounds` is
             # set (FR-6.5).
             supports_tool_round_cap=False,
+            # Same reasoning as claude/codex (FR-6.6).
+            supports_turn_retry=False,
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -498,13 +502,32 @@ class CursorBackend(Backend):
     async def _run_turn(self, ctx: TurnContext) -> AsyncIterator[Event]:
         yield TurnStarted(turn_id=ctx.turn_id)
         session_id = ctx.session.session_id
-        try:
-            client = await AsyncClient.launch_bridge(
-                workspace=ctx.session.cwd, local=_launch_local_options(self.native_config)
-            )
-        except Exception as exc:
-            yield TurnFailed(turn_id=ctx.turn_id, error=str(exc))
-            return
+        launch_retries = 0
+        while True:
+            try:
+                client = await AsyncClient.launch_bridge(
+                    workspace=ctx.session.cwd, local=_launch_local_options(self.native_config)
+                )
+                break
+            except Exception as exc:
+                # FR-6.6 pre-turn retry: bridge spawn failures are provably
+                # side-effect free (nothing ran yet).
+                retry_settings = ctx.retry
+                if retry_settings is None or launch_retries >= retry_settings.max_attempts:
+                    yield TurnFailed(turn_id=ctx.turn_id, error=str(exc))
+                    return
+                launch_retries += 1
+                delay = retry_settings.base_delay_s * 2 ** (launch_retries - 1)
+                yield ItemCompleted(
+                    message=retry_notice(
+                        phase="connect",
+                        attempt=launch_retries,
+                        max_attempts=retry_settings.max_attempts,
+                        delay_s=delay,
+                        error=str(exc),
+                    )
+                )
+                await anyio.sleep(delay)
         try:
             custom_tools = _build_custom_tools(ctx.tools)
             options = _agent_options(ctx.model_spec.model, ctx.session.cwd, custom_tools)

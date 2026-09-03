@@ -44,6 +44,7 @@ from collections.abc import AsyncIterator, Callable
 from typing import ClassVar, cast
 
 import anyio
+import httpx
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import BaseChatModel
 from langchain_core.messages import (
@@ -93,6 +94,7 @@ from tradewind.domain.models import (
     StoredMessage,
     TurnResult,
     calculate_cost,
+    retry_notice,
 )
 
 _MAX_ITERATIONS = 25
@@ -326,6 +328,36 @@ def _accumulate_usage(totals: dict[str, int], usage: UsageMetadata | None) -> No
         totals[key] = totals.get(key, 0) + cast(int, usage.get(key, 0))
 
 
+# FR-6.6 retry classification: typed-first (status codes and transport
+# error types), failing CLOSED -- an unclassified error never retries.
+# Pi's pattern lists survive only as the narrow string fallback for
+# transient classes that arrive without a status attribute.
+_RETRYABLE_STATUS = frozenset({408, 429, 500, 502, 503, 504, 529})
+_OVERFLOW_MARKERS = (
+    "prompt is too long",
+    "context length",
+    "context window",
+    "maximum context",
+    "too many tokens",
+)
+_TRANSIENT_MARKERS = ("overloaded", "connection reset", "connection error", "timed out")
+
+
+def _classify_error(exc: Exception) -> str:
+    """One of "overflow" | "retryable" | "fatal" (FR-6.6)."""
+    status = getattr(exc, "status_code", None)
+    text = str(exc).lower()
+    if (status == 400 or status is None) and any(m in text for m in _OVERFLOW_MARKERS):
+        return "overflow"
+    if isinstance(status, int):
+        return "retryable" if status in _RETRYABLE_STATUS else "fatal"
+    if isinstance(exc, ConnectionError | TimeoutError | httpx.TransportError):
+        return "retryable"
+    if any(m in text for m in _TRANSIENT_MARKERS):
+        return "retryable"
+    return "fatal"
+
+
 class LangchainBackend(Backend):
     """`Backend` for the Anthropic API via `langchain-anthropic`, running
     Tradewind's own broker-gated tool loop (component spec, DR-1)."""
@@ -363,6 +395,10 @@ class LangchainBackend(Backend):
             # is enforced exactly: `ctx.max_tool_rounds` executed rounds,
             # then an honest `end_reason="max_tool_rounds"` completion.
             supports_tool_round_cap=True,
+            # Mid-turn model-call retry is honest here (FR-6.6): the loop
+            # is tradewind's own, and the retry unit is one model call --
+            # completed tool executions are never re-run.
+            supports_turn_retry=True,
         )
 
     async def probe_native(
@@ -476,26 +512,91 @@ class LangchainBackend(Backend):
                 # summary + retained tail.
                 yield ItemCompleted(message=record)
                 history = [*history, record]
-            messages = _rebuild_messages(ctx, history)
-            messages.append(HumanMessage(content=ctx.prompt))
+            # Split base (rebuilt history) from this turn's suffix so
+            # overflow recovery (FR-6.6) can re-derive the base from a
+            # freshly compacted view WITHOUT losing in-turn messages.
+            base_messages = _rebuild_messages(ctx, history)
+            turn_suffix: list[BaseMessage] = [HumanMessage(content=ctx.prompt)]
 
             usage_totals: dict[str, int] = {}
             final_text: str | None = None
             end_reason: EndReason = "end_turn"
             rounds_executed = 0
 
+            overflow_recovered = False
             for _ in range(_MAX_ITERATIONS):
-                gathered: AIMessageChunk | None = None
-                async for chunk in bound_model.astream(messages):
-                    for block in chunk.content_blocks:
-                        delta = _delta_event(block)
-                        if delta is not None:
-                            yield delta
-                    gathered = chunk if gathered is None else gathered + chunk
-                if gathered is None:
-                    raise RuntimeError("chat model produced no response")
+                retries_used = 0
+                while True:
+                    try:
+                        gathered: AIMessageChunk | None = None
+                        async for chunk in bound_model.astream([*base_messages, *turn_suffix]):
+                            for block in chunk.content_blocks:
+                                delta = _delta_event(block)
+                                if delta is not None:
+                                    yield delta
+                            gathered = chunk if gathered is None else gathered + chunk
+                        if gathered is None:
+                            raise RuntimeError("chat model produced no response")
+                        break
+                    except Exception as exc:
+                        classification = _classify_error(exc)
+                        if classification == "overflow" and not overflow_recovered:
+                            # FR-6.6 overflow recovery, Pi §2.3: ONE
+                            # compact-then-retry per turn, distinct from the
+                            # retry budget; the error itself is the trigger,
+                            # so it needs neither ModelMeta nor auto=True. A
+                            # failed recovery compaction fails the turn with
+                            # ITS error, loudly.
+                            overflow_recovered = True
+                            keep_recent = (
+                                ctx.compaction.keep_recent_tokens
+                                if ctx.compaction is not None
+                                else 20000
+                            )
+                            try:
+                                recovery_record, _usage = await self._compact(
+                                    ctx.model_spec, history, keep_recent_tokens=keep_recent
+                                )
+                            except CompactionFailed as compaction_exc:
+                                raise CompactionFailed(
+                                    "context overflow and recovery compaction failed: "
+                                    f"{compaction_exc}"
+                                ) from exc
+                            yield ItemCompleted(message=recovery_record)
+                            yield ItemCompleted(
+                                message=retry_notice(
+                                    phase="overflow_recovery",
+                                    attempt=1,
+                                    max_attempts=1,
+                                    delay_s=0.0,
+                                    error=str(exc),
+                                )
+                            )
+                            history = [*history, recovery_record]
+                            base_messages = _rebuild_messages(ctx, history)
+                            continue
+                        retry_settings = ctx.retry
+                        if (
+                            classification == "retryable"
+                            and retry_settings is not None
+                            and retries_used < retry_settings.max_attempts
+                        ):
+                            retries_used += 1
+                            delay = retry_settings.base_delay_s * 2 ** (retries_used - 1)
+                            yield ItemCompleted(
+                                message=retry_notice(
+                                    phase="model_call",
+                                    attempt=retries_used,
+                                    max_attempts=retry_settings.max_attempts,
+                                    delay_s=delay,
+                                    error=str(exc),
+                                )
+                            )
+                            await anyio.sleep(delay)
+                            continue
+                        raise
                 _accumulate_usage(usage_totals, gathered.usage_metadata)
-                messages.append(gathered)
+                turn_suffix.append(gathered)
 
                 for item in _completed_items(gathered):
                     yield ItemCompleted(message=item)
@@ -552,7 +653,7 @@ class LangchainBackend(Backend):
                             },
                         )
                     )
-                    messages.append(
+                    turn_suffix.append(
                         ToolMessage(
                             content=content,
                             tool_call_id=cast(str, call["id"]),
@@ -563,7 +664,7 @@ class LangchainBackend(Backend):
                 # calls, while this counts *completed tool rounds* -- every
                 # `break` above exits before the increment, so at the cap
                 # check it equals rounds actually executed, not iterations.
-                rounds_executed += 1  # noqa: SIM113
+                rounds_executed += 1
             else:
                 yield TurnFailed(
                     turn_id=ctx.turn_id,
@@ -615,14 +716,34 @@ class LangchainBackend(Backend):
         meta = ctx.model_spec.meta
         if settings is None or not settings.auto or meta is None:
             return None, None
-        summary, retained = compacted_view(history)
-        feed_estimate = (
-            estimate_tokens(retained)
-            + (len(summary) // 4 if summary is not None else 0)
-            + len(ctx.prompt) // 4
-            + (len(ctx.system_prompt) // 4 if ctx.system_prompt is not None else 0)
+        overhead = len(ctx.prompt) // 4 + (
+            len(ctx.system_prompt) // 4 if ctx.system_prompt is not None else 0
         )
-        if not should_compact(feed_estimate, meta.context_window, settings.reserve_tokens):
+        # FR-5.8 trigger upgrade (Phase 2b): provider-reported tokens beat
+        # the chars/4 estimate where available -- the last turn's reported
+        # total covers everything through that turn's end; only rows AFTER
+        # it are estimated. Pi's staleness guard, ported to seq-space: a
+        # compaction record NEWER than that turn's last row means the
+        # reported number is pre-compaction -- ignore it (it would
+        # re-trigger immediately right after compacting).
+        context_tokens: int | None = None
+        if ctx.last_turn_usage is not None and ctx.last_turn_id is not None:
+            reported_total = ctx.last_turn_usage.get("total_tokens", 0)
+            last_turn_indices = [i for i, m in enumerate(history) if m.turn_id == ctx.last_turn_id]
+            if reported_total > 0 and last_turn_indices:
+                last_index = last_turn_indices[-1]
+                stale = any(m.kind == "compaction" for m in history[last_index + 1 :])
+                if not stale:
+                    trailing = [m for m in history[last_index + 1 :] if m.kind != "compaction"]
+                    context_tokens = reported_total + estimate_tokens(trailing) + overhead
+        if context_tokens is None:
+            summary, retained = compacted_view(history)
+            context_tokens = (
+                estimate_tokens(retained)
+                + (len(summary) // 4 if summary is not None else 0)
+                + overhead
+            )
+        if not should_compact(context_tokens, meta.context_window, settings.reserve_tokens):
             return None, None
         try:
             record, _usage = await self._compact(

@@ -18,7 +18,7 @@ from langchain_core.callbacks import CallbackManagerForLLMRun
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
 from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_core.outputs import ChatResult
+from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable
 from pydantic import ConfigDict, Field
 
@@ -627,3 +627,281 @@ async def test_bind_tools_not_implemented_is_fine_when_no_tools_registered() -> 
 
     result = cast(TurnCompleted, events[-1]).result
     assert result.final_text == "plain"
+
+
+# --- FR-6.6 retry: classification, backoff visibility, side-effect
+# safety, overflow recovery ---
+
+
+class _StatusError(Exception):
+    def __init__(self, status_code: int | None, message: str = "boom") -> None:
+        super().__init__(message)
+        if status_code is not None:
+            self.status_code = status_code
+
+
+def test_classification_is_typed_first_and_fails_closed() -> None:
+    from tradewind.adapters.langchain_backend import _classify_error
+
+    for status in (408, 429, 500, 502, 503, 504, 529):
+        assert _classify_error(_StatusError(status)) == "retryable"
+    for status in (400, 401, 403, 404, 413):
+        assert _classify_error(_StatusError(status)) == "fatal"
+    assert _classify_error(_StatusError(400, "prompt is too long: 250000 tokens")) == "overflow"
+    assert _classify_error(ConnectionError("reset")) == "retryable"
+    assert _classify_error(TimeoutError()) == "retryable"
+    # No status, no transient marker: FAIL CLOSED -- never retry blindly.
+    assert _classify_error(_StatusError(None, "something novel exploded")) == "fatal"
+    assert _classify_error(_StatusError(None, "Overloaded, please retry")) == "retryable"
+
+
+class _FlakyChatModel(_ScriptedChatModel):
+    """`_ScriptedChatModel` with a side script that may contain exceptions:
+    an Exception entry is RAISED by that model call instead of returned
+    (kept out of the pydantic-validated `responses` field)."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    script: list[object] = Field(default_factory=list)
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: object,
+    ) -> ChatResult:
+        del messages, stop, run_manager, kwargs
+        entry = self.script[self.i]
+        self.i = (self.i + 1) % len(self.script)
+        if isinstance(entry, Exception):
+            raise entry
+        return ChatResult(generations=[ChatGeneration(message=cast(AIMessage, entry))])
+
+
+def _retry_ctx(**kwargs: object) -> TurnContext:
+    from tradewind.application.config import RetrySettings
+
+    ctx = _make_ctx(**kwargs)  # type: ignore[arg-type]
+    ctx.retry = RetrySettings(max_attempts=2, base_delay_s=0.001)
+    return ctx
+
+
+async def test_transient_error_is_retried_and_visibly_so() -> None:
+    model = _FlakyChatModel(
+        responses=[AIMessage(content="pad")],
+        script=[_StatusError(503, "overloaded"), AIMessage(content="recovered")],
+    )
+
+    events = [event async for event in _backend(model).run(_retry_ctx())]
+
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.final_text == "recovered"
+    notices = [
+        e.message.content
+        for e in events
+        if isinstance(e, ItemCompleted) and e.message.content.get("type") == "retry_scheduled"
+    ]
+    assert len(notices) == 1
+    assert notices[0]["phase"] == "model_call"
+    assert notices[0]["attempt"] == 1
+
+
+async def test_retry_budget_exhaustion_fails_with_the_last_error() -> None:
+    model = _FlakyChatModel(
+        responses=[AIMessage(content="pad")],
+        script=[
+            _StatusError(503, "first"),
+            _StatusError(503, "second"),
+            _StatusError(503, "third and last"),
+        ],
+    )
+
+    events = [event async for event in _backend(model).run(_retry_ctx())]
+
+    failed = [e for e in events if isinstance(e, TurnFailed)]
+    assert len(failed) == 1
+    assert "third and last" in failed[0].error
+    notices = [
+        e
+        for e in events
+        if isinstance(e, ItemCompleted) and e.message.content.get("type") == "retry_scheduled"
+    ]
+    assert len(notices) == 2  # max_attempts=2 retries, then fail
+
+
+async def test_fatal_error_is_never_retried() -> None:
+    model = _FlakyChatModel(
+        responses=[AIMessage(content="pad")],
+        script=[_StatusError(401, "bad key"), AIMessage(content="unreachable")],
+    )
+
+    events = [event async for event in _backend(model).run(_retry_ctx())]
+
+    assert any(isinstance(e, TurnFailed) for e in events)
+    assert not any(
+        isinstance(e, ItemCompleted) and e.message.content.get("type") == "retry_scheduled"
+        for e in events
+    )
+
+
+async def test_retry_never_reexecutes_completed_tools() -> None:
+    """The retry unit is one MODEL CALL: a failure after a tool round
+    retries the request, never the tools (side-effect safety by
+    construction)."""
+    calls: list[object] = []
+
+    async def counting(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return "tool-ok"
+
+    tool_host = ToolHost(
+        [Tool(name="t", description="d", input_schema={"type": "object"}, handler=counting)],
+        [],
+        lambda ref: ref,
+    )
+    model = _FlakyChatModel(
+        responses=[AIMessage(content="pad")],
+        script=[
+            AIMessage(
+                content="", tool_calls=[{"name": "t", "args": {}, "id": "c1", "type": "tool_call"}]
+            ),
+            _StatusError(503, "hiccup after the tool ran"),
+            AIMessage(content="done"),
+        ],
+    )
+    ctx = _retry_ctx(tools=tool_host, broker=_AllowAllBroker())
+
+    events = [event async for event in _backend(model).run(ctx)]
+
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.final_text == "done"
+    assert len(calls) == 1  # the tool ran exactly once
+
+
+async def test_overflow_compacts_once_and_retries() -> None:
+    history = [
+        StoredMessage(
+            role="user",
+            kind="text",
+            content={"text": "old prompt " * 30},
+            seq=1,
+            session_id="11111111-1111-1111-1111-111111111111",
+            turn_id="t-old-1",
+            created_at="2026-01-01T00:00:01",
+        ),
+        StoredMessage(
+            role="assistant",
+            kind="text",
+            content={"text": "old reply " * 30},
+            seq=2,
+            session_id="11111111-1111-1111-1111-111111111111",
+            turn_id="t-old-1",
+            created_at="2026-01-01T00:00:02",
+        ),
+        StoredMessage(
+            role="user",
+            kind="text",
+            content={"text": "newer prompt " * 25},
+            seq=3,
+            session_id="11111111-1111-1111-1111-111111111111",
+            turn_id="t-old-2",
+            created_at="2026-01-01T00:00:03",
+        ),
+        StoredMessage(
+            role="assistant",
+            kind="text",
+            content={
+                "text": "short reply",
+            },
+            seq=4,
+            session_id="11111111-1111-1111-1111-111111111111",
+            turn_id="t-old-2",
+            created_at="2026-01-01T00:00:04",
+        ),
+    ]
+    model = _FlakyChatModel(
+        responses=[AIMessage(content="pad")],
+        script=[
+            _StatusError(400, "prompt is too long for this model"),
+            AIMessage(content="## Goal\ncheckpoint"),  # recovery summarizer
+            AIMessage(content="recovered after compaction"),
+        ],
+    )
+    ctx = _retry_ctx(history=history)
+    from tradewind.application.config import CompactionSettings
+
+    ctx.compaction = CompactionSettings(auto=False, reserve_tokens=20, keep_recent_tokens=40)
+
+    events = [event async for event in _backend(model).run(ctx)]
+
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.final_text == "recovered after compaction"
+    records = [e for e in events if isinstance(e, ItemCompleted) and e.message.kind == "compaction"]
+    assert len(records) == 1
+    notices = [
+        e.message.content
+        for e in events
+        if isinstance(e, ItemCompleted) and e.message.content.get("type") == "retry_scheduled"
+    ]
+    assert any(n["phase"] == "overflow_recovery" for n in notices)
+
+
+async def test_second_overflow_in_one_turn_fails() -> None:
+    history = [
+        StoredMessage(
+            role="user",
+            kind="text",
+            content={"text": "old prompt " * 30},
+            seq=1,
+            session_id="11111111-1111-1111-1111-111111111111",
+            turn_id="t-old-1",
+            created_at="2026-01-01T00:00:01",
+        ),
+        StoredMessage(
+            role="assistant",
+            kind="text",
+            content={"text": "old reply " * 30},
+            seq=2,
+            session_id="11111111-1111-1111-1111-111111111111",
+            turn_id="t-old-1",
+            created_at="2026-01-01T00:00:02",
+        ),
+        StoredMessage(
+            role="user",
+            kind="text",
+            content={"text": "newer prompt " * 25},
+            seq=3,
+            session_id="11111111-1111-1111-1111-111111111111",
+            turn_id="t-old-2",
+            created_at="2026-01-01T00:00:03",
+        ),
+        StoredMessage(
+            role="assistant",
+            kind="text",
+            content={
+                "text": "short reply",
+            },
+            seq=4,
+            session_id="11111111-1111-1111-1111-111111111111",
+            turn_id="t-old-2",
+            created_at="2026-01-01T00:00:04",
+        ),
+    ]
+    model = _FlakyChatModel(
+        responses=[AIMessage(content="pad")],
+        script=[
+            _StatusError(400, "prompt is too long"),
+            AIMessage(content="## Goal\ncheckpoint"),
+            _StatusError(400, "prompt is too long even now"),
+        ],
+    )
+    ctx = _retry_ctx(history=history)
+    from tradewind.application.config import CompactionSettings
+
+    ctx.compaction = CompactionSettings(auto=False, reserve_tokens=20, keep_recent_tokens=40)
+
+    events = [event async for event in _backend(model).run(ctx)]
+
+    failed = [e for e in events if isinstance(e, TurnFailed)]
+    assert len(failed) == 1
+    assert "too long even now" in failed[0].error

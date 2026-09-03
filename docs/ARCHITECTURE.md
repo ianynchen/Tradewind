@@ -144,9 +144,9 @@ this list.
 |---|---|---|---|
 | `TurnStarted` | Always, the first event of every turn. | yes | yes |
 | `TextDelta` | A streamed text chunk, ahead of the `ItemCompleted` it assembles into. | no (SDK hands messages over whole, not incrementally) | yes |
-| `ItemCompleted` | One normalized message (`text`/`thinking`/`tool_use`/`tool_result` — and, since FR-5.8, a `kind="compaction"` checkpoint record or a `kind="event"` compaction-failure notice) is complete and mirrored. Compaction deliberately rides THIS member rather than adding `CompactionStarted/Completed` events, so the frozen taxonomy gains zero members. | yes | yes |
+| `ItemCompleted` | One normalized message (`text`/`thinking`/`tool_use`/`tool_result` — and, since FR-5.8/FR-6.6, a `kind="compaction"` checkpoint record or a `kind="event"` notice: compaction failure or a scheduled retry (`retry_scheduled`)) is complete and mirrored. Compaction deliberately rides THIS member rather than adding `CompactionStarted/Completed` events, so the frozen taxonomy gains zero members. | yes | yes |
 | `PermissionRequested` | A tool call's broker verdict is `"deny"` — **deny-only, by design**: an `"allow"` verdict has no side effect distinct from the call itself proceeding, so it is not separately eventized. | yes | yes |
-| `TurnCompleted` | A turn finishes cleanly or is interrupted (`result.status` distinguishes the two; `result.end_reason` says *why* it ended — clean `end_turn`, provider `max_tokens` truncation, the caller's `max_tool_rounds` cap, or `interrupted` — FR-6.5). | yes | yes |
+| `TurnCompleted` | A turn finishes cleanly or is interrupted (`result.status` distinguishes the two; `result.end_reason` says *why* it ended — clean `end_turn`, provider `max_tokens` truncation, the caller's `max_tool_rounds` cap, `interrupted`, or the enforced deadline's `timeout` — FR-6.5/FR-6.6). | yes | yes |
 | `TurnFailed` | A turn ends in an unrecoverable error. | yes | yes |
 
 `ThinkingDelta` (a streamed reasoning chunk) was removed from the draft

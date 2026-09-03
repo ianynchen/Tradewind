@@ -18,6 +18,8 @@ import an adapter itself (GUIDELINES §8 "dependencies flow inward" --
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 import logging
 import uuid
@@ -258,6 +260,21 @@ def _fold_child_history(
     return merged
 
 
+def _effective_request_timeout(overrides: dict[str, object], default: float) -> float:
+    """Validate the per-call `request_timeout_s` override (FR-6.6);
+    falls back to `TurnDefaults.request_timeout_s`.
+
+    Failure modes:
+        ConfigError: the value is not a positive number (bool excluded).
+    """
+    value = overrides.get("request_timeout_s")
+    if value is None:
+        return default
+    if type(value) not in (int, float) or cast(float, value) <= 0:
+        raise ConfigError(f"request_timeout_s must be a positive number, got {value!r}")
+    return float(cast(float, value))
+
+
 def _effective_output_schema(
     snapshot: dict[str, object], overrides: dict[str, object]
 ) -> dict[str, object] | None:
@@ -436,6 +453,9 @@ class TurnRunner:
         # bad value would only fail.
         max_tool_rounds = _effective_max_tool_rounds(overrides)
         history_scope_override = _effective_history_scope(overrides)
+        request_timeout_s = _effective_request_timeout(
+            overrides, self._config.defaults.request_timeout_s
+        )
 
         turn_id = str(uuid.uuid4())
         self._interrupt_requested.discard(session_id)
@@ -448,6 +468,8 @@ class TurnRunner:
 
         terminal_status: TurnStatus | None = None
         final_text: str | None = None
+        watchdog_task: asyncio.Task[None] | None = None
+        timed_out = [False]
         usage: dict[str, object] | None = None
         cost_usd: float | None = None
         error: str | None = None
@@ -483,6 +505,20 @@ class TurnRunner:
                 if history_scope_override is not None
                 else ("flat" if feeds_mirror_context else "none")
             )
+            # FR-5.8 trigger upgrade: provider-reported usage for the
+            # compaction trigger -- fetched ONLY for mirror-rebuilding
+            # backends, so native-resume turns still cost zero extra reads.
+            last_turn_usage: dict[str, int] | None = None
+            last_turn_id: str | None = None
+            if feeds_mirror_context:
+                turn_rows = await anyio.to_thread.run_sync(self._store.turn_usages, session_id)
+                # THIS turn's own row is already open (begin_turn ran above)
+                # with empty usage -- only finished turns carry reported
+                # numbers, so in-progress rows are skipped.
+                finished = [row for row in turn_rows if row.status != "in_progress"]
+                if finished:
+                    last_turn_usage = finished[-1].usage
+                    last_turn_id = finished[-1].turn_id
             effective_system_prompt = _effective_system_prompt(session_row, overrides)
             if (
                 session_row.native_session_id is not None
@@ -592,8 +628,23 @@ class TurnRunner:
                     broker=broker,
                     load_history=load_history,
                     compaction=self._config.defaults.compaction,
+                    retry=self._config.defaults.retry,
+                    last_turn_usage=last_turn_usage,
+                    last_turn_id=last_turn_id,
                     max_tool_rounds=max_tool_rounds,
                 )
+
+                # FR-6.6 wall-clock deadline: a watchdog TASK (deliberately
+                # not a cancel scope across this generator's yields -- the
+                # 0.5.0 pitfall class) interrupts the backend at the
+                # deadline; the stream then ends without a terminal event
+                # and the synthesized terminal below reads `timed_out`.
+                async def _watchdog() -> None:
+                    await asyncio.sleep(request_timeout_s)
+                    timed_out[0] = True
+                    await backend.interrupt(session_id)
+
+                watchdog_task = asyncio.get_running_loop().create_task(_watchdog())
 
                 # `aclosing` (not a bare `async for`) so that if THIS
                 # generator (`execute()`) is itself abandoned/aclosed mid-turn
@@ -628,12 +679,16 @@ class TurnRunner:
                         self._tap(event, turn_id)
                         yield event
 
+                watchdog_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await watchdog_task
+
                 if terminal_status is None:
                     # The backend's iterator ended with neither TurnCompleted
-                    # nor TurnFailed -- per `Backend.run`'s contract, this only
-                    # happens on a mid-turn interrupt. Synthesize the terminal
-                    # event callers of run()/stream() rely on for a result.
-                    interrupted = session_id in self._interrupt_requested
+                    # nor TurnFailed -- per `Backend.run`'s contract, this
+                    # happens on a mid-turn interrupt: the caller's stop(),
+                    # or the FR-6.6 deadline watchdog.
+                    interrupted = timed_out[0] or session_id in self._interrupt_requested
                     terminal_status = "interrupted" if interrupted else "failed"
                     error = None if interrupted else "turn ended without emitting a terminal event"
                     synthesized: Event = (
@@ -641,7 +696,7 @@ class TurnRunner:
                             result=TurnResult(
                                 turn_id=turn_id,
                                 status="interrupted",
-                                end_reason="interrupted",
+                                end_reason="timeout" if timed_out[0] else "interrupted",
                                 final_text=None,
                                 usage={},
                                 cost_usd=None,
@@ -713,12 +768,16 @@ class TurnRunner:
                 error = f"turn runner: unhandled exception: {exc}"
             raise
         finally:
+            if watchdog_task is not None and not watchdog_task.done():
+                watchdog_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError), anyio.CancelScope(shield=True):
+                    await watchdog_task
             if terminal_status is None:
                 # Reached only when the caller abandoned the stream before
                 # a terminal event was produced (GeneratorExit from an
                 # early `break`/`aclose()`) -- no further `yield` is
                 # possible here, only the store write.
-                interrupted = session_id in self._interrupt_requested
+                interrupted = timed_out[0] or session_id in self._interrupt_requested
                 terminal_status = "interrupted" if interrupted else "failed"
                 error = None if interrupted else "turn ended without emitting a terminal event"
             # Shielded: this write must land even if the surrounding task is

@@ -384,6 +384,19 @@ emulates silently — an unsupported call raises `Unsupported`.
 session on `claude`/`codex`/`cursor` currently surfaces as `TurnFailed` rather than degrading
 to a mirror-replay turn.
 
+## Resilience
+
+- **Retry** (config: `TurnDefaults.retry`, default 3 attempts, 2s doubling backoff): transient
+  model-call failures (429/5xx/transport) retry automatically on `langchain` — the retry unit
+  is one model call, so completed tool executions are never re-run; a context-overflow error
+  compacts once and retries. SDK backends retry only the pre-turn connect/spawn step (their
+  engines retry API errors internally; re-running a started turn could duplicate tool side
+  effects — `supports_turn_retry` declares this honestly). Every scheduled retry is visible
+  as a `retry_scheduled` event item in the stream and the mirror.
+- **Turn timeout** (`TurnDefaults.request_timeout_s`, default 600s, per-call override): a turn
+  exceeding the deadline is interrupted via the backend's own `interrupt()` and ends
+  `status="interrupted"`, `end_reason="timeout"` — on all four backends.
+
 ## Testing your integration — no network
 
 Embedders' test suites can script whole turns without any network or credentials, through the
