@@ -7,6 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.1] - 2026-09-03
+
+### Changed
+
+- Schema migrations now run through **yoyo-migrations** over `.sql` files
+  shipped in the package (`src/tradewind/migrations/sqlite/`), replacing the
+  hand-stepped `PRAGMA user_version` ladder (ADR-0003). The ownership rule is
+  stated explicitly: **tradewind owns its schema; the host supplies only a
+  repository** (a path, later a DSN + `schema_name`) and never authors or
+  applies tradewind's DDL. Existing stores need no adoption step — every
+  statement is `IF NOT EXISTS`/`INSERT OR IGNORE`, so applying them merely
+  records bookkeeping; `PRAGMA user_version` is still written but is no
+  longer authoritative.
+- Co-embedding safety, mandatory because the failure is otherwise SILENT (a
+  shared bookkeeping table makes the second library skip its own identically
+  named migration and report success): migration ids are namespaced
+  (`0001_tradewind_schema`), the bookkeeping table is
+  `_tradewind_yoyo_migrations`, Postgres will require a `schema_name`, and
+  sharing a SQLite file with a host that also migrates it is unsupported.
+- The ephemeral in-memory store (FR-5.7) applies the same `.sql` files
+  directly through its own connection instead of via yoyo — each `:memory:`
+  connection is a private database and yoyo opens its own, so yoyo would
+  otherwise migrate a throwaway. Schema parity with a migrated file store is
+  test-pinned.
+
+### Fixed
+
+- A store whose `content_shape_version` is OLDER than this library's is now
+  refused loudly (`ConfigError`) instead of falling through silently — a
+  trap armed for the first shape bump, which would have read old shapes as
+  if they were current. The newer-than-library direction was already loud.
+
+### Added
+
+- Dependency: `yoyo-migrations==9.0.0` (binnacle's pin; adds one transitive
+  dependency, `zipp`). Confined to `tradewind.adapters` by an import-linter
+  contract.
+
 ## [0.11.0] - 2026-09-03
 
 ### Added
