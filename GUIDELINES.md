@@ -86,6 +86,10 @@ The schema contract can described in several files at once; they must never drif
 ### 5.2 Architectural Changes
 
 Architectural change should not take place silently. Always ask for approval before making an architectural change, and always record such changes as ADRs after approval. Clearly state what's replaced in the ADRs. Always apply architectural unit tests to ensure there is no authorized architectural changes. Exact architectural test framework is to be specified in ARCHITECTURE.md file.
+
+### 5.3 Documents are authoritative for intent; code is authoritative for existence
+
+§5's ordering settles what the system should do. It does not establish what is built. Before any spec, plan, or review cites a mechanism as shipped — a catalog key, a fact kind, an engine capability, a table — verify it in `src/` and record the file:line. A mechanism named only in `docs/` is a proposal until proven otherwise.
   
 ---  
   
