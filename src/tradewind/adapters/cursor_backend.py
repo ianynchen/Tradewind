@@ -174,6 +174,7 @@ from cursor_sdk import (
     SDKThinkingMessage,
     SDKToolUseMessage,
     SDKUserMessageEvent,
+    SummaryUpdate,
     TextBlock,
     TokenUsage,
     ToolUseBlock,
@@ -195,6 +196,7 @@ from tradewind.domain.models import (
     Profile,
     SessionRow,
     calculate_cost,
+    engine_compaction_record,
     resume_degraded_notice,
     retry_notice,
 )
@@ -624,6 +626,21 @@ class CursorBackend(Backend):
             if event.sdk_message is not None:
                 for message in sdk_message_items(event.sdk_message):
                     yield ItemCompleted(message=message)
+            # Cursor's compaction (FR-5.8 observability): `summary` IS its
+            # compaction mechanism -- its own persisted conversation model
+            # carries `summary`/`summary_archive(s)`/
+            # `message_count_at_last_compaction` together, and the SDK
+            # excludes these three events from the conversation delta flow,
+            # marking them operations ON the conversation rather than
+            # content within it. Only `SummaryUpdate` is recorded: it is the
+            # one carrying the text, so the `summary-started`/
+            # `summary-completed` bookends would add a second and third
+            # record of the same event. Absence is normal -- a turn that
+            # never compacts emits none of these.
+            if isinstance(event.interaction_update, SummaryUpdate):
+                yield ItemCompleted(
+                    message=engine_compaction_record(summary=event.interaction_update.summary)
+                )
         result: RunResult = await run.wait()
         if result.status == _CANCELLED_STATUS:
             # `Backend.run`'s contract (ports.py): an interrupted turn ends

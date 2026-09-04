@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-09-03
+
+### Added
+
+- Compaction observability on every backend (FR-5.8): when a backend's own
+  engine compacts its context, tradewind now records it as an ordinary
+  `ItemCompleted` with `kind="compaction"` — the same event tradewind's own
+  langchain compaction has always emitted, so one observer handler works
+  everywhere and the record is mirrored and durable. `cursor` supplies the
+  real summary text (its `summary` events ARE its compaction — verified
+  against its persisted conversation model, which carries `summary`,
+  `summary_archives` and `message_count_at_last_compaction` together);
+  `claude` supplies its `PreCompact` trigger (`auto`/`manual`), the hook
+  firing before a summary exists; `codex` supplies only its native turn id,
+  encrypting the summary itself. No `source`/`backend` field is added — a
+  caller knows which backend a session runs on — and success/failure is not
+  recorded, since no engine exposes it through its typed API.
+- README: a **Schema and migrations** section documenting that tradewind
+  owns its schema, migrates automatically at construction, and requires its
+  own SQLite file; and an **Observing compaction** section with the
+  per-backend fidelity table.
+
 ## [0.11.1] - 2026-09-03
 
 ### Changed

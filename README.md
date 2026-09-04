@@ -123,8 +123,6 @@ Key fields:
 |---|---|
 | `profiles` / `default_profile` | Backend + auth + tier→model mapping; per-session override via `SessionOptions.profile`. |
 | `store` | One union field: a `Path` (built-in sqlite store there), a caller-built `SessionStorePort` (e.g. Postgres later), or **omitted/`None` for an ephemeral in-memory store** — sessions and history work normally for the life of the instance, nothing touches disk, everything is gone at exit. SDK backends still persist natively either way; a `langchain` session's context then lives only as long as the instance. |
-
-Tradewind **owns the schema inside whatever store it is given** and migrates it at construction (ADR-0003); the host supplies the location, never the DDL. One consequence worth knowing: the SQLite file tradewind is pointed at should be tradewind's own — sharing a database that the host also migrates is unsupported.
 | `permission_broker` | Default broker consulted before tool execution. **Absent broker = all caller-registered tools allowed.** |
 | `native_stores` | `isolation_mode=True` relocates Codex/Cursor native stores (cloud hosts); default off preserves vendor-CLI interop. |
 | `defaults` | Default tier and timeouts (option layering: defaults < session options < per-call overrides). |
@@ -239,6 +237,46 @@ ModelSpec(
   on `langchain`/`codex`/`cursor` (claude's own reported cost always wins). On a
   subscription profile the figure is the **API-equivalent price** of the tokens used — a
   budgeting aid, not billed spend. Without a table it stays `None`, honestly.
+
+### Observing compaction — every backend
+
+Compaction is surfaced as an ordinary `ItemCompleted` with `kind="compaction"`, whether
+tradewind performed it (on `langchain`) or the backend's own engine did. One handler works
+everywhere, and because it is a normal mirrored item it is also durable — an observer that
+was not listening live can still find it later.
+
+```python
+from tradewind.domain.events import ItemCompleted
+
+def on_event(event) -> None:
+    if isinstance(event, ItemCompleted) and event.message.kind == "compaction":
+        print("compacted:", event.message.content.get("summary", "(no text from this engine)"))
+
+config = TradewindConfig(profiles=..., default_profile="default", on_event=on_event)
+
+# or per session, or after the fact:
+async for event in session.stream("..."): ...
+[m for m in await tw.history(sid) if m.kind == "compaction"]
+```
+
+What the record carries depends on what the engine is willing to tell us — the record never
+invents a field it does not have:
+
+| Backend | Content | Summary text? |
+|---|---|---|
+| `langchain` | `summary`, `first_kept_seq`, `tokens_before`, `summarizer_usage`, `summarizer_cost_usd` | yes — tradewind wrote it |
+| `cursor` | `summary` | yes — the engine's own text |
+| `claude` | `trigger` (`"auto"` / `"manual"`) | no — the hook fires *before* compaction |
+| `codex` | *(empty; native turn id on `native_id`)* | no — the engine encrypts its summary |
+
+There is deliberately no `source` or `backend` field: you know which backend a session runs
+on, so the record only carries what you cannot derive. Success or failure is not recorded
+either — no engine exposes it through its typed API, so tradewind does not guess.
+
+This is **observability, not recovery**: the mirror still holds every message, so a later
+REPLAY is richer than the engine's own compacted state. The record tells you the engine's
+context diverged from the mirror at that point — useful when debugging why an engine acted
+as if it had forgotten something the mirror still has.
 
 ### Why the turn ended — `end_reason`
 
@@ -365,6 +403,31 @@ full = await tw.history(sid, include_raw=True)                 # + verbatim nati
 
 Flat retrieval is one indexed query; `raw_json` (the verbatim native event payloads) is
 excluded by default and never fetched unless asked for.
+
+### Schema and migrations
+
+**Tradewind owns its schema; you supply the repository.** You give it a location — a
+SQLite path today, a DSN plus a schema name when Postgres lands — and tradewind creates
+and migrates its own tables inside it. You never author, apply, or track tradewind's DDL,
+so upgrading the library never asks you to hand-edit a schema.
+
+Migrations run automatically at `Tradewind(config)` construction, via
+[yoyo-migrations](https://ollycope.com/software/yoyo/) over `.sql` files shipped inside the
+package. They are forward-only and idempotent, so constructing repeatedly is safe.
+
+Two rules matter when embedding:
+
+- **Give tradewind its own SQLite file.** Pointing it at a database your application also
+  migrates is unsupported. Tradewind namespaces its migration ids (`0001_tradewind_*`) and
+  its bookkeeping table (`_tradewind_yoyo_migrations`) precisely so a co-embedded library
+  cannot collide with it — but SQLite has no schemas, so a shared file has no isolation
+  boundary left to rely on. (Embedding tradewind alongside another yoyo-using library in
+  *separate* databases is fine, and on Postgres it will be isolated by schema.)
+- **A store written by a newer tradewind is refused**, loudly, rather than opened and
+  possibly corrupted. Both directions of the content-shape version are checked.
+
+The ephemeral in-memory store needs none of this — it is created at the current schema and
+discarded at exit.
 
 ## Backend notes
 

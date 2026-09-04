@@ -168,6 +168,7 @@ from openai_codex.generated.v2_all import (
     AskForApproval,
     AskForApprovalValue,
     CommandExecutionThreadItem,
+    ContextCompactedNotification,
     DynamicToolCallStatus,
     DynamicToolCallThreadItem,
     FileChangeThreadItem,
@@ -220,6 +221,7 @@ from tradewind.domain.models import (
     TurnResult,
     Verdict,
     calculate_cost,
+    engine_compaction_record,
     normalize_decision,
     resume_degraded_notice,
     retry_notice,
@@ -1295,6 +1297,14 @@ class CodexBackend(Backend):
                     yield permission_event
                 for message in thread_item_to_messages(payload.item):
                     yield ItemCompleted(message=message)
+            elif isinstance(payload, ContextCompactedNotification):
+                # The engine compacted its OWN context (FR-5.8
+                # observability). Codex encrypts the summary
+                # (`CompactionResponseItem.encrypted_content`), so the
+                # record carries no text -- only the native turn id, on the
+                # field that exists for exactly that, so the compaction can
+                # be cross-referenced against the native transcript.
+                yield ItemCompleted(message=engine_compaction_record(native_id=payload.turn_id))
             elif isinstance(payload, ThreadTokenUsageUpdatedNotification):
                 usage = payload.token_usage
             elif isinstance(payload, TurnCompletedNotification):

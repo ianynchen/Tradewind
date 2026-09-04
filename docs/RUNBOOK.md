@@ -394,3 +394,24 @@ library) — they are read only by the test files that need real credentials to 
   default datetime adapter (its own `backends/base.py`). Cosmetic today and
   harmless on the supported 3.12/3.13 floors, but it is a removal candidate in
   a future Python — revisit if the floor rises.
+- **A vendored JS bundle can settle a question the typed Python API cannot.**
+  Cursor's `SummaryStartedUpdate`/`SummaryUpdate`/`SummaryCompletedUpdate`
+  looked like "a summary of the work done"; the Python types say nothing either
+  way. Reading the vendored `@cursor/sdk` bundle settled it: its persisted
+  conversation model carries `summary`, `summary_archive(s)`,
+  `self_summary_count` and `message_count_at_last_compaction` in ONE message,
+  and the SDK filters these three events out of the conversation delta flow --
+  so summary IS cursor's compaction. When a wrapper SDK is too thin to answer a
+  semantic question, the bundled implementation underneath usually can.
+- **A thin wrapper SDK can silently drop wire fields.** Cursor's
+  `summary-completed` carries `hookMessage` and `failed` on the wire, but the
+  Python parser builds `SummaryCompletedUpdate(type=...)` and discards the
+  payload -- so compaction success/failure is unreachable without going behind
+  the SDK. Check the wire form before promising a field to callers.
+- **Ask what the observer cannot derive.** The first design for the engine
+  compaction record carried `source` ("tradewind"/"engine") and `backend`.
+  Both restate what the caller already holds: with `session.stream()` you know
+  the session, with `tw.history(session_id)` you queried by it, so the profile
+  and backend follow. Dropping them also kept the langchain record's shape
+  byte-identical, so `CONTENT_SHAPE_VERSION` needed no bump and no shape
+  migration -- a field you do not add is a migration you do not write.
