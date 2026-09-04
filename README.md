@@ -45,7 +45,7 @@ config = TradewindConfig.model_validate(
 )
 
 async def main() -> None:
-    tw = Tradewind(config)          # opens/migrates the store; no network
+    tw = Tradewind(config)          # opens/migrates the store (tradewind owns its schema); no network
     session_id = str(uuid.uuid4())  # the CALLER mints session ids (UUIDv7 recommended)
     session = await tw.ensure(session_id, SessionOptions(system_prompt="Be concise."))
     result = await session.run("What's 2+2?")
@@ -123,6 +123,8 @@ Key fields:
 |---|---|
 | `profiles` / `default_profile` | Backend + auth + tier→model mapping; per-session override via `SessionOptions.profile`. |
 | `store` | One union field: a `Path` (built-in sqlite store there), a caller-built `SessionStorePort` (e.g. Postgres later), or **omitted/`None` for an ephemeral in-memory store** — sessions and history work normally for the life of the instance, nothing touches disk, everything is gone at exit. SDK backends still persist natively either way; a `langchain` session's context then lives only as long as the instance. |
+
+Tradewind **owns the schema inside whatever store it is given** and migrates it at construction (ADR-0003); the host supplies the location, never the DDL. One consequence worth knowing: the SQLite file tradewind is pointed at should be tradewind's own — sharing a database that the host also migrates is unsupported.
 | `permission_broker` | Default broker consulted before tool execution. **Absent broker = all caller-registered tools allowed.** |
 | `native_stores` | `isolation_mode=True` relocates Codex/Cursor native stores (cloud hosts); default off preserves vendor-CLI interop. |
 | `defaults` | Default tier and timeouts (option layering: defaults < session options < per-call overrides). |

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tradewind"
-version = "0.11.0"
+version = "0.11.1"
 description = "Agent infrastructure and policy execution engine"
 requires-python = ">=3.12"
 dependencies = [
@@ -16,6 +16,7 @@ dependencies = [
     "claude-agent-sdk==0.2.151",
     "openai-codex==0.147.0",
     "cursor-sdk==1.0.30",
+    "yoyo-migrations==9.0.0",
 ]
 
 [dependency-groups]
@@ -84,6 +85,13 @@ disallow_any_expr = false
 module = "tradewind.application.config"
 disallow_any_explicit = false
 disallow_any_expr = false
+
+[[tool.mypy.overrides]]
+# yoyo-migrations ships no py.typed marker / stubs (house precedent shared
+# with binnacle, which carries the identical override). Narrowly scoped to
+# the third-party module; `sqlite_store` itself stays fully typed.
+module = "yoyo.*"
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 # `turn_runner` gained its first direct reads of `StoredMessage.content`
@@ -310,7 +318,17 @@ name = "layers"
 type = "layers"
 layers = ["tradewind.adapters", "tradewind.application", "tradewind.domain"]
 [[tool.importlinter.contracts]]
+# Schema migration is a STORE-ADAPTER concern (spec 2026-09-03): tradewind
+# owns its schema, but only the adapter that implements a dialect knows how
+# to apply it. Neither the domain nor the application layer may reach for
+# the migration runner.
+name = "migrations are an adapter concern"
+type = "forbidden"
+source_modules = ["tradewind.domain", "tradewind.application"]
+forbidden_modules = ["yoyo"]
+
+[[tool.importlinter.contracts]]
 name = "domain is pure"
 type = "forbidden"
 source_modules = ["tradewind.domain"]
-forbidden_modules = ["sqlite3", "langchain_anthropic", "claude_agent_sdk", "openai_codex", "cursor_sdk"]
+forbidden_modules = ["sqlite3", "yoyo", "langchain_anthropic", "claude_agent_sdk", "openai_codex", "cursor_sdk"]

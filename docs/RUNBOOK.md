@@ -368,3 +368,29 @@ library) — they are read only by the test files that need real credentials to 
   house conventions; flagged again here in case phase 2 wants them started, matching the
   precedent every task report through 15 already recorded rather than introducing them
   unilaterally at close-out.
+- **Each `:memory:` SQLite connection is a PRIVATE database.** Verified while
+  adopting yoyo (ADR-0003): yoyo opens its own connection, so pointing it at
+  the ephemeral store would have migrated a throwaway database while the
+  store's own connection saw nothing — a silent no-op, not an error. Any tool
+  that "connects to the database by URI" is incompatible with an in-memory
+  store held open by someone else's connection; it must be handed the
+  connection, or the work must be done directly on it.
+- **A shared migration-bookkeeping table fails SILENTLY, not loudly.** yoyo
+  keys migrations by filename-derived id, so two libraries co-embedded in one
+  service, sharing `_yoyo_migrations` and both shipping `0001_schema`, would
+  make the second one SKIP its own migration and report success — surfacing
+  much later as `no such table`. Namespace migration ids and name the
+  bookkeeping table per-library; on Postgres, scope everything to an owned
+  schema via `search_path` (only `_yoyo_migrations` is renameable — `_yoyo_log`,
+  `yoyo_lock`, `_yoyo_version` are fixed class attributes).
+- **Ownership and execution are different questions.** An early framing in
+  this repo's discussion held that the embedding service should apply
+  tradewind's migrations because tradewind is a library. That conflated *who
+  owns the schema* (tradewind) with *who runs the DDL* (also tradewind, inside
+  the repository the host grants). `binnacle` had already solved this as a
+  library; check sibling projects for precedent before designing from first
+  principles.
+- **yoyo 9.0.0 emits a `DeprecationWarning`** on Python ≥3.12 for sqlite's
+  default datetime adapter (its own `backends/base.py`). Cosmetic today and
+  harmless on the supported 3.12/3.13 floors, but it is a removal candidate in
+  a future Python — revisit if the floor rises.

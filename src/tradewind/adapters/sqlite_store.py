@@ -21,6 +21,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
 
+from yoyo import get_backend, read_migrations
+
 from tradewind.application.ports import SessionStorePort
 from tradewind.domain.errors import (
     ConfigError,
@@ -41,61 +43,20 @@ from tradewind.domain.models import (
     TurnUsage,
 )
 
-_SCHEMA_SQL = """
-CREATE TABLE IF NOT EXISTS sessions (
-  session_id            TEXT PRIMARY KEY,
-  backend                TEXT NOT NULL,
-  profile                TEXT NOT NULL,
-  native_session_id      TEXT,
-  parent_session_id      TEXT REFERENCES sessions(session_id),
-  spawn_kind             TEXT,
-  spawned_by_message_id  INTEGER,
-  title                  TEXT,
-  cwd                    TEXT,
-  model                  TEXT,
-  system_prompt          TEXT,
-  options_json           TEXT NOT NULL,
-  status                 TEXT NOT NULL DEFAULT 'active',
-  created_at             TEXT NOT NULL,
-  updated_at             TEXT NOT NULL,
-  native_meta_json       TEXT,
-  native_history_json    TEXT NOT NULL DEFAULT '[]'
-);
-CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
-CREATE INDEX IF NOT EXISTS idx_sessions_native ON sessions(backend, native_session_id);
+# The migration directory this adapter owns (spec 2026-09-03: tradewind owns
+# its schema; the host supplies only the repository). Dialect-scoped -- a
+# Postgres adapter gets `migrations/postgres/` when P-4 lands.
+_MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "migrations" / "sqlite"
 
-CREATE TABLE IF NOT EXISTS turns (
-  turn_id        TEXT PRIMARY KEY,
-  session_id     TEXT NOT NULL REFERENCES sessions(session_id),
-  native_turn_id TEXT,
-  seq            INTEGER NOT NULL,
-  status         TEXT NOT NULL,
-  final_text     TEXT,
-  usage_json     TEXT,
-  cost_usd       REAL,
-  started_at     TEXT,
-  completed_at   TEXT,
-  error_json     TEXT
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_native ON turns(session_id, native_turn_id);
+# yoyo's bookkeeping table, named explicitly rather than left at
+# `_yoyo_migrations`: defense in depth for a store file a co-embedded
+# library also migrates (unsupported, but silent if it happened -- yoyo keys
+# migrations by filename-derived id, so a shared table would make the second
+# library SKIP its own migrations and report success). Migration ids are
+# `NNNN_tradewind_*` for the same reason.
+_MIGRATION_TABLE = "_tradewind_yoyo_migrations"
 
-CREATE TABLE IF NOT EXISTS messages (
-  id               INTEGER PRIMARY KEY AUTOINCREMENT,
-  session_id       TEXT NOT NULL REFERENCES sessions(session_id),
-  turn_id          TEXT REFERENCES turns(turn_id),
-  seq              INTEGER NOT NULL,
-  role             TEXT NOT NULL,
-  kind             TEXT NOT NULL,
-  content_json     TEXT NOT NULL,
-  native_id        TEXT,
-  parent_native_id TEXT,
-  agent_path       TEXT,
-  model            TEXT,
-  created_at       TEXT,
-  raw_json         TEXT
-);
-CREATE INDEX IF NOT EXISTS idx_messages_session_seq ON messages(session_id, seq);
-"""
+_MEMORY_PATH = ":memory:"
 
 _SESSION_COLUMNS = (
     "session_id, backend, profile, native_session_id, parent_session_id, "
@@ -127,6 +88,25 @@ def _message_select_list(include_raw: bool, *, alias: str | None = None) -> str:
     columns = _MESSAGE_COLUMNS_RAW if include_raw else _MESSAGE_COLUMNS_NO_RAW
     prefix = f"{alias}." if alias is not None else ""
     return ", ".join(f"{prefix}{column}" for column in columns)
+
+
+def _apply_file_migrations(db_path: str) -> None:
+    """Apply the packaged migrations to a FILE-backed store through yoyo.
+
+    Isolated in its own function purely for typing hygiene: yoyo ships no
+    `py.typed` (pyproject's narrow `yoyo.*` override), so under
+    `disallow_any_expr` every expression that touches it is `Any`. Keeping
+    the `type: ignore[misc]`s here -- rather than relaxing the flag for the
+    whole module, as the `tool_host`/`langchain_backend` overrides do --
+    leaves the rest of this adapter, which does all the row mapping, fully
+    strict.
+    """
+    backend = get_backend(  # type: ignore[misc]
+        f"sqlite:///{db_path}", migration_table=_MIGRATION_TABLE
+    )
+    migrations = read_migrations(str(_MIGRATIONS_DIR))  # type: ignore[misc]
+    with backend.lock():  # type: ignore[misc]
+        backend.apply_migrations(backend.to_apply(migrations))  # type: ignore[misc]
 
 
 def _now_iso() -> str:
@@ -187,53 +167,87 @@ class SqliteSessionStore(SessionStorePort):
     """`SessionStorePort` backed by a single SQLite file."""
 
     def __init__(self, db_path: str | Path) -> None:
-        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        self._db_path = str(db_path)
+        # An in-memory database is PRIVATE TO ITS CONNECTION (verified:
+        # two `:memory:` connections are two separate databases), so yoyo
+        # -- which opens its own -- cannot migrate this store. See
+        # `migrate()`.
+        self._is_memory = self._db_path == _MEMORY_PATH
+        self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.execute("PRAGMA busy_timeout = 5000")
         self._lock = threading.Lock()
 
     def migrate(self) -> None:
+        """Apply this adapter's own migrations (`migrations/sqlite/`).
+
+        Tradewind owns its schema; the caller supplies only the repository
+        (this file, or `:memory:`). Idempotent.
+
+        File-backed stores go through yoyo, which records per-migration
+        bookkeeping in `_tradewind_yoyo_migrations` and takes its own lock.
+        An in-memory store applies THE SAME `.sql` files directly through
+        this connection instead: yoyo opens its own connection, and an
+        in-memory database is private to its connection, so yoyo would
+        migrate a throwaway database while this store saw nothing. That is
+        also principled -- migrations exist to evolve a *persistent* store
+        across versions, and an ephemeral database is created at the
+        current schema and destroyed. Both paths read the same files, so
+        they cannot drift.
+
+        Failure modes:
+            ConfigError: the store's `content_shape_version` (FR-5.9) is
+                not the version this tradewind writes -- newer (a later
+                tradewind wrote it) or older (no shape-migration registry
+                exists yet). Never silently proceeds: reading one shape
+                version as another corrupts the mirror's meaning.
+        """
         with self._lock:
-            cur = self._conn.execute("PRAGMA user_version")
-            version_row = cast("tuple[object, ...] | None", cur.fetchone())
-            version = cast(int, version_row[0]) if version_row is not None else 0
-            if version < 1:
-                self._conn.executescript(_SCHEMA_SQL)
-                self._conn.execute("PRAGMA user_version = 1")
+            if self._is_memory:
+                for path in self._forward_migration_files():
+                    self._conn.executescript(path.read_text(encoding="utf-8"))
                 self._conn.commit()
-            if version < 2:
-                # v2 (FR-5.9): the meta key-value table, recording the
-                # mirror's CONTENT-shape version (the JSON inside
-                # content_json) -- orthogonal to this TABLE-schema version.
-                self._conn.execute(
-                    "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-                )
-                self._conn.execute(
-                    "INSERT OR IGNORE INTO meta (key, value) VALUES ('content_shape_version', ?)",
-                    (str(CONTENT_SHAPE_VERSION),),
-                )
-                self._conn.execute("PRAGMA user_version = 2")
-                self._conn.commit()
-            shape_row = cast(
-                "tuple[object, ...] | None",
-                self._conn.execute(
-                    "SELECT value FROM meta WHERE key = 'content_shape_version'"
-                ).fetchone(),
+            else:
+                _apply_file_migrations(self._db_path)
+            self._check_content_shape_version()
+
+    @staticmethod
+    def _forward_migration_files() -> list[Path]:
+        """The forward `.sql` files in apply order (rollbacks excluded)."""
+        return sorted(
+            path
+            for path in _MIGRATIONS_DIR.glob("[0-9]*.sql")
+            if not path.name.endswith(".rollback.sql")
+        )
+
+    def _check_content_shape_version(self) -> None:
+        """Guard the OTHER version axis (FR-5.9): the JSON shapes inside
+        `messages.content_json`, which no DDL migration describes. Both
+        directions are loud -- an older store needs a shape migration that
+        does not exist yet, and pretending otherwise would read v1 shapes
+        as if they were v2."""
+        shape_row = cast(
+            "tuple[object, ...] | None",
+            self._conn.execute(
+                "SELECT value FROM meta WHERE key = 'content_shape_version'"
+            ).fetchone(),
+        )
+        if shape_row is None:
+            return
+        recorded = int(cast(str, shape_row[0]))
+        if recorded > CONTENT_SHAPE_VERSION:
+            raise ConfigError(
+                f"store content_shape_version={recorded} is newer than this "
+                f"tradewind's supported version {CONTENT_SHAPE_VERSION}; upgrade "
+                "tradewind before opening this store"
             )
-            recorded_shape = (
-                int(cast(str, shape_row[0])) if shape_row is not None else CONTENT_SHAPE_VERSION
+        if recorded < CONTENT_SHAPE_VERSION:
+            raise ConfigError(
+                f"store content_shape_version={recorded} predates this tradewind's "
+                f"version {CONTENT_SHAPE_VERSION} and no shape migration exists for it; "
+                "this store cannot be opened safely"
             )
-            if recorded_shape > CONTENT_SHAPE_VERSION:
-                # A newer tradewind wrote this store: refuse loudly rather
-                # than risk corrupting shapes this version cannot read.
-                raise ConfigError(
-                    f"store content_shape_version={recorded_shape} is newer than this "
-                    f"tradewind's supported version {CONTENT_SHAPE_VERSION}; upgrade "
-                    "tradewind before opening this store"
-                )
-            # recorded_shape < CONTENT_SHAPE_VERSION is the future
-            # shape-migration hook; empty today (v1 IS the current shapes).
 
     def _select_session_row(self, session_id: str) -> SessionRow | None:
         cur = self._conn.execute(

@@ -27,11 +27,29 @@ in-memory mirror, FR-5.7).
 |---|---|---|
 | Engine | stdlib `sqlite3`, WAL, `foreign_keys=ON`, `busy_timeout` 5 s | House pattern (waypoint 01); zero deps; embedder-friendly single file. |
 | Location | path-valued `TradewindConfig.store`, no default path; `None` selects an ephemeral in-memory database (FR-5.7) | Library rule: the host decides where data lives (NFR-5) — including nowhere. |
-| Schema versioning | `PRAGMA user_version`, forward-only migrations at open (v2 adds the `meta` key-value table) | An embedder upgrade must never strand transcripts. |
-| Content-shape versioning (FR-5.9) | `meta.content_shape_version`, checked on every `migrate()`: newer-than-library → refuse loudly (`ConfigError`); older → forward-only shape-migration hook | The JSON inside `content_json` is a contract too; Pi versions its session files for the same reason. |
+| Schema ownership | **Tradewind owns its schema; the host supplies only a repository** (a path, later a DSN + `schema_name`). The host never authors or applies tradewind's DDL. | ADR-0003. A host authoring these tables would be pinned to tradewind's internals across every upgrade. |
+| Schema versioning | yoyo-migrations over in-package `.sql` files (`src/tradewind/migrations/sqlite/`), forward-only, applied at open (ADR-0003; replaced hand-stepped `PRAGMA user_version`, which remains written but is no longer authoritative) | Per-migration bookkeeping and rollbacks; one model shared with binnacle; extends to Postgres. |
+| Content-shape versioning (FR-5.9) | `meta.content_shape_version`, checked on every `migrate()`: **both** directions refuse loudly (`ConfigError`) — newer means a later tradewind owns the data, older means no shape migration exists for it yet | The JSON inside `content_json` is a contract too; Pi versions its session files for the same reason. Reading one shape version as another corrupts meaning silently, so neither direction may fall through. |
 | Timestamps | UTC ISO-8601 text | Legible in any SQLite browser. |
 | Identifiers | caller-minted UUID text primary keys (FR-5.6, I-1a) | Idempotent creation; embedder records the id before calling. |
 | `raw_json` | stored always, returned only on `include_raw` | The payload elephant stays out of the hot path (NFR-1). |
+
+## Migration rules (ADR-0003)
+
+Isolation is mandatory, because the failure mode when it is missing is
+**silent**. yoyo creates four bookkeeping tables and only `_yoyo_migrations`
+is renameable; a service embedding both tradewind and another yoyo-using
+library (e.g. `binnacle`) would otherwise share them, and since yoyo keys
+migrations by filename-derived id, the second library to migrate would skip
+its own `0001_schema`, report success, and fail later as `no such table`.
+
+| Rule | Value |
+|---|---|
+| Migration ids namespaced | `0001_tradewind_schema`, `0002_tradewind_meta` |
+| Bookkeeping table named explicitly | `_tradewind_yoyo_migrations` |
+| Postgres (P-4) | `schema_name` REQUIRED; yoyo connects with `search_path` set to it, so all four bookkeeping tables land inside tradewind's schema |
+| SQLite | tradewind's store file is tradewind's own; sharing a database the host also migrates is UNSUPPORTED (no schemas, so no `search_path` escape hatch) |
+| `:memory:` (FR-5.7) | yoyo cannot reach it — each `:memory:` connection is a private database and yoyo opens its own. The same `.sql` files are applied directly through the store's connection, without bookkeeping: an ephemeral database has no version history to track. Schema parity with a migrated file store is test-pinned. |
 
 ## Behavior contract
 
