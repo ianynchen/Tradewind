@@ -82,6 +82,11 @@ from claude_agent_sdk import (
     ClaudeAgentOptions,
     ClaudeSDKClient,
     CLIConnectionError,
+    HookCallback,
+    HookContext,
+    HookInput,
+    HookJSONOutput,
+    HookMatcher,
     McpSdkServerConfig,
     PermissionResult,
     PermissionResultAllow,
@@ -121,6 +126,7 @@ from tradewind.domain.models import (
     Profile,
     SessionRow,
     TurnResult,
+    engine_compaction_record,
     normalize_decision,
     resume_degraded_notice,
     retry_notice,
@@ -460,6 +466,28 @@ def _build_mcp_servers(host: ToolHost) -> dict[str, McpSdkServerConfig]:
     return {_MCP_SERVER_NAME: create_sdk_mcp_server(name=_MCP_SERVER_NAME, tools=tools)}
 
 
+def _make_precompact_hook(pending_events: list[Event]) -> HookCallback:
+    """A `PreCompact` hook that records the engine's own compaction
+    (FR-5.8 observability).
+
+    The CLI fires this BEFORE compacting, so the summary does not exist
+    yet and the record carries only the trigger (`"auto"`/`"manual"`) --
+    honest about what it is: "the engine is about to compact its own
+    context". Queued on the same `pending_events` list `_make_can_use_tool`
+    uses, drained by `_drive_client` on the next message. Returns an empty
+    output: this hook observes, it never steers the CLI.
+    """
+
+    async def on_pre_compact(
+        hook_input: HookInput, _tool_use_id: str | None, _context: HookContext
+    ) -> HookJSONOutput:
+        trigger = cast("str | None", cast("dict[str, Any]", hook_input).get("trigger"))
+        pending_events.append(ItemCompleted(message=engine_compaction_record(trigger=trigger)))
+        return {}
+
+    return on_pre_compact
+
+
 def _make_can_use_tool(
     broker: PermissionBroker, pending_events: list[Event], terminate_flag: list[bool]
 ) -> CanUseTool:
@@ -620,6 +648,7 @@ class ClaudeBackend(Backend):
             tools=[],
             mcp_servers=cast("dict[str, Any]", _build_mcp_servers(ctx.tools)),
             can_use_tool=_make_can_use_tool(ctx.broker, pending_events, terminate_flag),
+            hooks={"PreCompact": [HookMatcher(hooks=[_make_precompact_hook(pending_events)])]},
             system_prompt=cast(Any, system_prompt),
             model=ctx.model_spec.model,
             cwd=ctx.session.cwd,

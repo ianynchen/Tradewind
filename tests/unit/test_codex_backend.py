@@ -14,10 +14,11 @@ import queue
 import threading
 from contextlib import aclosing
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
-from openai_codex.generated.v2_all import SandboxMode
+from openai_codex.generated.v2_all import ContextCompactedNotification, SandboxMode
 
 import tradewind.adapters.codex_backend as codex_backend
 from tradewind.adapters.codex_backend import (
@@ -30,7 +31,7 @@ from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import TurnContext
 from tradewind.application.tool_host import ToolHost
 from tradewind.domain.errors import ConfigError, Unsupported
-from tradewind.domain.events import PermissionRequested, TurnStarted
+from tradewind.domain.events import ItemCompleted, PermissionRequested, TurnStarted
 from tradewind.domain.models import (
     ModelSpec,
     Profile,
@@ -683,3 +684,57 @@ async def test_replay_prompt_request_is_answered_and_visible() -> None:
     ]
     assert len(degraded) == 1
     assert "thread not found" in str(degraded[0].message.content["reason"])
+
+
+# --- engine compaction observability (FR-5.8) ---
+
+
+async def test_codex_context_compacted_notification_is_recorded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex encrypts its summary (`CompactionResponseItem.
+    encrypted_content`), so the record carries no text -- only the native
+    turn id, so the compaction can be cross-referenced against the native
+    transcript."""
+
+    def fake_drive_turn(
+        client: Any,  # noqa: ARG001 -- matches _drive_turn's real signature
+        session: Any,  # noqa: ARG001
+        prompt: Any,  # noqa: ARG001
+        model: Any,  # noqa: ARG001
+        effort: Any,  # noqa: ARG001
+        output_schema: Any,  # noqa: ARG001
+        system_prompt: Any,  # noqa: ARG001
+        sandbox: Any,  # noqa: ARG001
+        approval_policy_value: Any,  # noqa: ARG001
+        out_queue: queue.Queue[object],
+        record_native_id: Any,
+        record_handle: Any,  # noqa: ARG001
+        retry_max: Any,  # noqa: ARG001
+        retry_delay_s: Any,  # noqa: ARG001
+    ) -> None:
+        record_native_id("thread-1")
+        out_queue.put(
+            SimpleNamespace(
+                payload=ContextCompactedNotification(threadId="thread-1", turnId="native-turn-9")
+            )
+        )
+        out_queue.put(codex_backend._DONE)
+
+    monkeypatch.setattr(codex_backend, "_drive_turn", fake_drive_turn)
+
+    backend = CodexBackend(_profile(), NativeStoreConfig())
+    tool_host = ToolHost([], [], lambda ref: ref)
+    ctx = _make_turn_context(broker=_ScriptedBroker("allow"), tools=tool_host)
+    try:
+        events = [event async for event in backend.run(ctx)]
+    finally:
+        await tool_host.stop_socket()
+
+    compactions = [
+        e for e in events if isinstance(e, ItemCompleted) and e.message.kind == "compaction"
+    ]
+    assert len(compactions) == 1
+    assert compactions[0].message.native_id == "native-turn-9"
+    # No summary text is invented for an engine that does not expose one.
+    assert compactions[0].message.content == {}

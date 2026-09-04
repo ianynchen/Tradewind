@@ -446,3 +446,35 @@ def resume_degraded_notice(*, reason: str) -> NormalizedMessage:
         kind="event",
         content={"type": "resume_degraded", "policy": "replay", "reason": reason},
     )
+
+
+def engine_compaction_record(
+    *,
+    summary: str | None = None,
+    trigger: str | None = None,
+    native_id: str | None = None,
+) -> NormalizedMessage:
+    """The mirrored `kind="compaction"` record for a compaction the BACKEND
+    ENGINE performed on its own context (FR-5.8 observability), as opposed
+    to one tradewind performed itself on the mirror.
+
+    Carries only what the caller cannot derive: no `source` and no
+    `backend` field, because a caller reading `session.stream()` knows the
+    session and one reading `tw.history(session_id)` queried by it -- the
+    profile, and therefore the backend, follows either way (user decision,
+    2026-09-03).
+
+    Fidelity differs by engine and is documented rather than flattened:
+    `cursor` supplies the real summary text; `claude`'s `PreCompact` hook
+    fires beforehand and supplies only its trigger; `codex` encrypts its
+    summary and supplies only a native turn id. Success/failure is never
+    recorded -- no engine exposes it through its typed API.
+    """
+    content: dict[str, Any] = {}
+    if summary is not None:
+        content["summary"] = summary
+    if trigger is not None:
+        content["trigger"] = trigger
+    return NormalizedMessage(
+        role="assistant", kind="compaction", content=content, native_id=native_id
+    )

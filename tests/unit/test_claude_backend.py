@@ -492,3 +492,40 @@ async def test_forced_replay_injects_rendered_mirror_into_a_fresh_session(
     assert "MOSSPETAL" in connected_prompts[0]  # rendered mirror preamble
     assert connected_prompts[0].endswith("hello")  # caller's prompt last
     assert cast(Any, captured[0]).resume is None  # fresh native session
+
+
+# --- engine compaction observability (FR-5.8): the PreCompact hook ---
+
+
+async def test_precompact_hook_records_the_engines_compaction() -> None:
+    """Claude's hook fires BEFORE the engine compacts, so no summary text
+    exists yet -- the record honestly carries only the trigger."""
+    pending: list[object] = []
+    hook = claude_backend_module._make_precompact_hook(cast(Any, pending))
+
+    result = await hook(
+        cast(
+            Any, {"hook_event_name": "PreCompact", "trigger": "auto", "custom_instructions": None}
+        ),
+        None,
+        cast(Any, {}),
+    )
+
+    assert result == {}  # observes only; never steers the CLI
+    assert len(pending) == 1
+    item = cast(ItemCompleted, pending[0])
+    assert item.message.kind == "compaction"
+    assert item.message.content == {"trigger": "auto"}
+    assert item.message.role == "assistant"
+
+
+async def test_precompact_hook_is_registered_on_the_sdk_options(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _install_fake_sdk_client(monkeypatch, [_success_result()])
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    [event async for event in backend.run(_make_ctx(output_schema=None))]
+
+    hooks = cast(Any, captured[0]).hooks
+    assert hooks is not None and "PreCompact" in hooks

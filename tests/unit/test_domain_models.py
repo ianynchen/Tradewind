@@ -20,6 +20,7 @@ from tradewind.domain.models import (
     McpServerDef,
     SessionOptions,
     Tool,
+    engine_compaction_record,
 )
 
 
@@ -204,3 +205,35 @@ def test_normalize_decision_accepts_both_forms() -> None:
     assert normalize_decision(Denial()) == ("deny", None, False)
     assert normalize_decision(Denial(reason="not in scope")) == ("deny", "not in scope", False)
     assert normalize_decision(Denial(reason="stop", terminate=True)) == ("deny", "stop", True)
+
+
+# --- engine_compaction_record: only what the caller cannot derive ---
+
+
+def test_engine_compaction_record_omits_source_and_backend() -> None:
+    """Design decision (2026-09-03): no `source`/`backend` field. A caller
+    reading `session.stream()` knows the session, and one reading
+    `tw.history(session_id)` queried by it -- the profile, and therefore
+    the backend, follows either way, so both fields would restate what the
+    caller already holds."""
+    record = engine_compaction_record(summary="a checkpoint")
+
+    assert record.kind == "compaction"
+    assert set(record.content) == {"summary"}
+    assert "source" not in record.content
+    assert "backend" not in record.content
+
+
+def test_engine_compaction_record_omits_absent_fields_entirely() -> None:
+    # An engine that exposes no summary must not get an empty-string one:
+    # absence is honest, a blank checkpoint is a lie of shape.
+    record = engine_compaction_record(native_id="native-turn-1")
+
+    assert record.content == {}
+    assert record.native_id == "native-turn-1"
+
+
+def test_engine_compaction_record_carries_claude_trigger_only() -> None:
+    record = engine_compaction_record(trigger="manual")
+
+    assert record.content == {"trigger": "manual"}

@@ -16,16 +16,23 @@ needs none of that -- it raises before `_run_turn` is ever reached.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from cursor_sdk import UnsupportedRunOperationError
+from cursor_sdk import (
+    SummaryCompletedUpdate,
+    SummaryStartedUpdate,
+    SummaryUpdate,
+    UnsupportedRunOperationError,
+)
 
 from tradewind.adapters.cursor_backend import CursorBackend, _build_custom_tools
 from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import TurnContext
 from tradewind.application.tool_host import ToolHost
 from tradewind.domain.errors import Unsupported
+from tradewind.domain.events import ItemCompleted
 from tradewind.domain.models import (
     ModelSpec,
     Profile,
@@ -312,3 +319,58 @@ def test_native_lost_classification_is_conservative() -> None:
     assert _is_native_lost_error(Exception("Agent not found")) is True
     assert _is_native_lost_error(Exception("agent was archived")) is True
     assert _is_native_lost_error(Exception("connection reset")) is False
+
+
+# --- engine compaction observability (FR-5.8): cursor's `summary` events
+# ARE its compaction (its persisted conversation model carries
+# summary/summary_archives/message_count_at_last_compaction together, and
+# the SDK excludes these events from the conversation delta flow) ---
+
+
+class _SummaryRun:
+    """A fake `AsyncRun` replaying one compaction lifecycle."""
+
+    def __init__(self, updates: list[object]) -> None:
+        self._updates = updates
+
+    def __aiter__(self) -> Any:
+        return self._events()
+
+    async def _events(self) -> Any:
+        for update in self._updates:
+            yield SimpleNamespace(sdk_message=None, interaction_update=update)
+
+    async def wait(self) -> Any:
+        return SimpleNamespace(status="finished", result="done", usage=None)
+
+
+async def test_cursor_summary_update_is_recorded_as_a_compaction_item() -> None:
+    backend = CursorBackend(_profile(), NativeStoreConfig())
+    run = _SummaryRun(
+        [
+            SummaryStartedUpdate(type="summary-started"),
+            SummaryUpdate(type="summary", summary="checkpoint of the earlier work"),
+            SummaryCompletedUpdate(type="summary-completed"),
+        ]
+    )
+
+    events = [e async for e in backend._consume("turn-1", cast(Any, run), ModelSpec(model="m"))]
+
+    compactions = [
+        e for e in events if isinstance(e, ItemCompleted) and e.message.kind == "compaction"
+    ]
+    # Exactly ONE record per compaction: the started/completed bookends
+    # would otherwise triple-count a single event.
+    assert len(compactions) == 1
+    assert compactions[0].message.content == {"summary": "checkpoint of the earlier work"}
+    assert compactions[0].message.role == "assistant"
+
+
+async def test_cursor_turn_without_compaction_records_nothing() -> None:
+    # Absence is normal, never an error -- most turns never compact.
+    backend = CursorBackend(_profile(), NativeStoreConfig())
+    run = _SummaryRun([])
+
+    events = [e async for e in backend._consume("turn-1", cast(Any, run), ModelSpec(model="m"))]
+
+    assert not any(isinstance(e, ItemCompleted) and e.message.kind == "compaction" for e in events)
