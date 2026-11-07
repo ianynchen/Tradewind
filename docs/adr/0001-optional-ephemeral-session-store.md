@@ -3,7 +3,7 @@ id: "ADR-0001"
 title: "Optional session store — one union field, ephemeral in-memory default"
 status: accepted
 date: 2026-09-02
-deciders: [human:yining]
+deciders: [human:ianynchen]
 ---
 
 # ADR-0001: Optional session store — one union field, ephemeral in-memory default
