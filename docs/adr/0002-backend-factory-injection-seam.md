@@ -1,3 +1,11 @@
+---
+id: "ADR-0002"
+title: "Public backend-factory injection seam on the Tradewind constructor"
+status: accepted
+date: 2026-09-02
+deciders: [human:yining]
+---
+
 # ADR-0002: Public backend-factory injection seam on the Tradewind constructor
 
 Date: 2026-09-02 · Status: accepted (user-requested, sextant integration) ·

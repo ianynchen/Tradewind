@@ -1,3 +1,11 @@
+---
+id: "ADR-0001"
+title: "Optional session store — one union field, ephemeral in-memory default"
+status: accepted
+date: 2026-09-02
+deciders: [human:yining]
+---
+
 # ADR-0001: Optional session store — one union field, ephemeral in-memory default
 
 Date: 2026-09-02 · Status: accepted (user-approved in session) · Drives: FR-5.7

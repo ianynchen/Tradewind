@@ -1,3 +1,11 @@
+---
+id: "ADR-0003"
+title: "Tradewind owns its schema, applied with yoyo"
+status: accepted
+date: 2026-09-03
+deciders: [human:yining]
+---
+
 # ADR-0003: Tradewind owns its schema, applied with yoyo
 
 Date: 2026-09-03 · Status: Accepted · Supersedes: the hand-stepped
