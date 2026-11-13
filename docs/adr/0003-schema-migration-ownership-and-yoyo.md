@@ -72,6 +72,23 @@ This is principled rather than a workaround: migrations exist to evolve a
 the current schema and destroyed. Both paths read the same files, and a test
 pins schema equality between them.
 
+## Reasoning
+
+- **Ownership and execution are separate questions.** The earlier framing —
+  the embedding service applies tradewind's DDL at deploy time — conflated
+  who owns the schema with who executes the migration.
+- **A host that applied the DDL would be coupled to tradewind's internals.**
+  A host that had to author, apply, or track tradewind's DDL would be pinned
+  to those internals across every upgrade.
+- **yoyo has a working in-house precedent.** `binnacle` is likewise a
+  library, and already runs yoyo-migrations from inside itself with
+  in-package `.sql` files; adopting it gives one migration model across
+  binnacle and tradewind.
+- **`PRAGMA user_version` stepping was not enough.** It has no per-migration
+  bookkeeping (making "did an old store upgrade correctly" untestable
+  without bespoke scaffolding), no rollbacks, and it does not extend to
+  Postgres.
+
 ## Consequences
 
 - One migration model across binnacle and tradewind; per-migration

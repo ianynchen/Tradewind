@@ -28,6 +28,8 @@ before the module registry in `_resolve_backend`. Names not present fall
 through to the registry, so overriding one backend leaves the rest
 functional; the module registry and other instances are never touched.
 
+## Reasoning
+
 Chosen over a `chat_model_factory` passthrough on `Profile.backend_options`:
 the kwarg is backend-agnostic (works for faking claude/codex/cursor too),
 and it keeps live callables out of the declarative config model that

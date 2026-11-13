@@ -36,6 +36,20 @@ session only needs context for the life of the process.
    Postgres later per P-4; `None` → ephemeral). The illegal both-set
    state becomes unrepresentable, deleting the cross-field validator.
 
+## Reasoning
+
+- **Why persistence is optional.** Sextant (and embedders like it) want to
+  use tradewind without configuring any database: SDK backends already
+  persist natively, and a langchain session only needs context for the life
+  of the process.
+- **Why an in-memory store rather than no store at all.** The mirror is also
+  what feeds langchain's context rebuild, so a RAM store preserves
+  multi-turn conversation context, single-flight, and reconcile with zero
+  runner changes, while still writing nothing to disk.
+- **Why one union field.** The illegal both-set state becomes
+  unrepresentable, which deletes the hand-written "exactly one" cross-field
+  validator.
+
 ## Replaced
 
 - `StoreConfig` (class, export, and its "exactly one of
