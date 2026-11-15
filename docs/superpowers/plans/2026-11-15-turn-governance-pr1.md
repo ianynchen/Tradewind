@@ -12,7 +12,8 @@
 
 ## Global Constraints
 
-- GUIDELINES.md binds (§1–4, §7, §11, §13.5): no CI change, no package version bump, match existing patterns, no unrequested refactors.
+- GUIDELINES.md binds (§1–4, §7, §11, §13.5): no CI change, match existing patterns, no unrequested refactors.
+- **Version (owner, 2026-11-15):** bump the minor version after implementation: `0.11.2` → `0.12.0` (Task 12).
 - One ADR (`docs/adr/0004-turn-governance.md`); REQUIREMENTS updated in the same PR (05 §Delivery list).
 - `jsonschema` is the only new runtime dependency. Process listing uses `ps`, not `psutil`.
 - Plain turns on Claude, Codex and LangChain emit exactly the same events as before (verified by a test per backend).
@@ -246,7 +247,8 @@
 - Modify: `docs/REQUIREMENTS.md` (new FRs: action policy, permission modes, preflight, prompt rule; FR-4 vocabulary and broker compatibility; FR-6.6 supervisor, optional hard cap, "every backend"; FR-8.1 new flags; FR-2 terminal record without `TurnStarted`), `docs/ARCHITECTURE.md` (§3.1 port additions), `README.md` (capability matrix, engine-auto strength per engine), `docs/RUNBOOK.md` (05 §Notes; Claude engine_auto finding; Codex slash finding), `CHANGELOG.md`
 - [ ] **Step 1:** Write the ADR (context, decision = 05, consequences, alternatives: per-backend special rules).
 - [ ] **Step 2:** Update the documents; `uv run` any doc checks the repo has.
-- [ ] **Step 3:** Gate && commit `docs: turn governance ADR and requirements`.
+- [ ] **Step 3:** Bump `version` in `pyproject.toml` from `0.11.2` to `0.12.0` (owner); move the CHANGELOG `[Unreleased]` entries under `## [0.12.0] - <date>`; `uv lock`.
+- [ ] **Step 4:** Gate && commit `docs: turn governance ADR and requirements; release 0.12.0`.
 
 ### Task 13: Whole-branch review and PR
 
