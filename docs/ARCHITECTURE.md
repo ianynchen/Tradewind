@@ -146,7 +146,7 @@ this list.
 | `TextDelta` | A streamed text chunk, ahead of the `ItemCompleted` it assembles into. | no (SDK hands messages over whole, not incrementally) | yes |
 | `ItemCompleted` | One normalized message (`text`/`thinking`/`tool_use`/`tool_result` — and, since FR-5.8/FR-6.6, a `kind="compaction"` checkpoint record or a `kind="event"` notice: compaction failure or a scheduled retry (`retry_scheduled`)) is complete and mirrored. Compaction deliberately rides THIS member rather than adding `CompactionStarted/Completed` events, so the frozen taxonomy gains zero members. | yes | yes |
 | `PermissionRequested` | A tool call's broker verdict is `"deny"` — **deny-only, by design**: an `"allow"` verdict has no side effect distinct from the call itself proceeding, so it is not separately eventized. Carries the broker's `reason` (FR-4.4) on every consulted path, including backends whose engines cannot show it to the model. | yes | yes |
-| `TurnCompleted` | A turn finishes cleanly or is interrupted (`result.status` distinguishes the two; `result.end_reason` says *why* it ended — clean `end_turn`, provider `max_tokens` truncation, the caller's `max_tool_rounds` cap, `interrupted`, the enforced deadline's `timeout`, or the broker's `broker_terminated` — FR-6.5/FR-6.6/FR-4.4). | yes | yes |
+| `TurnCompleted` | A turn finishes cleanly or is interrupted (`result.status` distinguishes the two; `result.end_reason` says *why* it ended — clean `end_turn`, provider `max_tokens` truncation, the caller's `max_tool_rounds` cap, `interrupted`, the enforced deadline's `timeout`, or the broker's `broker_terminated` — FR-6.5/FR-6.6/FR-4.4). With `output_schema`, `result.structured_output` ADDS the schema-shaped result on every backend that supports it; `result.final_text` is unchanged (FR-1.3). | yes | yes |
 | `TurnFailed` | A turn ends in an unrecoverable error. | yes | yes |
 
 `ThinkingDelta` (a streamed reasoning chunk) was removed from the draft
@@ -194,7 +194,8 @@ CREATE TABLE turns (
   usage_json   TEXT,
   cost_usd     REAL,
   started_at   TEXT, completed_at TEXT,
-  error_json   TEXT
+  error_json   TEXT,
+  structured_output TEXT             -- FR-1.3: schema turn's result (JSON); NULL otherwise (migration 0003)
 );
 
 CREATE TABLE messages (

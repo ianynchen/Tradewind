@@ -98,7 +98,9 @@ class _SpyStore(SessionStorePort):
     def append_message(self, session_id, turn_id, msg):
         raise NotImplementedError
 
-    def finalize_turn(self, turn_id, *, status, final_text, usage, cost_usd, error):
+    def finalize_turn(
+        self, turn_id, *, status, final_text, usage, cost_usd, error, structured_output=None
+    ):
         raise NotImplementedError
 
     def turn_usages(self, session_id):  # noqa: ARG002 -- SessionStorePort interface

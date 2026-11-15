@@ -59,10 +59,25 @@ of scope for this adapter (it only ever reads `ctx.load_history()` through
 `resume=<native id>`'s own transcript, never manually reconstructing
 messages from `StoredMessage`s the way `LangchainBackend` does).
 
-Deferred, matching `LangchainBackend`'s own precedent: `ctx.output_schema`
-raises `Unsupported` (`capabilities().supports_structured_output` is
-False -- the SDK has no `output_schema`-shaped request parameter to wire it
-to). `ModelSpec.effort` is also not wired to `ClaudeAgentOptions.effort`:
+Structured output (FR-1.3): `ctx.output_schema` rides the SDK's native
+`ClaudeAgentOptions.output_format` (`{"type": "json_schema", "schema": ...}`,
+rendered by the SDK as the CLI's `--json-schema`). The CLI adds its own
+`StructuredOutput` tool, validates the model's call against the schema, and
+reports the result as `ResultMessage.structured_output`; this adapter ADDS
+it as `TurnResult.structured_output` (the field every structured-output
+backend sets), while `final_text` stays the model's prose
+(`ResultMessage.result`) and every assistant message streams and mirrors
+exactly as in a plain turn. The mirror keeps what the native transcript holds
+(the `StructuredOutput` `tool_use`/`tool_result` pair), so reconcile still
+compares like with like. Failure paths: the CLI's own
+`error_max_structured_output_retries` error result fails the turn like any
+error result; a clean finish with NO `structured_output` (the CLI silently
+disables structured output when it rejects a schema at init) also fails the
+turn rather than completing without the result the caller asked for; an honest
+partial (`max_tool_rounds`, `max_tokens`) keeps its `end_reason` and carries
+no structured result.
+
+`ModelSpec.effort` is not wired to `ClaudeAgentOptions.effort`:
 the task-10 brief's options list does not name it, and GUIDELINES §1.1
 treats an unlisted option as out of scope rather than a silent addition;
 flagged in the task-10 report for controller follow-up alongside the two
@@ -108,7 +123,6 @@ from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import Backend, TurnContext
 from tradewind.application.tool_host import ToolHost
 from tradewind.domain.compaction import compose_replay_prompt
-from tradewind.domain.errors import Unsupported
 from tradewind.domain.events import (
     Event,
     ItemCompleted,
@@ -553,13 +567,11 @@ class ClaudeBackend(Backend):
         return self._native_ids.pop(session_id, None)
 
     def capabilities(self) -> Capabilities:
-        # Exactly the table in the task-10 brief. `supports_structured_
-        # output=False`: the SDK has no `output_schema`-shaped request
-        # parameter (mirrors `LangchainBackend`'s own deferral, module
-        # docstring).
+        # Exactly the table in the task-10 brief, plus structured output
+        # via the SDK's native `output_format` (module docstring).
         return Capabilities(
             supports_system_prompt=True,
-            supports_structured_output=False,
+            supports_structured_output=True,
             supports_interactive_permissions=True,
             supports_in_process_tools=True,
             supports_native_resume=True,
@@ -661,13 +673,14 @@ class ClaudeBackend(Backend):
             # own.
             max_turns=None if ctx.max_tool_rounds is None else ctx.max_tool_rounds + 1,
             resume=ctx.session.native_session_id,
+            output_format=(
+                {"type": "json_schema", "schema": ctx.output_schema}
+                if ctx.output_schema is not None
+                else None
+            ),
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
-        if ctx.output_schema is not None:
-            # Raised before `TurnStarted`, matching `LangchainBackend.run`'s
-            # own capability-mismatch handling (module docstring).
-            raise Unsupported("structured output not yet implemented for claude backend")
         async for event in self._run_turn(ctx):
             yield event
 
@@ -794,10 +807,26 @@ class ClaudeBackend(Backend):
                     # set `ctx.max_tool_rounds` -- it completes honestly
                     # with `end_reason="max_tool_rounds"` instead (FR-6.5).
                     yield TurnFailed(turn_id=ctx.turn_id, error=_result_error(message))
-                else:
-                    yield TurnCompleted(
-                        result=turn_result_from_result_message(message, ctx.turn_id)
-                    )
+                    return
+                result = turn_result_from_result_message(message, ctx.turn_id)
+                if ctx.output_schema is not None:
+                    if isinstance(message.structured_output, dict):
+                        # FR-1.3, additive: `final_text` stays the model's
+                        # prose (`ResultMessage.result`); the result is
+                        # ADDED beside it.
+                        result.structured_output = cast(
+                            "dict[str, object]", message.structured_output
+                        )
+                    elif result.end_reason == "end_turn":
+                        yield TurnFailed(
+                            turn_id=ctx.turn_id,
+                            error=(
+                                "claude turn ended without structured output although "
+                                "output_schema was set (the CLI may have rejected the schema)"
+                            ),
+                        )
+                        return
+                yield TurnCompleted(result=result)
                 return
         for event in pending_events:
             yield event

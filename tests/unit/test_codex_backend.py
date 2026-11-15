@@ -738,3 +738,117 @@ async def test_codex_context_compacted_notification_is_recorded(
     assert compactions[0].message.native_id == "native-turn-9"
     # No summary text is invented for an engine that does not expose one.
     assert compactions[0].message.content == {}
+
+
+# --- FR-1.3: structured output. Codex's final answer IS the JSON text, so
+# `final_text` stays exactly as before and the parsed result is ADDED as
+# `TurnResult.structured_output`. ---
+
+
+def _codex_turn_queue(final_answer: str) -> queue.Queue[object]:
+    from openai_codex.generated.v2_all import (
+        AgentMessageThreadItem,
+        ItemCompletedNotification,
+        MessagePhase,
+        ThreadItem,
+        Turn,
+        TurnCompletedNotification,
+        TurnStatus,
+    )
+
+    class _FakeNotification:
+        def __init__(self, payload: object) -> None:
+            self.payload = payload
+
+    out_queue: queue.Queue[object] = queue.Queue()
+    out_queue.put(
+        _FakeNotification(
+            ItemCompletedNotification(
+                thread_id="t-1",
+                turn_id="turn-native-1",
+                completed_at_ms=0,
+                item=ThreadItem(
+                    root=AgentMessageThreadItem(
+                        id="m-1",
+                        type="agentMessage",
+                        text=final_answer,
+                        phase=MessagePhase.final_answer,
+                    )
+                ),
+            )
+        )
+    )
+    out_queue.put(
+        _FakeNotification(
+            TurnCompletedNotification(
+                thread_id="t-1",
+                turn=Turn(id="turn-native-1", items=[], status=TurnStatus.completed),
+            )
+        )
+    )
+    out_queue.put(codex_backend._DONE)
+    return out_queue
+
+
+async def test_schema_turn_adds_structured_output_and_keeps_final_text() -> None:
+    from tradewind.domain.events import TurnCompleted
+
+    backend = CodexBackend(_profile(), NativeStoreConfig())
+
+    events = [
+        event
+        async for event in backend._consume(
+            "turn-1",
+            _codex_turn_queue('{"answer": 42}'),
+            ModelSpec(model="gpt-5.4-mini"),
+            has_output_schema=True,
+        )
+    ]
+
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert len(completed) == 1
+    assert completed[0].result.final_text == '{"answer": 42}'  # unchanged
+    assert completed[0].result.structured_output == {"answer": 42}
+    texts = [e.message.content["text"] for e in events if isinstance(e, ItemCompleted)]
+    assert texts == ['{"answer": 42}']  # the mirror item is unchanged too
+
+
+async def test_plain_turn_has_no_structured_output_even_when_text_looks_like_json() -> None:
+    # No schema = today's behaviour exactly: nothing is parsed or added.
+    from tradewind.domain.events import TurnCompleted
+
+    backend = CodexBackend(_profile(), NativeStoreConfig())
+
+    events = [
+        event
+        async for event in backend._consume(
+            "turn-1", _codex_turn_queue('{"answer": 42}'), ModelSpec(model="gpt-5.4-mini")
+        )
+    ]
+
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.final_text == '{"answer": 42}'
+    assert completed[0].result.structured_output is None
+
+
+async def test_schema_turn_whose_final_answer_is_not_a_json_object_fails() -> None:
+    """A clean finish without a structured result is a failure (FR-1.3),
+    never a completion the caller would have to re-validate."""
+    from tradewind.domain.events import TurnCompleted, TurnFailed
+
+    backend = CodexBackend(_profile(), NativeStoreConfig())
+
+    events = [
+        event
+        async for event in backend._consume(
+            "turn-1",
+            _codex_turn_queue("sorry, no JSON today"),
+            ModelSpec(model="gpt-5.4-mini"),
+            has_output_schema=True,
+        )
+    ]
+
+    assert not any(isinstance(e, TurnCompleted) for e in events)
+    failed = [e for e in events if isinstance(e, TurnFailed)]
+    assert len(failed) == 1
+    assert "structured output" in failed[0].error

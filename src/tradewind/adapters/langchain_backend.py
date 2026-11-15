@@ -30,16 +30,24 @@ only in the live response's `raw_json`, which the mirror-rebuild path
 (`include_raw=False`) never has, so it is legally dropped rather than
 re-sent broken.
 
-Deferred: `ctx.output_schema` (tool-choice-forced structured output, per
-the component spec's "Structured output" decision row) is accepted on
-`TurnContext` but not yet wired into this adapter's request — flagged in
-the task-8 report for controller follow-up, not silently dropped.
+Structured output (FR-1.3; component spec "Structured output" decision
+row, "force once at the end"): the tool loop runs exactly as without a
+schema. When the model ends its turn without tool calls (`end_turn`), ONE
+more model call is made with `tool_choice` forced to a single schema tool
+built from `ctx.output_schema`; its arguments become
+`TurnResult.structured_output`, ADDED beside `final_text` (which keeps the
+model's natural final text). The result is mirrored as one assistant
+`kind="text"` item carrying its JSON text, not as the forced `tool_use`: that
+call has no `tool_result`, and a later turn's rebuild would replay the
+broken pair (and, with no tools bound, a `tool_use` block the request
+cannot define).
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 from collections.abc import AsyncIterator, Callable
 from typing import ClassVar, cast
 
@@ -100,6 +108,16 @@ from tradewind.domain.models import (
 )
 
 _MAX_ITERATIONS = 25
+
+# The single schema tool the forced structured-output call is pinned to
+# (FR-1.3). Namespaced so it cannot plausibly collide with a caller tool.
+_STRUCTURED_OUTPUT_TOOL = "tradewind_structured_output"
+# Sent as a user message ahead of the forced call, never mirrored: the
+# request must not end on an assistant message (newer Anthropic models
+# refuse assistant prefill), and it tells the model what the call is for.
+_STRUCTURED_OUTPUT_INSTRUCTION = (
+    f"Now give your final answer by calling the {_STRUCTURED_OUTPUT_TOOL} tool."
+)
 
 ChatModelFactory = Callable[[ModelSpec], BaseChatModel]
 
@@ -290,7 +308,30 @@ def _stop_reason(message: AIMessage) -> str | None:
     return value if isinstance(value, str) else None
 
 
-def _bind_tools(chat_model: BaseChatModel, schemas: list[dict[str, object]]) -> BaseChatModel:
+def _structured_output_tool(output_schema: dict[str, object]) -> dict[str, object]:
+    """The schema tool (Anthropic tool-dict format, like `ToolHost.schemas()`)
+    whose input schema IS the caller's `output_schema`."""
+    return {
+        "name": _STRUCTURED_OUTPUT_TOOL,
+        "description": "Return the final answer in the required structured format.",
+        "input_schema": output_schema,
+    }
+
+
+def _forced_result(message: AIMessage) -> dict[str, object] | None:
+    """The forced call's arguments to the schema tool, or None when the
+    model did not call it."""
+    for call in message.tool_calls:
+        if call["name"] == _STRUCTURED_OUTPUT_TOOL:
+            return cast("dict[str, object]", call["args"])
+    return None
+
+
+def _bind_tools(
+    chat_model: BaseChatModel,
+    schemas: list[dict[str, object]],
+    tool_choice: str | None = None,
+) -> BaseChatModel:
     """Bind `schemas` (Anthropic-format tool dicts, `ToolHost.schemas()`'s
     own output) to `chat_model`, or return it unchanged when there are none.
 
@@ -306,6 +347,10 @@ def _bind_tools(chat_model: BaseChatModel, schemas: list[dict[str, object]]) -> 
     if not schemas:
         return chat_model
     try:
+        if tool_choice is not None:
+            # The forced structured-output call (FR-1.3) only; every
+            # ordinary bind keeps today's exact call.
+            return cast(BaseChatModel, chat_model.bind_tools(schemas, tool_choice=tool_choice))
         return cast(BaseChatModel, chat_model.bind_tools(schemas))
     except NotImplementedError as exc:
         # `BaseChatModel.bind_tools` raises a bare `NotImplementedError`
@@ -379,15 +424,11 @@ class LangchainBackend(Backend):
 
     def capabilities(self) -> Capabilities:
         # Exactly the table in docs/components/03-langchain-adapter.md.
-        # `supports_structured_output=False`: tool-choice-forced structured
-        # output is deferred (controller ruling, task-8 fix round 1) — the
-        # design for *where* in the loop forcing applies is not yet made,
-        # so the flag stays honest rather than advertising unimplemented
-        # behavior. `run()` raises `Unsupported` if a caller asks for it
-        # anyway via `ctx.output_schema`.
+        # Structured output: one forced schema-tool call once the loop ends
+        # (module docstring).
         return Capabilities(
             supports_system_prompt=True,
-            supports_structured_output=False,
+            supports_structured_output=True,
             supports_interactive_permissions=True,
             supports_in_process_tools=True,
             supports_native_resume=False,
@@ -428,13 +469,6 @@ class LangchainBackend(Backend):
             scope.cancel()
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
-        if ctx.output_schema is not None:
-            # Raised before `TurnStarted`, not surfaced as `TurnFailed`:
-            # this is a capability mismatch (`supports_structured_output`
-            # is False), the same kind of error `read_native_transcript`
-            # raises directly rather than emitting an event for.
-            raise Unsupported("structured output not yet implemented for langchain backend")
-
         session_id = ctx.session.session_id
         scope = anyio.CancelScope()
         self._scopes[session_id] = scope
@@ -532,16 +566,23 @@ class LangchainBackend(Backend):
 
             usage_totals: dict[str, int] = {}
             final_text: str | None = None
+            structured_output: dict[str, object] | None = None
             end_reason: EndReason = "end_turn"
             rounds_executed = 0
+            # FR-1.3: set once the model ended its turn and the ONE forced
+            # schema-tool call is next; that call ends the turn.
+            forced_call = False
+            model = bound_model
 
             overflow_recovered = False
-            for _ in range(_MAX_ITERATIONS):
+            # The forced call is one model call beyond the tool loop's own
+            # runaway budget, never a tool round.
+            for _ in range(_MAX_ITERATIONS + (1 if ctx.output_schema is not None else 0)):
                 retries_used = 0
                 while True:
                     try:
                         gathered: AIMessageChunk | None = None
-                        async for chunk in bound_model.astream([*base_messages, *turn_suffix]):
+                        async for chunk in model.astream([*base_messages, *turn_suffix]):
                             for block in chunk.content_blocks:
                                 delta = _delta_event(block)
                                 if delta is not None:
@@ -608,6 +649,40 @@ class LangchainBackend(Backend):
                             continue
                         raise
                 _accumulate_usage(usage_totals, gathered.usage_metadata)
+
+                if forced_call:
+                    # Everything the forced response holds is kept, except
+                    # its schema `tool_use` (no `tool_result` follows it --
+                    # module docstring); the result itself is added below.
+                    for item in _completed_items(gathered):
+                        if item.kind != "tool_use" or item.content["name"] != (
+                            _STRUCTURED_OUTPUT_TOOL
+                        ):
+                            yield ItemCompleted(message=item)
+                    if _stop_reason(gathered) == "max_tokens":
+                        # Truncated arguments are no result: an honest
+                        # `max_tokens` partial, `final_text` unchanged.
+                        end_reason = "max_tokens"
+                        break
+                    structured_output = _forced_result(gathered)
+                    if structured_output is None:
+                        yield TurnFailed(
+                            turn_id=ctx.turn_id,
+                            error=(
+                                "structured output: the forced final call returned no "
+                                f"{_STRUCTURED_OUTPUT_TOOL} tool call"
+                            ),
+                        )
+                        return
+                    yield ItemCompleted(
+                        message=NormalizedMessage(
+                            role="assistant",
+                            kind="text",
+                            content={"text": json.dumps(structured_output)},
+                        )
+                    )
+                    break
+
                 turn_suffix.append(gathered)
 
                 for item in _completed_items(gathered):
@@ -626,6 +701,18 @@ class LangchainBackend(Backend):
                 tool_calls = gathered.tool_calls
                 if not tool_calls:
                     final_text = _final_text(gathered)
+                    if ctx.output_schema is not None:
+                        # FR-1.3 "force once at the end": the model ended
+                        # its turn; ONE more call, pinned to the schema
+                        # tool, adds the structured result.
+                        forced_call = True
+                        model = _bind_tools(
+                            chat_model,
+                            [*schemas, _structured_output_tool(ctx.output_schema)],
+                            tool_choice=_STRUCTURED_OUTPUT_TOOL,
+                        )
+                        turn_suffix.append(HumanMessage(content=_STRUCTURED_OUTPUT_INSTRUCTION))
+                        continue
                     break
 
                 if ctx.max_tool_rounds is not None and rounds_executed >= ctx.max_tool_rounds:
@@ -706,6 +793,7 @@ class LangchainBackend(Backend):
                     final_text=final_text,
                     usage=usage_totals,
                     cost_usd=self._computed_cost(ctx.model_spec, usage_totals),
+                    structured_output=structured_output,
                 )
             )
         except Exception as exc:

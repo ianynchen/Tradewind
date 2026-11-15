@@ -307,11 +307,19 @@ async def test_history_flat_and_tree(harness: ClaudeHarness) -> None:
     await matrix.history_flat_and_tree(cast(Any, harness))
 
 
-async def test_structured_output(harness: ClaudeHarness) -> None:
-    # Expected to skip: `ClaudeBackend.capabilities().supports_structured_
-    # output` is False (module docstring) -- exercises the skip machinery,
-    # not structured output, same as `test_langchain.py`'s own copy of this
-    # test (task-9 brief).
+async def test_structured_output(harness: ClaudeHarness, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Kept cheap (live, billed): the scenario's tiny prompt and tool-round
+    # cap, plus a hard spend cap on this one test via the SDK's own
+    # `max_budget_usd` -- set here, not in the adapter, which exposes no
+    # budget option.
+    real_build_options = ClaudeBackend._build_options
+
+    def capped_build_options(self: ClaudeBackend, *args: Any, **kwargs: Any) -> Any:
+        options = real_build_options(self, *args, **kwargs)
+        options.max_budget_usd = 0.05
+        return options
+
+    monkeypatch.setattr(ClaudeBackend, "_build_options", capped_build_options)
     await matrix.structured_output(cast(Any, harness))
 
 

@@ -21,6 +21,7 @@ touched no path but the sqlite store's.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -38,7 +39,7 @@ from langchain_core.runnables import Runnable
 from pydantic import ConfigDict
 
 from tests.conformance import matrix
-from tradewind.adapters.langchain_backend import LangchainBackend
+from tradewind.adapters.langchain_backend import _STRUCTURED_OUTPUT_TOOL, LangchainBackend
 from tradewind.application.client import Tradewind
 from tradewind.application.config import NativeStoreConfig, TradewindConfig
 from tradewind.domain.models import ApiKeyAuth, Capabilities, ModelSpec, Profile, SessionOptions
@@ -123,7 +124,24 @@ class LangchainHarness:
     _queue: list[BaseChatModel] = field(default_factory=list)
 
     def script_text_response(self, text: str) -> None:
-        self._queue.append(_ScriptedChatModel(responses=[AIMessage(content=text)]))
+        """One text reply. A schema turn (FR-1.3) makes ONE more, forced
+        call to the schema tool; when `text` is a JSON object, that call is
+        scripted to answer with it (a plain turn never reaches it)."""
+        responses: list[BaseMessage] = [AIMessage(content=text)]
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            parsed = None
+        if isinstance(parsed, dict):
+            responses.append(
+                AIMessage(
+                    content="",
+                    tool_calls=[
+                        make_tool_call(name=_STRUCTURED_OUTPUT_TOOL, args=parsed, id="call_so")
+                    ],
+                )
+            )
+        self._queue.append(_ScriptedChatModel(responses=responses))
 
     def script_tool_calls_then_text(
         self, tool_calls: list[matrix.ScriptedToolCall], final_text: str
@@ -207,9 +225,8 @@ async def test_history_flat_and_tree(harness: LangchainHarness) -> None:
 
 
 async def test_structured_output(harness: LangchainHarness) -> None:
-    # Expected to skip: `LangchainBackend.capabilities().supports_structured_
-    # output` is False (task-8 fix round 1) -- this exercises the skip
-    # machinery itself, not structured output (task-9 brief).
+    # Hermetic (scripted fake): the forced schema-tool call answers with the
+    # scripted JSON (`LangchainHarness.script_text_response`).
     await matrix.structured_output(harness)
 
 

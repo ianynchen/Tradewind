@@ -2,9 +2,8 @@
 backend is expected to honor (task-9 brief). Each function takes a
 `ConformanceHarness` and is guarded by `pytest.skip` on the `Capabilities`
 flag it needs -- a backend that doesn't support a scenario's precondition
-skips it rather than failing (`structured_output` skips on `langchain`
-today; that is the correct, expected result and exercises the skip
-machinery itself).
+skips it rather than failing (`structured_output` skips on `cursor`; that
+is the correct, expected result and exercises the skip machinery itself).
 
 Every assertion here is in terms of Tradewind's own normalized surface
 (`Session`, `TurnResult`, `Event`, `StoredMessage`) so scenarios stay
@@ -40,9 +39,9 @@ scripted double:
     module docstring). It now asks for a fixed token to appear in the reply
     instead, which both a scripted fake and a real model reliably satisfy.
 
-`structured_output` is unchanged: it stays purely capability-gated (skips on
-any backend with `supports_structured_output=False`) rather than behavioral,
-since no backend advertises that capability yet to exercise against.
+`structured_output` stays capability-gated (skips on any backend with
+`supports_structured_output=False`) and asserts the one shared result
+field, `TurnResult.structured_output` (FR-1.3).
 """
 
 from __future__ import annotations
@@ -336,13 +335,17 @@ async def history_flat_and_tree(harness: ConformanceHarness) -> None:
 
 
 async def structured_output(harness: ConformanceHarness) -> None:
-    """A turn given `output_schema` completes with a final response shaped
-    by it (FR-8, deferred per-backend via `Capabilities.
-    supports_structured_output` -- `langchain`/`claude` skip this today, so
-    `CodexBackend` (task-14) is the first to actually exercise it live).
+    """A turn given `output_schema` completes with the schema-shaped result
+    in `TurnResult.structured_output` -- the one field every backend with
+    `supports_structured_output` sets (FR-1.3); `final_text` is NOT asserted
+    on, since it stays each backend's own final text (the JSON on codex,
+    the model's prose on claude/langchain).
 
-    `additionalProperties: false` is required in the schema (module
-    docstring's own category of fix, same as `tool_allow_deny`'s): a bare
+    Kept cheap for the live runs (codex/claude are env-gated): a tiny
+    prompt and schema, and -- where the backend can enforce one -- a tool-
+    round cap, so a confused model cannot loop.
+
+    `additionalProperties: false` is required in the schema: a bare
     `{"type": "object", "properties": {...}}` -- valid JSON Schema in
     general -- is REJECTED live by Codex's strict structured-output mode
     (`invalid_json_schema: 'additionalProperties' is required to be
@@ -352,24 +355,28 @@ async def structured_output(harness: ConformanceHarness) -> None:
     """
     if not harness.capabilities.supports_structured_output:
         pytest.skip("backend does not support structured output")
-    harness.script_text_response('{"answer": 42}')
+    harness.script_text_response('{"ok": true}')
     session_id = str(uuid.uuid4())
     session = await harness.tradewind.create(
         session_id,
         SessionOptions(
             output_schema={
                 "type": "object",
-                "properties": {"answer": {"type": "integer"}},
-                "required": ["answer"],
+                "properties": {"ok": {"type": "boolean"}},
+                "required": ["ok"],
                 "additionalProperties": False,
             }
         ),
     )
 
-    result = await session.run("what is the answer?")
+    overrides: dict[str, object] = {}
+    if harness.capabilities.supports_tool_round_cap:
+        overrides["max_tool_rounds"] = 2
+    result = await session.run('Return {"ok": true}.', **overrides)
 
     assert result.status == "completed"
-    assert result.final_text is not None
+    assert result.end_reason == "end_turn"
+    assert result.structured_output == {"ok": True}
 
 
 _ECHO_TOKEN = "ZANZIBAR"

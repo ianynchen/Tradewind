@@ -540,6 +540,20 @@ def _final_text_from_items(agent_messages: list[AgentMessageThreadItem]) -> str 
     return fallback
 
 
+def _structured_output_from_text(text: str | None) -> dict[str, object] | None:
+    """FR-1.3: a schema turn's structured result, parsed from the engine's
+    final answer (which, under `output_schema`, IS the JSON text), or None
+    when that answer is absent or not a JSON object -- the caller then
+    fails the turn rather than complete it without a result."""
+    if text is None:
+        return None
+    try:
+        parsed = cast(object, json.loads(text))
+    except json.JSONDecodeError:
+        return None
+    return cast("dict[str, object]", parsed) if isinstance(parsed, dict) else None
+
+
 def _computed_cost(model_spec: ModelSpec, usage: dict[str, int]) -> float | None:
     """`TurnResult.cost_usd` from the tier's cost table (FR-10.5); None
     without one. Field mapping per the Phase-1 spec: codex's
@@ -1189,6 +1203,7 @@ class CodexBackend(Backend):
                     ctx.model_spec,
                     _request_interrupt,
                     _build_replay_prompt,
+                    has_output_schema=ctx.output_schema is not None,
                 ):
                     if isinstance(event, (TurnCompleted, TurnFailed)):
                         terminal_event_observed = True
@@ -1240,6 +1255,8 @@ class CodexBackend(Backend):
         model_spec: ModelSpec,
         request_interrupt: Callable[[], Awaitable[None]] | None = None,
         build_replay_prompt: Callable[[], Awaitable[str]] | None = None,
+        *,
+        has_output_schema: bool = False,
     ) -> AsyncIterator[Event]:
         agent_messages: list[AgentMessageThreadItem] = []
         usage: ThreadTokenUsage | None = None
@@ -1336,6 +1353,21 @@ class CodexBackend(Backend):
                     # `is_aborted_result` handling).
                     return
                 if turn.status == TurnStatus.completed:
+                    final_text = _final_text_from_items(agent_messages)
+                    structured_output: dict[str, object] | None = None
+                    if has_output_schema:
+                        # FR-1.3: `final_text` stays the engine's final
+                        # answer as before; the parsed result is ADDED.
+                        structured_output = _structured_output_from_text(final_text)
+                        if structured_output is None:
+                            yield TurnFailed(
+                                turn_id=turn_id,
+                                error=(
+                                    "codex turn ended without structured output although "
+                                    "output_schema was set (final answer is not a JSON object)"
+                                ),
+                            )
+                            return
                     yield TurnCompleted(
                         result=TurnResult(
                             turn_id=turn_id,
@@ -1347,7 +1379,7 @@ class CodexBackend(Backend):
                             # can never be the reason here -- `run()` raises
                             # `Unsupported` before any cap could apply.
                             end_reason="end_turn",
-                            final_text=_final_text_from_items(agent_messages),
+                            final_text=final_text,
                             usage=_usage_dict(usage) if usage is not None else {},
                             # Codex reports no per-turn dollar figure, so
                             # this is COMPUTED from the tier's cost table
@@ -1356,6 +1388,7 @@ class CodexBackend(Backend):
                             cost_usd=_computed_cost(
                                 model_spec, _usage_dict(usage) if usage is not None else {}
                             ),
+                            structured_output=structured_output,
                         )
                     )
                 else:

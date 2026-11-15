@@ -2073,3 +2073,57 @@ async def test_healthy_probe_keeps_the_native_path(tmp_path: Path) -> None:
     ctx = fake.contexts[-1]
     assert ctx.force_replay is False
     assert ctx.session.native_session_id == "alive-native"
+
+
+# --- FR-1.3: the runner persists a schema turn's structured result beside
+# its final text, and leaves both untouched on the way to the caller ---
+
+
+async def test_structured_output_is_persisted_and_returned_beside_final_text(
+    tmp_path: Path,
+) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    completed = TurnCompleted(
+        result=TurnResult(
+            turn_id="fake-turn",
+            status="completed",
+            end_reason="end_turn",
+            final_text="Here is the answer.",
+            usage={},
+            cost_usd=None,
+            structured_output={"answer": 42},
+        )
+    )
+    tw._backends["default"] = _ScriptedBackend(
+        profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), completed]
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    result = await session.run("hello")
+
+    assert result.final_text == "Here is the answer."
+    assert result.structured_output == {"answer": 42}
+    conn = cast(Any, tw._store)._conn
+    row = conn.execute(
+        "SELECT final_text, structured_output FROM turns WHERE session_id = ?", (_VALID_ID,)
+    ).fetchone()
+    assert row == ("Here is the answer.", '{"answer": 42}')
+
+
+async def test_plain_turn_persists_no_structured_output(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _ScriptedBackend(
+        profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), _completed("hi")]
+    )
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    result = await session.run("hello")
+
+    assert result.structured_output is None
+    conn = cast(Any, tw._store)._conn
+    row = conn.execute(
+        "SELECT final_text, structured_output FROM turns WHERE session_id = ?", (_VALID_ID,)
+    ).fetchone()
+    assert row == ("hi", None)

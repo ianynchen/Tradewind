@@ -2,9 +2,8 @@
 function -- `interrupt()`'s handling of a client registered before
 `ClaudeSDKClient.connect()` finishes (task-10 fix round 1),
 `take_native_session_id()`'s per-session pop semantics (task-11 review, fix
-round 1), and `run()`'s `output_schema` capability guard (task-15 fix
-round 1: previously untested here, though the guard itself dates to
-task-10). Pure event mapping lives in `tests/unit/test_claude_mapping.py`;
+round 1), and structured output (`ctx.output_schema` wired to the SDK's
+`output_format`, result added as `TurnResult.structured_output` -- FR-1.3). Pure event mapping lives in `tests/unit/test_claude_mapping.py`;
 a real live session is `tests/conformance/test_claude.py` /
 `tests/integration/test_claude_live.py` (`@pytest.mark.integration`).
 """
@@ -21,7 +20,6 @@ from tradewind.adapters.claude_backend import ClaudeBackend
 from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import TurnContext
 from tradewind.application.tool_host import ToolHost
-from tradewind.domain.errors import Unsupported
 from tradewind.domain.events import ItemCompleted, TurnCompleted, TurnFailed
 from tradewind.domain.models import (
     ModelSpec,
@@ -42,8 +40,8 @@ def _profile() -> Profile:
 
 
 class _NoBroker:
-    """Satisfies `PermissionBroker` but must never be called -- the
-    `output_schema` guard raises before `ctx.broker` is ever touched."""
+    """Satisfies `PermissionBroker` but must never be called -- no scripted
+    turn here makes a tool call."""
 
     async def decide(self, tool_name: str, _tool_input: dict[str, object]) -> Verdict:
         raise AssertionError(f"broker.decide should not be called (got {tool_name!r})")
@@ -76,24 +74,6 @@ def _make_ctx(
         load_history=_history_loader([]),
         max_tool_rounds=max_tool_rounds,
     )
-
-
-# --- run(): output_schema capability guard (mirrors supports_structured_
-# output=False; same test shape as test_langchain_adapter.py's own) ------
-
-
-async def test_run_with_output_schema_raises_unsupported_before_turn_started() -> None:
-    backend = ClaudeBackend(_profile(), NativeStoreConfig())
-    ctx = _make_ctx(output_schema={"type": "object", "properties": {}})
-
-    events: list[object] = []
-    with pytest.raises(Unsupported):
-        async for event in backend.run(ctx):
-            events.append(event)
-
-    # No TurnStarted (or anything else, and in particular no ClaudeSDKClient
-    # construction attempt) happened before the raise.
-    assert events == []
 
 
 class _RaisesConnectionErrorClient:
@@ -529,3 +509,145 @@ async def test_precompact_hook_is_registered_on_the_sdk_options(
 
     hooks = cast(Any, captured[0]).hooks
     assert hooks is not None and "PreCompact" in hooks
+
+
+# --- structured output (FR-1.3): `ctx.output_schema` rides the SDK's native
+# `output_format`; the result is ADDED as `TurnResult.structured_output`
+# beside the unchanged prose `final_text` (same field on every backend). ---
+
+_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {"answer": {"type": "integer"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+
+
+def test_capabilities_declare_structured_output_support() -> None:
+    assert (
+        ClaudeBackend(_profile(), NativeStoreConfig()).capabilities().supports_structured_output
+        is True
+    )
+
+
+async def test_output_schema_is_passed_to_the_sdk_as_a_json_schema_output_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _install_fake_sdk_client(
+        monkeypatch, [_success_result(structured_output={"answer": 42})]
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    [event async for event in backend.run(_make_ctx(output_schema=_SCHEMA))]
+
+    assert cast(Any, captured[0]).output_format == {"type": "json_schema", "schema": _SCHEMA}
+
+
+async def test_no_output_schema_sends_no_output_format(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Without a schema the CLI must not be told to force structured output.
+    captured = _install_fake_sdk_client(monkeypatch, [_success_result()])
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_make_ctx(output_schema=None))]
+
+    assert cast(Any, captured[0]).output_format is None
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.final_text == "done"  # plain text turn unchanged
+    assert completed[0].result.structured_output is None
+
+
+async def test_structured_output_is_added_beside_the_prose_final_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-1.3, additive: the model's own text still streams and mirrors as
+    in a plain turn, `final_text` stays its prose, and the schema result is
+    ADDED as `structured_output`."""
+    from claude_agent_sdk import AssistantMessage, TextBlock
+
+    _install_fake_sdk_client(
+        monkeypatch,
+        [
+            AssistantMessage(content=[TextBlock(text="Here you go.")], model="claude-sonnet-4-5"),
+            _success_result(result="Here you go.", structured_output={"answer": 42}),
+        ],
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_make_ctx(output_schema=_SCHEMA))]
+
+    texts = [
+        e.message.content["text"]
+        for e in events
+        if isinstance(e, ItemCompleted) and e.message.kind == "text"
+    ]
+    assert texts == ["Here you go."]
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert len(completed) == 1
+    assert completed[0].result.end_reason == "end_turn"
+    assert completed[0].result.final_text == "Here you go."
+    assert completed[0].result.structured_output == {"answer": 42}
+
+
+async def test_clean_finish_without_structured_output_fails_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI silently disables structured output when it rejects the
+    schema at init, and then ends the turn as an ordinary success. A caller
+    who asked for a schema must not get a "completed" turn with prose where
+    the JSON should be."""
+    _install_fake_sdk_client(monkeypatch, [_success_result(structured_output=None)])
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_make_ctx(output_schema=_SCHEMA))]
+
+    assert not any(isinstance(e, TurnCompleted) for e in events)
+    failed = [e for e in events if isinstance(e, TurnFailed)]
+    assert len(failed) == 1
+    assert "structured output" in failed[0].error
+
+
+async def test_structured_output_retry_exhaustion_fails_the_turn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The CLI's own error result when no attempt produced schema-valid output.
+    _install_fake_sdk_client(
+        monkeypatch,
+        [
+            _success_result(
+                subtype="error_max_structured_output_retries",
+                is_error=True,
+                result=None,
+                terminal_reason="structured_output_retry_exhausted",
+                errors=["Output does not match required schema"],
+            )
+        ],
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_make_ctx(output_schema=_SCHEMA))]
+
+    assert not any(isinstance(e, TurnCompleted) for e in events)
+    failed = [e for e in events if isinstance(e, TurnFailed)]
+    assert len(failed) == 1
+    assert "does not match required schema" in failed[0].error
+
+
+async def test_max_tool_rounds_with_output_schema_stays_an_honest_partial(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The caller's cap ended the turn before any structured output: that
+    `end_reason` stands, with no structured result -- not a failure."""
+    capped = _success_result(
+        subtype="error_max_turns", is_error=True, terminal_reason="max_turns", result=None
+    )
+    _install_fake_sdk_client(monkeypatch, [capped])
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [
+        event async for event in backend.run(_make_ctx(output_schema=_SCHEMA, max_tool_rounds=1))
+    ]
+
+    assert not any(isinstance(e, TurnFailed) for e in events)
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.end_reason == "max_tool_rounds"
+    assert completed[0].result.structured_output is None

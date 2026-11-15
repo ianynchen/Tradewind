@@ -154,7 +154,7 @@ child = await s.spawn("summarize the findings", tier="light")   # subagent: fres
 ```python
 # Collected:
 result = await session.run("Refactor the parser", tier="strong")
-# result: TurnResult(turn_id, status, end_reason, final_text, usage, cost_usd)
+# result: TurnResult(turn_id, status, end_reason, final_text, usage, cost_usd, structured_output)
 
 # Cap the number of tool-execution rounds for one call:
 result = await session.run("Investigate, max two probes", max_tool_rounds=2)
@@ -177,7 +177,11 @@ The frozen event taxonomy (`tradewind.domain.events`): `TurnStarted`, `TextDelta
 `ItemCompleted` (carries a `NormalizedMessage` — the unit the mirror stores), `PermissionRequested`
 (emitted on deny), `TurnCompleted`, `TurnFailed`. Per-call overrides accepted by
 `run`/`stream`: `tier`, `system_prompt`, `output_schema`, `max_tool_rounds`,
-`history_scope`.
+`history_scope`. With `output_schema`, the turn's text and tool events are exactly those of a
+plain turn, and the schema-shaped result is ADDED as `result.structured_output` (a dict, also
+persisted) — the same field on every backend that supports structured output (codex, claude,
+langchain). `result.final_text` keeps the model's own final text (on codex that final answer is
+itself the JSON).
 
 ### What context the turn sees — `history_scope`
 
@@ -457,7 +461,7 @@ emulates silently — an unsupported call raises `Unsupported`.
 | Capability | langchain | claude | codex | cursor (EXPERIMENTAL) |
 |---|---|---|---|---|
 | `supports_system_prompt` | yes | yes | yes | no (emulated above the port) |
-| `supports_structured_output` | no | no | yes | no |
+| `supports_structured_output` | yes (forced schema-tool call, +1 model call) | yes (native `output_format`) | yes | no |
 | `supports_interactive_permissions` | yes | yes | yes | no |
 | `supports_in_process_tools` | yes | yes | no (MCP shim) | yes |
 | `supports_native_resume` | no (mirror rebuild) | yes | yes | yes |

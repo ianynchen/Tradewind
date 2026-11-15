@@ -362,6 +362,12 @@ class TurnResult:
     final_text: str | None
     usage: dict[str, int]
     cost_usd: float | None
+    # FR-1.3: the schema-shaped result of a turn run with `output_schema`,
+    # ADDED beside `final_text` (which keeps the model's own final text --
+    # except on codex, whose final answer IS the JSON). None on every turn
+    # without a schema, and on an honest partial (`max_tool_rounds`,
+    # `max_tokens`, `broker_terminated`) that ended before a result existed.
+    structured_output: dict[str, object] | None = None
 
 
 @dataclass

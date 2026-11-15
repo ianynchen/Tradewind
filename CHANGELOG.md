@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Structured output on the `claude` and `langchain` backends (FR-1.3):
+  `supports_structured_output` is now `True` on both, and `output_schema` no
+  longer raises `Unsupported` there (`cursor` still does). It is ADDITIVE on
+  every backend: a schema turn's text and tool events are exactly those of a
+  plain turn, and the result is added as the new
+  `TurnResult.structured_output` (a dict; `None` on a turn without a
+  schema). `final_text` keeps the model's own final text — prose on
+  `claude`/`langchain`, the JSON final answer on `codex`, which now also
+  sets `structured_output`.
+  - `claude` passes the schema as the SDK's native `output_format`.
+  - `langchain` makes ONE extra model call after the tool loop ends
+    (`end_turn`), with `tool_choice` forced to a single schema tool; the
+    call is not a tool round. The result is mirrored as one assistant
+    `kind="text"` item carrying its JSON text.
+  - A clean finish without a structured result is a `TurnFailed` on all
+    three backends; `max_tool_rounds`, `max_tokens` and
+    `broker_terminated` endings keep their `end_reason`, with no result.
+- `turns.structured_output` column (migration
+  `0003_tradewind_turn_structured_output`, applied automatically): the
+  result is persisted as JSON beside `final_text`.
+  `SessionStorePort.finalize_turn` takes a new optional
+  `structured_output` keyword, which the turn runner always passes; custom
+  store implementations must accept it.
+
 ## [0.11.2] - 2026-09-03
 
 ### Added

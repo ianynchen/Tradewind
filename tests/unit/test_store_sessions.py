@@ -63,6 +63,7 @@ def test_migrate_on_fresh_file_records_every_migration_as_applied(tmp_path: Path
     assert _applied_migration_ids(db_path) == [
         "0001_tradewind_schema",
         "0002_tradewind_meta",
+        "0003_tradewind_turn_structured_output",
     ]
 
 
@@ -74,6 +75,7 @@ def test_migrate_is_idempotent(tmp_path: Path) -> None:
     assert _applied_migration_ids(db_path) == [
         "0001_tradewind_schema",
         "0002_tradewind_meta",
+        "0003_tradewind_turn_structured_output",
     ]
 
 
@@ -98,6 +100,7 @@ def test_migrate_upgrades_a_store_left_at_an_older_migration(tmp_path: Path) -> 
     assert _applied_migration_ids(db_path) == [
         "0001_tradewind_schema",
         "0002_tradewind_meta",
+        "0003_tradewind_turn_structured_output",
     ]
     fresh = SqliteSessionStore(tmp_path / "fresh.db")
     fresh.migrate()
@@ -280,6 +283,7 @@ def test_older_store_migrates_forward_to_meta_without_touching_data(tmp_path: Pa
     assert _applied_migration_ids(db_path) == [
         "0001_tradewind_schema",
         "0002_tradewind_meta",
+        "0003_tradewind_turn_structured_output",
     ]
     assert reopened.get_session("sess-1") is not None
 

@@ -21,7 +21,7 @@ permanent self-skip.
 | `interrupt_midturn` | PASS | PASS (flaky — see below) | PASS | BLOCKED: no cursor subscription |
 | `resume_continues_context` | PASS | PASS | PASS | BLOCKED: no cursor subscription |
 | `history_flat_and_tree` | PASS | PASS | PASS | BLOCKED: no cursor subscription |
-| `structured_output` | SKIP (`supports_structured_output=False`) | SKIP (`supports_structured_output=False`) | PASS | BLOCKED: no cursor subscription |
+| `structured_output` | PASS (fake model, forced schema-tool call) | NOT YET RUN LIVE (scenario rewritten for `TurnResult.structured_output`; spend-capped at $0.05) | PASS before the rewrite; NOT YET RE-RUN for `structured_output` | BLOCKED: no cursor subscription |
 | `system_prompt_respected` | PASS | PASS | PASS | BLOCKED: no cursor subscription |
 
 Commands:

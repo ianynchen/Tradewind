@@ -414,11 +414,12 @@ class SqliteSessionStore(SessionStorePort):
         usage: dict[str, object] | None,
         cost_usd: float | None,
         error: str | None,
+        structured_output: dict[str, object] | None = None,
     ) -> None:
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE turns SET status = ?, final_text = ?, usage_json = ?, cost_usd = ?, "
-                "completed_at = ?, error_json = ? WHERE turn_id = ?",
+                "completed_at = ?, error_json = ?, structured_output = ? WHERE turn_id = ?",
                 (
                     status,
                     final_text,
@@ -426,6 +427,7 @@ class SqliteSessionStore(SessionStorePort):
                     cost_usd,
                     _now_iso(),
                     json.dumps(error) if error is not None else None,
+                    json.dumps(structured_output) if structured_output is not None else None,
                     turn_id,
                 ),
             )
