@@ -76,7 +76,10 @@ in a multi-user setting (separate OS users, environment allowlists, separate
 2. **PR 1 — shared parts, all backends:** engine-auto permission mode
    (Claude, Codex, Antigravity-ready); slash commands off (Claude, Codex);
    the backend-neutral broker vocabulary (`native`); the result-tool seam in
-   `ToolHost`/`turn_runner`; the `prepare_turn` port hook; cancellation of
+   `ToolHost`/`turn_runner`; the `prepare_turn` port hook and the runner's
+   stop checks around it; `ctx.timeout_reason` and the runner's timeout
+   notice; the runner's broker wrapper for pending-approval activity;
+   cancellation of
    abandoned shim calls in `ToolHost`; the inactivity watchdog and its
    activity channel, wired for Claude, Codex and LangChain; `jsonschema`
    declared; a fake backend that exercises the seams as Antigravity will. One
@@ -114,7 +117,8 @@ installed `agy` with Tradewind's settings in broker mode. It plants traps
 and observes them directly, because ACP does not report every action. The check has its own
 time limit (default 15 minutes); hitting it records the outcome **"timed out"**
 for that version, which is not a fail: the waiting broker-mode turns are
-refused with a notice, and the next broker-mode turn runs the check again,
+refused before `TurnStarted` with `ConfigError("Antigravity safety check
+timed out for agy <version>; retry later")`, and the next broker-mode turn runs the check again,
 at most once per hour per version (backoff), so a slow check cannot run on
 every turn. (A single trap that stays inconclusive after its retries still
 makes the check fail.) The check runs in its own throwaway workspace. A `stop()` while a turn waits in `prepare_turn` for the check cancels
@@ -325,7 +329,10 @@ it starts the FR-6.6 watchdog and before `TurnStarted`, so slow preparation
   broker it puts on `TurnContext` (every backend and `ToolHost` call
   `ctx.broker.decide`), counts pending calls with a counter, and reports
   `approval_ended` in a `finally`, so a cancelled call never stays open.
-  Backends do not report approvals themselves. (The "broker error or
+  Backends do not report approvals themselves. The same wrapped broker is
+  given to `ToolHost` (which gets its broker from its constructor) and to
+  `TurnContext`, and the wrapper keeps the `is_default_allow_all` marker
+  of the broker it wraps, so the no-broker → engine-auto rule still works. (The "broker error or
   timeout → deny" rule in the Permissions table refers to the broker's own
   error or its own timeout, not to these timers.) The kinds are: `model`,
   `tool_started`, `tool_output`, `tool_ended`, `background_started`,
@@ -489,7 +496,11 @@ its CLI reminder fires.
   workspace-customization outcomes (stop, delete with backup and notice, proceed with notice, no callback → stop);
   slash-prefixed prompt; resume; interrupt with a surviving child process;
   turn waits for a background task; engine-auto and no-broker paths;
-  version record; capability flags.
+  version record; check timeout and its 1-hour backoff; `stop()` while a
+  turn waits for the check; the timeout notice before a racing backend
+  terminal event; PID reuse not reported; pending approval pauses the
+  silence timers; background work keeps model silence from firing;
+  capability flags.
 - Live conformance (`tests/conformance/test_antigravity.py`, env gate
   `TRADEWIND_RUN_ANTIGRAVITY_INTEGRATION`, `integration` marker, 3-minute
   time box, cheapest model), run once by the operator: plain turn; structured
