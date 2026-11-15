@@ -20,7 +20,7 @@ from tradewind.adapters.claude_backend import ClaudeBackend
 from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import TurnContext
 from tradewind.application.tool_host import ToolHost
-from tradewind.domain.events import ItemCompleted, TurnCompleted, TurnFailed
+from tradewind.domain.events import ItemCompleted, PermissionRequested, TurnCompleted, TurnFailed
 from tradewind.domain.models import (
     ModelSpec,
     Profile,
@@ -757,3 +757,276 @@ async def test_max_tool_rounds_with_output_schema_stays_an_honest_partial(
     completed = [e for e in events if isinstance(e, TurnCompleted)]
     assert completed[0].result.end_reason == "max_tool_rounds"
     assert completed[0].result.structured_output is None
+
+
+# --- FR-6.5 on a schema turn: the cap counts CALLER tool rounds exactly.
+# The CLI's `max_turns` keeps headroom for the StructuredOutput call, so the
+# adapter itself denies (and interrupts) the first caller tool past the cap.
+# The fake below plays the CLI: it streams each response's AssistantMessage,
+# then asks `can_use_tool` for each tool in it, as the CLI's control
+# requests do. ---
+
+
+class _AllowBroker:
+    async def decide(self, _tool_name: str, _tool_input: dict[str, object]) -> Verdict:
+        return "allow"
+
+
+def _install_cli_like_client(
+    monkeypatch: pytest.MonkeyPatch,
+    responses: list[list[tuple[str, str]]],
+    *,
+    ask_before_streaming: bool = False,
+) -> list[object]:
+    """`responses`: one list of `(tool_use_id, tool_name)` per model
+    response. A response with no tools ends the turn. Records every
+    permission result. `ask_before_streaming` sends a response's permission
+    request BEFORE its message reaches the stream consumer."""
+    import asyncio
+
+    from claude_agent_sdk import (
+        AssistantMessage,
+        PermissionResultDeny,
+        ToolPermissionContext,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
+
+    decisions: list[object] = []
+
+    class _CliLikeClient:
+        def __init__(self, options: Any) -> None:
+            self._options = options
+
+        async def connect(self, _prompt: str) -> None:
+            pass
+
+        async def receive_response(self) -> Any:
+            can_use_tool = self._options.can_use_tool
+            for index, tools in enumerate(responses):
+                message = AssistantMessage(
+                    content=[ToolUseBlock(id=i, name=n, input={}) for i, n in tools],
+                    model="claude-sonnet-4-5",
+                    message_id=f"msg-{index}",
+                )
+
+                async def ask(tools: list[tuple[str, str]] = tools) -> list[object]:
+                    return [
+                        await can_use_tool(n, {}, ToolPermissionContext(tool_use_id=i))
+                        for i, n in tools
+                    ]
+
+                if ask_before_streaming and tools:
+                    pending = asyncio.ensure_future(ask())
+                    # Let the permission request start (and block) BEFORE
+                    # the consumer sees the message holding the call.
+                    await asyncio.sleep(0)
+                    assert not pending.done()
+                    yield message
+                    results = await pending
+                else:
+                    yield message
+                    results = await ask() if tools else []
+                decisions.extend(results)
+                if any(isinstance(r, PermissionResultDeny) and r.interrupt for r in results):
+                    yield _success_result(terminal_reason="aborted_tools", result=None)
+                    return
+                if not tools:
+                    break
+                yield UserMessage(
+                    content=[
+                        ToolResultBlock(tool_use_id=i, content="ok", is_error=None)
+                        for i, _ in tools
+                    ]
+                )
+            yield _success_result(structured_output={"answer": 1})
+
+        async def disconnect(self) -> None:
+            pass
+
+    monkeypatch.setattr(claude_backend_module, "ClaudeSDKClient", _CliLikeClient)
+    return decisions
+
+
+def _capped_schema_ctx(max_tool_rounds: int) -> TurnContext:
+    ctx = _make_ctx(output_schema=_SCHEMA, max_tool_rounds=max_tool_rounds)
+    ctx.broker = cast(Any, _AllowBroker())
+    return ctx
+
+
+async def test_schema_turn_with_zero_cap_executes_no_caller_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """FR-6.5: `max_tool_rounds=0` means no tool execution, schema or not."""
+    from claude_agent_sdk import PermissionResultDeny
+
+    decisions = _install_cli_like_client(
+        monkeypatch, [[("t1", "mcp__tradewind__x")], [("so", "StructuredOutput")]]
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_capped_schema_ctx(0))]
+
+    assert len(decisions) == 1
+    assert isinstance(decisions[0], PermissionResultDeny)
+    assert decisions[0].interrupt is True
+    assert not any(isinstance(e, PermissionRequested) for e in events)  # not a broker denial
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert len(completed) == 1
+    assert completed[0].result.end_reason == "max_tool_rounds"
+    assert completed[0].result.structured_output is None
+
+
+async def test_schema_turn_with_cap_one_runs_exactly_one_caller_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+    decisions = _install_cli_like_client(
+        monkeypatch,
+        [
+            [("t1", "mcp__tradewind__x"), ("t2", "mcp__tradewind__y")],
+            [("t3", "mcp__tradewind__x")],
+        ],
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_capped_schema_ctx(1))]
+
+    # Round 1 (both of its calls) runs; round 2's first call is stopped.
+    assert [type(d) for d in decisions] == [
+        PermissionResultAllow,
+        PermissionResultAllow,
+        PermissionResultDeny,
+    ]
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.end_reason == "max_tool_rounds"
+
+
+async def test_structured_output_call_is_not_a_caller_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cap 0, and the model calls StructuredOutput directly: that is not a
+    caller round, so the turn completes with its result."""
+    decisions = _install_cli_like_client(monkeypatch, [[("so", "StructuredOutput")], []])
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_capped_schema_ctx(0))]
+
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.end_reason == "end_turn"
+    assert completed[0].result.structured_output == {"answer": 1}
+    assert len(decisions) == 1
+
+
+async def test_cap_holds_when_the_permission_request_overtakes_the_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The SDK starts a permission handler as soon as it reads the request,
+    possibly before the stream consumer has seen the message that holds
+    the call: the check must wait for it, not guess."""
+    from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+    decisions = _install_cli_like_client(
+        monkeypatch,
+        [[("t1", "mcp__tradewind__x")], [("t2", "mcp__tradewind__x")]],
+        ask_before_streaming=True,
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_capped_schema_ctx(1))]
+
+    # Round 1 allowed (it waited, it did not guess "over the cap"); round 2 stopped.
+    assert [type(d) for d in decisions] == [PermissionResultAllow, PermissionResultDeny]
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.end_reason == "max_tool_rounds"
+
+
+def test_native_transcript_cut_after_the_call_still_drops_its_result() -> None:
+    """Reconcile reads from after the last mirrored id -- which can be the
+    very message holding the StructuredOutput call. Its result, after the
+    cut, must still be recognized and dropped (no orphan tool_result)."""
+    from claude_agent_sdk import SessionMessage
+
+    from tradewind.adapters.claude_backend import native_transcript_items
+
+    entries = [
+        SessionMessage(
+            type="assistant",
+            uuid="a-1",
+            session_id="sess-1",
+            message={
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_so", "name": "StructuredOutput", "input": {}}
+                ],
+            },
+        ),
+        SessionMessage(
+            type="user",
+            uuid="u-1",
+            session_id="sess-1",
+            message={
+                "role": "user",
+                "content": [{"type": "tool_result", "tool_use_id": "toolu_so", "content": "ok"}],
+            },
+        ),
+    ]
+
+    assert native_transcript_items(entries, after_native_id="a-1") == []
+
+
+async def test_retry_exhaustion_without_result_text_keeps_the_streamed_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI's error results carry `errors`, often with `result=None`: the
+    turn's text must still be kept, from the last assistant text streamed."""
+    from claude_agent_sdk import AssistantMessage, TextBlock
+
+    _install_fake_sdk_client(
+        monkeypatch,
+        [
+            AssistantMessage(content=[TextBlock(text="first")], model="claude-sonnet-4-5"),
+            AssistantMessage(content=[TextBlock(text="last words")], model="claude-sonnet-4-5"),
+            _success_result(
+                subtype="error_max_structured_output_retries",
+                is_error=True,
+                result=None,
+                terminal_reason="structured_output_retry_exhausted",
+                errors=["no valid output"],
+            ),
+        ],
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_make_ctx(output_schema=_SCHEMA))]
+
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.final_text == "last words"
+    assert completed[0].result.structured_output is None
+
+
+async def test_structured_output_reminder_in_the_live_stream_is_not_surfaced(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the model first ends with plain text, the CLI yields an
+    `isMeta` user message "[structured-output-enforce] You MUST call the
+    StructuredOutput tool ..." -- engine plumbing, never a mirrored item."""
+    from claude_agent_sdk import UserMessage
+
+    _install_fake_sdk_client(
+        monkeypatch,
+        [
+            UserMessage(
+                content="[structured-output-enforce] You MUST call the StructuredOutput tool "
+                "to complete this request. Call this tool now."
+            ),
+            _success_result(structured_output={"answer": 1}),
+        ],
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_make_ctx(output_schema=_SCHEMA))]
+
+    assert not any(isinstance(e, ItemCompleted) for e in events)

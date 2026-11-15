@@ -35,10 +35,14 @@ row, "force once at the end"): the tool loop runs exactly as without a
 schema. When the model ends its turn without tool calls (`end_turn`), ONE
 more model call is made with `tool_choice` forced to a single schema tool
 built from `ctx.output_schema`; its arguments become ONLY
-`TurnResult.structured_output`. That call emits nothing -- no delta, no
-item, no mirrored `tool_use` -- so a schema turn's events and mirror are
-exactly a plain turn's, and `final_text` keeps the model's natural final
-text. A forced call that does not call the schema tool leaves the result
+`TurnResult.structured_output`. That call emits no CONTENT -- no delta, no
+text/tool item, no mirrored `tool_use` -- so a schema turn's content events
+and mirror are exactly a plain turn's, and `final_text` keeps the model's
+natural final text. One precise exception: the forced call is a model call
+under the FR-6.6 policy, so its OPERATIONAL notices -- a `retry_scheduled`
+event item, and on context overflow the recovery compaction record and its
+notice -- are still emitted and mirrored, as for any model call (nothing is
+lost). A forced call that does not call the schema tool leaves the result
 None; the turn still completes.
 """
 

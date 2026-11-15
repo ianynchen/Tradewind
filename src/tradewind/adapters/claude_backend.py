@@ -71,7 +71,8 @@ exactly a plain turn's: the CLI's `StructuredOutput` `tool_use`/`tool_result`
 pair is engine plumbing, hidden from the live stream AND from
 `native_transcript_items` (so reconcile never backfills it); the tool is
 auto-allowed without consulting the broker; and it does not cost the caller
-a tool round (`_build_options`'s `max_turns`). A schema turn that ends
+a tool round -- `_build_options` gives the CLI's `max_turns` headroom for it,
+and `_CallerRoundCap` keeps `max_tool_rounds` exact for caller tools. A schema turn that ends
 without a valid result -- a clean finish with no `structured_output` (the
 CLI silently disables structured output when it rejects a schema at init),
 or the CLI's own `error_max_structured_output_retries` -- still COMPLETES,
@@ -420,12 +421,22 @@ def native_transcript_items(
     found among `entries` is treated as "not present yet" and nothing is
     dropped.
     """
+    # StructuredOutput call ids from EVERY entry, before the cut: the cut can
+    # fall right after the call, leaving only its result to drop.
+    hidden_ids: set[str] = {
+        cast(str, block.get("id"))
+        for entry in entries
+        if isinstance(entry.message, dict) and isinstance(entry.message.get("content"), list)
+        for block in cast("list[Any]", entry.message["content"])
+        if isinstance(block, dict)
+        and block.get("type") == "tool_use"
+        and block.get("name") == _STRUCTURED_OUTPUT_TOOL
+    }
     if after_native_id is not None:
         index = next((i for i, e in enumerate(entries) if e.uuid == after_native_id), None)
         if index is not None:
             entries = entries[index + 1 :]
     items: list[NormalizedMessage] = []
-    hidden_ids: set[str] = set()
     for entry in entries:
         message = entry.message if isinstance(entry.message, dict) else {}
         content = message.get("content")
@@ -541,16 +552,87 @@ def _make_precompact_hook(pending_events: list[Event]) -> HookCallback:
     return on_pre_compact
 
 
+# How long a permission request may wait for the stream to show the model
+# response that holds its call (`_CallerRoundCap.is_over_cap`). The SDK queues
+# that message before it even reads the request, so this is a deadlock guard
+# only; past it the call is treated as over the cap (fail closed).
+_ROUND_LOOKUP_TIMEOUT_S = 30.0
+
+
+class _CallerRoundCap:
+    """Exact caller-tool-round cap for a schema turn (FR-6.5 with FR-1.3).
+
+    A schema turn gives the CLI `max_turns` headroom for its StructuredOutput
+    call (`_build_options`), so the CLI no longer enforces
+    `max_tool_rounds` exactly; this does. `_drive_client` feeds it every
+    `AssistantMessage` (`observe`); a round is one model response
+    (`message_id` -- the CLI streams one `AssistantMessage` per content
+    block, all sharing it) holding at least one caller tool call. The
+    permission bridge asks `is_over_cap` per call. Per-turn state, touched
+    only from this turn's event loop.
+    """
+
+    def __init__(self, cap: int) -> None:
+        self.cap = cap
+        # Set once a call was refused for the cap; `_drive_client` then maps
+        # the CLI's aborted result to an honest `max_tool_rounds` completion.
+        self.hit = False
+        self._round_of_response: dict[str, int] = {}
+        self._round_of_call: dict[str, int] = {}
+        self._changed = anyio.Event()
+
+    def observe(self, message: AssistantMessage) -> None:
+        caller_ids = [
+            block.id
+            for block in message.content
+            if isinstance(block, ToolUseBlock) and block.name != _STRUCTURED_OUTPUT_TOOL
+        ]
+        if not caller_ids:
+            return
+        response = message.message_id or message.uuid or caller_ids[0]
+        round_number = self._round_of_response.setdefault(
+            response, len(self._round_of_response) + 1
+        )
+        for call_id in caller_ids:
+            self._round_of_call[call_id] = round_number
+        self._changed.set()
+        self._changed = anyio.Event()
+
+    async def is_over_cap(self, tool_use_id: str | None) -> bool:
+        """Whether the call `tool_use_id` belongs to a round past the cap.
+        Waits for the stream to show it: the SDK may start this permission
+        handler before `_drive_client` has read the message holding it."""
+        if tool_use_id is None:
+            return True  # the wire protocol always sends one; fail closed
+        with anyio.move_on_after(_ROUND_LOOKUP_TIMEOUT_S):
+            while tool_use_id not in self._round_of_call:
+                await self._changed.wait()
+        round_number = self._round_of_call.get(tool_use_id)
+        return round_number is None or round_number > self.cap
+
+
 def _make_can_use_tool(
-    broker: PermissionBroker, pending_events: list[Event], terminate_flag: list[bool]
+    broker: PermissionBroker,
+    pending_events: list[Event],
+    terminate_flag: list[bool],
+    round_cap: _CallerRoundCap | None = None,
 ) -> CanUseTool:
     async def can_use_tool(
-        tool_name: str, tool_input: dict[str, Any], _context: ToolPermissionContext
+        tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
     ) -> PermissionResult:
         if tool_name == _STRUCTURED_OUTPUT_TOOL:
             # FR-1.3: the CLI's own structured-output tool is plumbing, not
             # a caller tool -- the broker never sees it.
             return PermissionResultAllow()
+        if round_cap is not None and await round_cap.is_over_cap(context.tool_use_id):
+            # FR-6.5 on a schema turn: the caller's cap, enforced here (not
+            # a broker verdict, so no PermissionRequested). Interrupting
+            # ends the CLI's loop; `_drive_client` reports the honest
+            # `max_tool_rounds` completion.
+            round_cap.hit = True
+            return PermissionResultDeny(
+                message=f"max_tool_rounds ({round_cap.cap}) reached", interrupt=True
+            )
         bare_name = _strip_server_prefix(tool_name)
         input_dict = cast("dict[str, object]", tool_input)
         decision = await broker.decide(bare_name, input_dict)
@@ -692,7 +774,11 @@ class ClaudeBackend(Backend):
             )
 
     def _build_options(
-        self, ctx: TurnContext, pending_events: list[Event], terminate_flag: list[bool]
+        self,
+        ctx: TurnContext,
+        pending_events: list[Event],
+        terminate_flag: list[bool],
+        round_cap: _CallerRoundCap | None = None,
     ) -> ClaudeAgentOptions:
         system_prompt = (
             {"type": "preset", "preset": "claude_code", "append": ctx.system_prompt}
@@ -702,7 +788,7 @@ class ClaudeBackend(Backend):
         return ClaudeAgentOptions(
             tools=[],
             mcp_servers=cast("dict[str, Any]", _build_mcp_servers(ctx.tools)),
-            can_use_tool=_make_can_use_tool(ctx.broker, pending_events, terminate_flag),
+            can_use_tool=_make_can_use_tool(ctx.broker, pending_events, terminate_flag, round_cap),
             hooks={"PreCompact": [HookMatcher(hooks=[_make_precompact_hook(pending_events)])]},
             system_prompt=cast(Any, system_prompt),
             model=ctx.model_spec.model,
@@ -716,7 +802,9 @@ class ClaudeBackend(Backend):
             # own. A schema turn adds ONE more (FR-1.3): the CLI counts its
             # StructuredOutput call as a turn, and when the model first ends
             # with plain text it appends a reminder and asks again -- so N
-            # caller rounds need at most N + 2 responses there.
+            # caller rounds need at most N + 2 responses there. That
+            # headroom would also admit an (N+1)th caller round, so on a
+            # schema turn `_CallerRoundCap` enforces N exactly.
             max_turns=(
                 None
                 if ctx.max_tool_rounds is None
@@ -754,11 +842,18 @@ class ClaudeBackend(Backend):
             )
         pending_events: list[Event] = []
         terminate_flag = [False]
-        client = ClaudeSDKClient(self._build_options(ctx, pending_events, terminate_flag))
+        round_cap = (
+            _CallerRoundCap(ctx.max_tool_rounds)
+            if ctx.output_schema is not None and ctx.max_tool_rounds is not None
+            else None
+        )
+        client = ClaudeSDKClient(
+            self._build_options(ctx, pending_events, terminate_flag, round_cap)
+        )
         self._clients[session_id] = client
         try:
             async for event in self._drive_client(
-                client, ctx, effective_prompt, pending_events, terminate_flag
+                client, ctx, effective_prompt, pending_events, terminate_flag, round_cap
             ):
                 yield event
         except Exception as exc:
@@ -789,6 +884,7 @@ class ClaudeBackend(Backend):
         prompt: str,
         pending_events: list[Event],
         terminate_flag: list[bool],
+        round_cap: _CallerRoundCap | None = None,
     ) -> AsyncIterator[Event]:
         # FR-6.6 pre-turn retry: connect/spawn failures are the one class
         # provably free of duplicated tool side effects (nothing ran yet).
@@ -818,14 +914,21 @@ class ClaudeBackend(Backend):
         # The CLI's StructuredOutput pair (FR-1.3) is hidden from the stream;
         # its ids carry from the call's message to the result's.
         hidden_ids: set[str] = set()
+        # The last assistant text streamed: an error result often carries no
+        # `result` text, and FR-1.3 keeps the turn's text on a completion.
+        last_text: str | None = None
         async for message in client.receive_response():
             for event in pending_events:
                 yield event
             pending_events.clear()
             if isinstance(message, AssistantMessage):
+                if round_cap is not None:
+                    round_cap.observe(message)
                 for item in _without_structured_output(
                     assistant_message_items(message), hidden_ids
                 ):
+                    if item.kind == "text":
+                        last_text = cast(str, item.content["text"])
                     yield ItemCompleted(message=item)
             elif isinstance(message, UserMessage):
                 for item in _without_structured_output(user_message_items(message), hidden_ids):
@@ -844,6 +947,23 @@ class ClaudeBackend(Backend):
                                 status="completed",
                                 end_reason="broker_terminated",
                                 final_text=message.result,
+                                usage=_usage_ints(message.usage),
+                                cost_usd=message.total_cost_usd,
+                            )
+                        )
+                        return
+                    if round_cap is not None and round_cap.hit:
+                        # FR-6.5: this abort was OUR cap denial on a schema
+                        # turn -- the same honest partial a plain capped
+                        # turn reports, with no structured result.
+                        yield TurnCompleted(
+                            result=TurnResult(
+                                turn_id=ctx.turn_id,
+                                status="completed",
+                                end_reason="max_tool_rounds",
+                                final_text=message.result
+                                if message.result is not None
+                                else last_text,
                                 usage=_usage_ints(message.usage),
                                 cost_usd=message.total_cost_usd,
                             )
@@ -868,6 +988,8 @@ class ClaudeBackend(Backend):
                     yield TurnFailed(turn_id=ctx.turn_id, error=_result_error(message))
                     return
                 result = turn_result_from_result_message(message, ctx.turn_id)
+                if result.final_text is None and is_structured_output_exhausted_result(message):
+                    result.final_text = last_text
                 if ctx.output_schema is not None and isinstance(message.structured_output, dict):
                     # FR-1.3, additive: `final_text` stays the model's prose
                     # (`ResultMessage.result`); the result is ADDED beside

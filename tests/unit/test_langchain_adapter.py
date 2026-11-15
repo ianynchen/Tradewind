@@ -1355,3 +1355,34 @@ async def test_iteration_limit_is_unchanged_by_a_schema() -> None:
     failed = [e for e in events if isinstance(e, TurnFailed)]
     assert len(failed) == 1
     assert "max iterations" in failed[0].error
+
+
+async def test_forced_call_may_use_the_slot_after_a_full_tool_loop() -> None:
+    """24 tool rounds, a plain end on call 25 (the loop's last allowed
+    call), then the forced call as call 26: the turn completes with its
+    result -- the extra slot exists for exactly this call."""
+
+    async def handler(**_: object) -> str:
+        return "ok"
+
+    tool_host = ToolHost(
+        [Tool(name="t", description="d", input_schema={"type": "object"}, handler=handler)],
+        [],
+        lambda ref: ref,
+    )
+    tool_round = AIMessage(
+        content="",
+        tool_calls=[{"name": "t", "args": {}, "id": "call_r", "type": "tool_call"}],
+    )
+    model = _RecordingChatModel(
+        responses=[*([tool_round] * 24), AIMessage(content="finally"), _forced({"answer": 3})]
+    )
+    ctx = _schema_ctx(tools=tool_host, broker=_AllowAllBroker())
+
+    events = [event async for event in _backend(model).run(ctx)]
+
+    assert len(model.calls) == 26
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.end_reason == "end_turn"
+    assert result.final_text == "finally"
+    assert result.structured_output == {"answer": 3}
