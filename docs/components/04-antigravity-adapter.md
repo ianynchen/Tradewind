@@ -113,10 +113,12 @@ in a multi-user setting (separate OS users, environment allowlists, separate
 installed `agy` with Tradewind's settings in broker mode. It plants traps
 and observes them directly, because ACP does not report every action. The check has its own
 time limit (default 15 minutes); hitting it records the version as
-"inconclusive (timed out)", which counts as a fail. A `stop()` while turns
-wait for the check or for a lock cancels the waiting turn (it raises
-`TurnInterrupted` before `TurnStarted`); the check itself completes and
-records its result. Traps work (e.g.
+"inconclusive (timed out)", which counts as a fail. A `stop()` while a turn
+waits for the check or for a lock cancels that `prepare_turn` (the runner
+treats it like a stop before `TurnStarted` and records the turn as
+interrupted, the same terminal handling it uses today when the stream ends
+without a terminal event after `stop()`); the check itself completes and
+records its result. No new error class is added. Traps work (e.g.
 subagent calls look like ordinary calls):
 
 - marker files for writes inside and outside the workspace;
