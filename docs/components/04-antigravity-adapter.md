@@ -218,7 +218,7 @@ calls. The builder may revisit a call only by raising it.
 
 | Decision | Choice | Why |
 |---|---|---|
-| Workspace customizations **(owner, C1)** | Before spawn, look in the cwd, the repo root and every folder between them for `.agents/`, `.gemini/`, `.agent/` content other than empty skill folders (hooks, plugins, skills, MCP config); the spike confirms `agy` loads from nowhere else. If found, call the caller's `on_workspace_customizations(files) -> "stop" \| "delete" \| "proceed"`. No callback, or a callback error → `stop` (`ConfigError` listing the files). `delete`: copy the files to a timestamped backup folder in Tradewind's data folder, then delete them from the workspace; `run()` emits a notice after `TurnStarted` naming the deleted files and the backup path. Tradewind never restores them; restoring is the user's responsibility (owner). If the files are tracked by git, the deletion is a normal working-tree change that a later commit may include; that is also the user's responsibility. `proceed`: `run()` emits a notice after `TurnStarted`: "Antigravity customizations loaded without broker control: <files>" | Hooks and plugins run without any approval request. The owner's ruling, literally: stop, delete, or proceed. |
+| Workspace customizations **(owner, C1)** | Before spawn, look in the cwd, the repo root and every folder between them for `.agents/`, `.gemini/`, `.agent/` content other than empty skill folders (hooks, plugins, skills, MCP config); the spike confirms `agy` loads from nowhere else. If found, call the caller's `on_workspace_customizations(files: list[Path]) -> Awaitable[Literal["stop", "delete", "proceed"]]` (absolute paths; async, awaited in `prepare_turn`, cancelled by `stop()` like the wait for the check). It is a live object like the broker: excluded from the session snapshot and supplied again by the embedder at resume. No callback, or a callback error → `stop` (`ConfigError` listing the files). `delete`: copy the files to a timestamped backup folder in Tradewind's data folder, then delete them from the workspace; `run()` emits a notice after `TurnStarted` naming the deleted files and the backup path. Tradewind never restores them; restoring is the user's responsibility (owner). Only the files found by the scan in `prepare_turn` are deleted; a file already gone is skipped. The backup folder is `<timestamp>-<turn id>` and keeps paths relative to the repo root. If any copy fails, nothing is deleted and the turn raises `ConfigError` before `TurnStarted`. If the files are tracked by git, the deletion is a normal working-tree change that a later commit may include; that is also the user's responsibility. `proceed`: `run()` emits a notice after `TurnStarted`: "Antigravity customizations loaded without broker control: <files>" | Hooks and plugins run without any approval request. The owner's ruling, literally: stop, delete, or proceed. |
 | Empty skill folders | `agy` creates empty `.gemini/skills` and `.agents/skills` in the cwd; they are ignored by the check and left in place | They hold nothing that runs. |
 | Slash commands **(owner, M11)** | Off: a prompt is always a message to the model. Use the engine's own off switch where it exists; otherwise a prompt whose first non-whitespace character is `/` is sent with the plain-text prefix `Message: ` (so `/clear the old tests` reaches the model as `Message: /clear the old tests`); the mirror keeps the caller's original prompt. The spike and PR 1 confirm per engine that the prefixed form is not expanded. (Claude and Codex in PR 1, same rule.) | A prompt from a PR description must not run `/logout` or `/clear`. |
 | Skills | Not separately blocked. Prompt-triggered skills are off (slash commands); workspace skills fall under C1; default customizations are off; a skill's actions are tool calls and are decided like any other | A skill gives the model instructions, not permissions. |
@@ -387,7 +387,7 @@ it starts the FR-6.6 watchdog and before `TurnStarted`, so slow preparation
   work-state updates).
 - A backend declares `supports_inactivity_watchdog` (capability flag).
 
-PR 2: `BackendName` gains `"antigravity"` and the backend registry entry;
+PR 2 (with an ADR, or an amendment to the PR 1 ADR, for its public-interface changes): `BackendName` gains `"antigravity"` and the backend registry entry;
 `NativeStoreConfig.antigravity_dir`; the `on_workspace_customizations`
 callback in `SessionOptions`; the verified-version record; `turn_runner`
 passes the broker to `ToolHost` for `antigravity` as for `codex`.
@@ -397,7 +397,9 @@ FR for `permission_mode` / engine-auto, a new FR for "a prompt is always a
 message" (slash commands off), the FR-4 broker vocabulary (`native`), the
 result-tool seam, FR-6.6 (inactivity watchdog; hard limit optional where
 supported), FR-8.1 (the engine-auto and inactivity-watchdog flags), the
-`prepare_turn` hook; PR 2 — glossary ("four backends"), FR-1.3 (the Antigravity
+`prepare_turn` hook, the event-order invariant in the port docstring and
+FR-2 (a terminal record without `TurnStarted` when a turn is stopped
+around `prepare_turn`), and "every backend" in place of "four" in FR-6.6; PR 2 — a new FR for workspace customizations (C1: stop, delete, proceed), glossary and FR-9.1 ("four backends"), FR-1.3 (the Antigravity
 reminder exchange), FR-3.1,
 FR-4.1, FR-6.3/6.4 (store isolation mandatory here; no transcript
 reconcile), FR-8.2, NFR-4 (latest `agy` plus the automatic check, not an
