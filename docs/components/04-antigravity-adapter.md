@@ -117,9 +117,8 @@ for that version, which is not a fail: the waiting broker-mode turns are
 refused with a notice, and the next broker-mode turn runs the check again,
 at most once per hour per version (backoff), so a slow check cannot run on
 every turn. (A single trap that stays inconclusive after its retries still
-makes the check fail.) The check does not hold the repo lock: it runs in its
-own throwaway workspace. A `stop()` while a turn waits in `prepare_turn` (for the check or the
-lock) cancels that wait: the Antigravity backend counts a turn as in flight
+makes the check fail.) The check runs in its own throwaway workspace. A `stop()` while a turn waits in `prepare_turn` for the check cancels
+that wait: the Antigravity backend counts a turn as in flight
 from the start of `prepare_turn`, so `interrupt()` reaches it;
 `prepare_turn` returns, and the runner sees the stop request and records
 the turn as interrupted without calling `run()`. The check runs in its own
@@ -209,14 +208,13 @@ calls. The builder may revisit a call only by raising it.
 | Login and token **(owner, M1)** | The spike finds where the token lives (keychain or file) and whether profiles are separate. If they cannot be separated, Tradewind shares the owner's login (accepted fallback). T3's `GEMINI_HOME` / `AGY_ACP_FORCE_FILE_STORAGE` are **not** used: they do not exist in 1.5.3 | A shared login adds no security risk (the token is already in the keychain); side effects are a shared quota and one account. |
 | Environment **(owner, M4)** | Inherit the owner's environment. Remove only variables that switch `agy` away from subscription auth (at least `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`; the spike lists the full set) | Scope rule: no more risk than the owner's terminal; tools need `SSH_AUTH_SOCK`, `GH_TOKEN`, deploy credentials, proxies. |
 | AI credits | Off in Tradewind's settings | Unattended turns must not spend paid credits when the quota runs out. |
-| Parallel turns | Allowed, also in one repo (shared repo lock; only a `set_aside` turn is exclusive). The spike runs several in parallel on one profile (database locks, token refresh); if they conflict, turns on one profile are serialised | — |
+| Parallel turns | Allowed. The spike runs several in parallel on one profile (database locks, token refresh); if they conflict, turns on one profile are serialised | — |
 
 ### Workspace and prompt
 
 | Decision | Choice | Why |
 |---|---|---|
-| Workspace customizations **(owner, C1)** | Before spawn, look in the cwd, the repo root and every folder between them for `.agents/`, `.gemini/`, `.agent/` content other than empty skill folders (hooks, plugins, skills, MCP config); the spike confirms `agy` loads from nowhere else. If found, call the caller's `on_workspace_customizations(files) -> "stop" \| "set_aside" \| "proceed"`. No callback, or a callback error → `stop` (`ConfigError` listing the files). `proceed`: `run()` emits a notice after `TurnStarted`: "Antigravity customizations loaded without broker control: <files>" | Hooks and plugins run without any approval request. |
-| `set_aside` details | Allowed only for files git does **not** track; if any found file is tracked, `set_aside` is refused and the turn stops with that reason (moving a tracked file is a deletion to git, which `git add -A` would commit). **The repo** is the realpath of the cwd's git top-level (`git rev-parse --show-toplevel`; each git worktree is its own repo, which is how Meridian runs Antigravity work in parallel), or the realpath of the cwd when it is not in git. The **repo lock** is a shared/exclusive OS file lock (`flock`) on a lock file in Tradewind's data folder named by a hash of that path, plus an in-process reader/writer lock for turns in one process. **Every** Antigravity turn takes it **shared** in `prepare_turn`, before crash recovery and the C1 scan, and holds it to the end of the turn; normal turns therefore run in parallel. A turn whose answer is `set_aside` releases its shared hold, takes the lock **exclusive**, scans again, and keeps it exclusive until its files are restored; while it holds it, other turns in that repo wait. Waiting never blocks the event loop and can be cancelled: the lock is polled with `LOCK_NB` and a short sleep. Waiting happens before the watchdog starts; after 5 s of waiting, Tradewind logs it, and it has an optional caller limit (`lock_wait_timeout_s`, default none). **Release:** the held lock is an idempotent release handle on `TurnContext`. `prepare_turn` releases it on its own exceptions; the runner calls it in its outermost `finally` on every path (including a consumer that abandons the turn before `run()` starts, and runner errors between `prepare_turn` and `run()`); `run()`'s `finally` calls it too. The move and the restore happen inside `run()` in one `try/finally`. A journal entry is written before the move. Crash recovery restores an entry when the exclusive lock can be taken (an OS file lock is released when its process dies; PIDs are recorded only for the log). Files merge into folders `agy` created meanwhile (e.g. `.agents/skills`) | Restores after crashes and failures, never touches a live turn's files, never lets a parallel turn load hooks unasked, never commits a deletion, and keeps normal turns parallel. |
+| Workspace customizations **(owner, C1)** | Before spawn, look in the cwd, the repo root and every folder between them for `.agents/`, `.gemini/`, `.agent/` content other than empty skill folders (hooks, plugins, skills, MCP config); the spike confirms `agy` loads from nowhere else. If found, call the caller's `on_workspace_customizations(files) -> "stop" \| "delete" \| "proceed"`. No callback, or a callback error → `stop` (`ConfigError` listing the files). `delete`: copy the files to a timestamped backup folder in Tradewind's data folder, then delete them from the workspace; `run()` emits a notice after `TurnStarted` naming the deleted files and the backup path. Tradewind never restores them; restoring is the user's responsibility (owner). If the files are tracked by git, the deletion is a normal working-tree change that a later commit may include; that is also the user's responsibility. `proceed`: `run()` emits a notice after `TurnStarted`: "Antigravity customizations loaded without broker control: <files>" | Hooks and plugins run without any approval request. The owner's ruling, literally: stop, delete, or proceed. |
 | Empty skill folders | `agy` creates empty `.gemini/skills` and `.agents/skills` in the cwd; they are ignored by the check and left in place | They hold nothing that runs. |
 | Slash commands **(owner, M11)** | Off: a prompt is always a message to the model. Use the engine's own off switch where it exists; otherwise a prompt whose first non-whitespace character is `/` is sent with the plain-text prefix `Message: ` (so `/clear the old tests` reaches the model as `Message: /clear the old tests`); the mirror keeps the caller's original prompt. The spike and PR 1 confirm per engine that the prefixed form is not expanded. (Claude and Codex in PR 1, same rule.) | A prompt from a PR description must not run `/logout` or `/clear`. |
 | Skills | Not separately blocked. Prompt-triggered skills are off (slash commands); workspace skills fall under C1; default customizations are off; a skill's actions are tool calls and are decided like any other | A skill gives the model instructions, not permissions. |
@@ -457,14 +455,10 @@ its CLI reminder fires.
 1. `prepare_turn` (before the watchdog and `TurnStarted`): resolve the
    permission mode (broker, engine-auto, or no broker → engine-auto); in
    broker mode, check the `agy` version against the record (run the check if
-   unrecorded, under the check lock); take the repo lock **shared**; recover
-   any crash-journal entry for the repo (taking the lock exclusive briefly
-   if one exists); detect workspace customizations (C1) and get the
-   caller's answer; if it is `set_aside`, switch to the **exclusive** lock
-   and scan again. No files move here.
-2. In `run()`, inside one `try/finally` that restores set-aside files and
-   releases the lock: if the answer was `set_aside`, write the journal entry
-   and move the files.
+   unrecorded, under the check lock); detect workspace customizations (C1)
+   and get the caller's answer. No files are deleted here.
+2. In `run()`: if the answer was `delete`, copy the files to the backup
+   folder and delete them.
    Spawn `agy acp` in its own process group (Settings isolation, Environment
    rows), `initialize`, `authenticate`, `session/new` or `session/resume`
    with this turn's shim and the system prompt append. Set `mode`
@@ -479,8 +473,7 @@ its CLI reminder fires.
    not killed). Then list the recorded processes that are still alive,
    leaving out the Tradewind shim and `agy`'s own helper processes (the
    spike lists them); if any remain, emit the process report. Then emit the
-   terminal event. The `finally` restores set-aside files and releases the
-   lock.
+   terminal event.
 
 ## Acceptance
 
@@ -493,7 +486,7 @@ its CLI reminder fires.
   output (valid first call; invalid then valid; no call → reminder → valid;
   3 invalid → no reminder → `None`; last valid wins; early end drops the
   result; reminder content visible; `final_text` = main answer);
-  workspace-customization outcomes incl. restore after interrupt;
+  workspace-customization outcomes (stop, delete with backup and notice, proceed with notice, no callback → stop);
   slash-prefixed prompt; resume; interrupt with a surviving child process;
   turn waits for a background task; engine-auto and no-broker paths;
   version record; capability flags.
