@@ -739,27 +739,6 @@ def test_native_transcript_drops_the_structured_output_pair() -> None:
     assert [(i.kind, i.content.get("text")) for i in items] == [("text", "Here you go.")]
 
 
-async def test_max_tool_rounds_with_output_schema_stays_an_honest_partial(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The caller's cap ended the turn before any structured output: that
-    `end_reason` stands, with no structured result -- not a failure."""
-    capped = _success_result(
-        subtype="error_max_turns", is_error=True, terminal_reason="max_turns", result=None
-    )
-    _install_fake_sdk_client(monkeypatch, [capped])
-    backend = ClaudeBackend(_profile(), NativeStoreConfig())
-
-    events = [
-        event async for event in backend.run(_make_ctx(output_schema=_SCHEMA, max_tool_rounds=1))
-    ]
-
-    assert not any(isinstance(e, TurnFailed) for e in events)
-    completed = [e for e in events if isinstance(e, TurnCompleted)]
-    assert completed[0].result.end_reason == "max_tool_rounds"
-    assert completed[0].result.structured_output is None
-
-
 # --- FR-6.5 on a schema turn: the cap counts CALLER tool rounds exactly.
 # The CLI's `max_turns` keeps headroom for the StructuredOutput call, so the
 # adapter itself denies (and interrupts) the first caller tool past the cap.
@@ -773,12 +752,22 @@ class _AllowBroker:
         return "allow"
 
 
+async def _collect_bounded(stream: Any) -> list[object]:
+    """Drain `stream` under a 5 s bound. The round cap's wait for its call
+    has no deadline by design (it is bounded by the turn), so a regression
+    that stops feeding the cap would otherwise hang the suite instead of
+    failing it."""
+    with anyio.fail_after(5):
+        return [event async for event in stream]
+
+
 def _install_cli_like_client(
     monkeypatch: pytest.MonkeyPatch,
     responses: list[list[tuple[str, str]]],
     *,
     ask_before_streaming: bool = False,
     split_blocks: bool = False,
+    texts: dict[int, str] | None = None,
 ) -> list[object]:
     """`responses`: one list of `(tool_use_id, tool_name)` per model
     response. A response with no tools ends the turn. Records every
@@ -786,12 +775,14 @@ def _install_cli_like_client(
     request BEFORE its message reaches the stream consumer. `split_blocks`
     streams a response the way the real CLI does: one `AssistantMessage`
     per content block, all sharing the response's `message_id`, each with
-    its own `uuid`."""
+    its own `uuid`. `texts` maps a response index to a text block streamed
+    ahead of that response's tool calls."""
     import asyncio
 
     from claude_agent_sdk import (
         AssistantMessage,
         PermissionResultDeny,
+        TextBlock,
         ToolPermissionContext,
         ToolResultBlock,
         ToolUseBlock,
@@ -810,8 +801,11 @@ def _install_cli_like_client(
         async def receive_response(self) -> Any:
             can_use_tool = self._options.can_use_tool
             for index, tools in enumerate(responses):
+                text_blocks: list[Any] = (
+                    [TextBlock(text=texts[index])] if texts and index in texts else []
+                )
                 message = AssistantMessage(
-                    content=[ToolUseBlock(id=i, name=n, input={}) for i, n in tools],
+                    content=text_blocks + [ToolUseBlock(id=i, name=n, input={}) for i, n in tools],
                     model="claude-sonnet-4-5",
                     message_id=f"msg-{index}",
                     uuid=f"uuid-{index}",
@@ -895,7 +889,7 @@ async def test_schema_turn_with_zero_cap_executes_no_caller_tool(
     )
     backend = ClaudeBackend(_profile(), NativeStoreConfig())
 
-    events = [event async for event in backend.run(_capped_schema_ctx(0))]
+    events = await _collect_bounded(backend.run(_capped_schema_ctx(0)))
 
     assert len(decisions) == 1
     assert isinstance(decisions[0], PermissionResultDeny)
@@ -921,7 +915,7 @@ async def test_schema_turn_with_cap_one_runs_exactly_one_caller_round(
     )
     backend = ClaudeBackend(_profile(), NativeStoreConfig())
 
-    events = [event async for event in backend.run(_capped_schema_ctx(1))]
+    events = await _collect_bounded(backend.run(_capped_schema_ctx(1)))
 
     # Round 1 (both of its calls) runs; round 2's first call is stopped.
     assert [type(d) for d in decisions] == [
@@ -945,7 +939,7 @@ async def test_structured_output_call_is_not_a_caller_round(
     )
     backend = ClaudeBackend(_profile(), NativeStoreConfig())
 
-    events = [event async for event in backend.run(_capped_schema_ctx(1))]
+    events = await _collect_bounded(backend.run(_capped_schema_ctx(1)))
 
     assert [type(d) for d in decisions] == [PermissionResultAllow, PermissionResultAllow]
     completed = [e for e in events if isinstance(e, TurnCompleted)]
@@ -968,7 +962,7 @@ async def test_cap_holds_when_the_permission_request_overtakes_the_stream(
     )
     backend = ClaudeBackend(_profile(), NativeStoreConfig())
 
-    events = [event async for event in backend.run(_capped_schema_ctx(1))]
+    events = await _collect_bounded(backend.run(_capped_schema_ctx(1)))
 
     # Round 1 allowed (it waited, it did not guess "over the cap"); round 2 stopped.
     assert [type(d) for d in decisions] == [PermissionResultAllow, PermissionResultDeny]
@@ -1080,7 +1074,7 @@ async def test_parallel_calls_of_one_response_are_one_round(
     )
     backend = ClaudeBackend(_profile(), NativeStoreConfig())
 
-    events = [event async for event in backend.run(_capped_schema_ctx(1))]
+    events = await _collect_bounded(backend.run(_capped_schema_ctx(1)))
 
     assert [type(d) for d in decisions] == [PermissionResultAllow, PermissionResultAllow]
     completed = [e for e in events if isinstance(e, TurnCompleted)]
@@ -1106,7 +1100,7 @@ async def test_broker_still_decides_calls_inside_the_cap(
     ctx.broker = cast(Any, _DenyBroker())
     backend = ClaudeBackend(_profile(), NativeStoreConfig())
 
-    events = [event async for event in backend.run(ctx)]
+    events = await _collect_bounded(backend.run(ctx))
 
     assert len(decisions) == 1
     denial = decisions[0]
@@ -1171,10 +1165,11 @@ async def test_slow_consumer_never_turns_a_waiting_call_into_a_cap_stop(
     backend = ClaudeBackend(_profile(), NativeStoreConfig())
 
     events: list[object] = []
-    async for event in backend.run(_capped_schema_ctx(1)):
-        events.append(event)
-        if isinstance(event, ItemCompleted):
-            await anyio.sleep(0.1)  # a slow consumer: far past any lookup deadline
+    with anyio.fail_after(5):  # a regression that never observes must fail, not hang
+        async for event in backend.run(_capped_schema_ctx(1)):
+            events.append(event)
+            if isinstance(event, ItemCompleted):
+                await anyio.sleep(0.1)  # a slow consumer: far past any lookup deadline
 
     assert [type(d) for d in decisions] == [PermissionResultAllow]
     completed = [e for e in events if isinstance(e, TurnCompleted)]
@@ -1227,7 +1222,7 @@ async def test_plain_turn_with_zero_cap_executes_no_tool(
     decisions = _install_cli_like_client(monkeypatch, [[("t1", "mcp__tradewind__x")], []])
     backend = ClaudeBackend(_profile(), NativeStoreConfig())
 
-    events = [event async for event in backend.run(_capped_plain_ctx(0))]
+    events = await _collect_bounded(backend.run(_capped_plain_ctx(0)))
 
     assert len(decisions) == 1
     assert isinstance(decisions[0], PermissionResultDeny)
@@ -1249,7 +1244,7 @@ async def test_plain_turn_with_cap_one_refuses_the_second_round(
     )
     backend = ClaudeBackend(_profile(), NativeStoreConfig())
 
-    events = [event async for event in backend.run(_capped_plain_ctx(1))]
+    events = await _collect_bounded(backend.run(_capped_plain_ctx(1)))
 
     assert [type(d) for d in decisions] == [PermissionResultAllow, PermissionResultDeny]
     completed = [e for e in events if isinstance(e, TurnCompleted)]
@@ -1274,9 +1269,92 @@ async def test_uncapped_plain_turn_is_unchanged(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(ClaudeBackend, "_build_options", capturing)
     backend = ClaudeBackend(_profile(), NativeStoreConfig())
 
-    events = [event async for event in backend.run(_capped_plain_ctx(None))]
+    events = await _collect_bounded(backend.run(_capped_plain_ctx(None)))
 
     assert [type(d) for d in decisions] == [PermissionResultAllow, PermissionResultAllow]
     assert captured_options[0].max_turns is None
     completed = [e for e in events if isinstance(e, TurnCompleted)]
     assert completed[0].result.end_reason == "end_turn"
+
+
+# --- review round 4 ---
+
+
+async def test_schema_turn_backstop_without_a_cap_hit_is_not_a_false_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cap 0 + schema: invalid StructuredOutput attempts (and the CLI's
+    reminder) use CLI turns, so the `max_turns` backstop can fire with ZERO
+    caller rounds. That is a schema turn without a valid result (FR-1.3):
+    it completes as `end_turn`, `structured_output=None`, text kept -- not
+    a false `max_tool_rounds`."""
+    from claude_agent_sdk import (
+        AssistantMessage,
+        TextBlock,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
+
+    def attempt(n: int, text: str) -> list[object]:
+        return [
+            AssistantMessage(
+                content=[TextBlock(text=text)], model="m", message_id=f"msg-{n}", uuid=f"u-{n}a"
+            ),
+            AssistantMessage(
+                content=[ToolUseBlock(id=f"so-{n}", name="StructuredOutput", input={"bad": 1})],
+                model="m",
+                message_id=f"msg-{n}",
+                uuid=f"u-{n}b",
+            ),
+            UserMessage(
+                content=[
+                    ToolResultBlock(tool_use_id=f"so-{n}", content="schema mismatch", is_error=True)
+                ]
+            ),
+        ]
+
+    _install_fake_sdk_client(
+        monkeypatch,
+        [
+            *attempt(1, "first try"),
+            *attempt(2, "second try"),
+            _success_result(
+                subtype="error_max_turns",
+                is_error=True,
+                terminal_reason="max_turns",
+                result=None,
+            ),
+        ],
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = await _collect_bounded(backend.run(_capped_schema_ctx(0)))
+
+    assert not any(isinstance(e, TurnFailed) for e in events)
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert len(completed) == 1
+    assert completed[0].result.end_reason == "end_turn"
+    assert completed[0].result.structured_output is None
+    assert completed[0].result.final_text == "second try"
+
+
+async def test_capped_final_text_is_the_final_responses_text_only(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cap 1: response 1 says something and calls a tool; response 2 only
+    calls a tool, which the cap refuses. `final_text` is the FINAL
+    response's text -- none here -- not text from an earlier response
+    (langchain's `_final_text` semantics)."""
+    _install_cli_like_client(
+        monkeypatch,
+        [[("t1", "mcp__tradewind__x")], [("t2", "mcp__tradewind__x")]],
+        texts={0: "let me check"},
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = await _collect_bounded(backend.run(_capped_plain_ctx(1)))
+
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.end_reason == "max_tool_rounds"
+    assert completed[0].result.final_text is None

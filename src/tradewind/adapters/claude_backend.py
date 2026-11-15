@@ -817,13 +817,17 @@ class ClaudeBackend(Backend):
             # own `max_turns` check, so `max_turns` alone overran it by one
             # round). `max_turns` stays as a BACKSTOP only, bounding a
             # runaway if the permission path were ever bypassed. Its value
-            # is the most responses a well-behaved capped run can need, so
-            # it never stops a turn before the exact cap does: N tool rounds
-            # take N + 1 responses (each round's response plus the final
-            # one); a schema turn adds one more (FR-1.3) -- the CLI counts
-            # its StructuredOutput call as a turn, and when the model first
-            # ends with plain text it appends a reminder and asks again.
-            # None (uncapped) stays None.
+            # is the responses a well-behaved capped run needs: N tool
+            # rounds take N + 1 responses (each round's response plus the
+            # final one); a schema turn adds one more (FR-1.3) -- the CLI
+            # counts its StructuredOutput call as a turn, and when the model
+            # first ends with plain text it appends a reminder and asks
+            # again. On a PLAIN turn it cannot fire before the exact cap (no
+            # non-caller tools exist). On a SCHEMA turn it CAN fire first --
+            # invalid StructuredOutput attempts and reminders also use CLI
+            # turns -- and `_drive_client` then completes the turn as a
+            # schema turn without a valid result (`end_turn`, no result),
+            # never as a false `max_tool_rounds`. None (uncapped) stays None.
             max_turns=(
                 None
                 if ctx.max_tool_rounds is None
@@ -933,14 +937,22 @@ class ClaudeBackend(Backend):
         # The CLI's StructuredOutput pair (FR-1.3) is hidden from the stream;
         # its ids carry from the call's message to the result's.
         hidden_ids: set[str] = set()
-        # The last assistant text streamed: an error result often carries no
-        # `result` text, and FR-1.3 keeps the turn's text on a completion.
+        # The FINAL response's last text (langchain `_final_text`
+        # semantics): an error result often carries no `result` text, and
+        # FR-1.3 keeps the turn's text on a completion. Reset whenever a new
+        # model response starts -- the CLI streams one AssistantMessage per
+        # content block, all sharing the response's `message_id`.
         last_text: str | None = None
+        current_response: str | None = None
         async for message in client.receive_response():
             for event in pending_events:
                 yield event
             pending_events.clear()
             if isinstance(message, AssistantMessage):
+                response = message.message_id or message.uuid
+                if response is None or response != current_response:
+                    last_text = None
+                    current_response = response
                 if round_cap is not None:
                     round_cap.observe(message)
                 for item in _without_structured_output(
@@ -1007,7 +1019,20 @@ class ClaudeBackend(Backend):
                     yield TurnFailed(turn_id=ctx.turn_id, error=_result_error(message))
                     return
                 result = turn_result_from_result_message(message, ctx.turn_id)
-                if result.final_text is None and is_structured_output_exhausted_result(message):
+                if ctx.output_schema is not None and is_max_turns_result(message):
+                    # FR-1.3 over FR-6.5: on a schema turn the exact caller
+                    # cap is `_CallerRoundCap` (a cap stop arrives as an
+                    # aborted result, handled above). A `max_turns` result
+                    # here is the BACKSTOP firing because invalid
+                    # StructuredOutput attempts or the CLI's reminder used
+                    # up CLI turns -- a schema turn without a valid result,
+                    # which completes as `end_turn`, text kept, not a false
+                    # `max_tool_rounds`.
+                    result.end_reason = "end_turn"
+                if result.final_text is None and (
+                    is_structured_output_exhausted_result(message)
+                    or (ctx.output_schema is not None and is_max_turns_result(message))
+                ):
                     result.final_text = last_text
                 if ctx.output_schema is not None and isinstance(message.structured_output, dict):
                     # FR-1.3, additive: `final_text` stays the model's prose

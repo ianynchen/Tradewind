@@ -350,6 +350,14 @@ library) — they are read only by the test files that need real credentials to 
   only ever sets `max_turns` from the caller's own `max_tool_rounds`, that "error" is the
   caller's requested cap working — `_drive_client` must reclassify it as an honest
   `max_tool_rounds` completion BEFORE the generic `is_error` → `TurnFailed` branch.
+- **The bundled claude CLI runs a response's tools BEFORE its `max_turns` check**, so
+  `max_turns` cannot be an exact tool-round cap (`max_tool_rounds=0` still ran the first
+  response's tools). Tradewind enforces `max_tool_rounds` itself through the permission
+  callback (`_CallerRoundCap`: count caller rounds per model response, refuse the first
+  call past the cap with an interrupt) and keeps `max_turns` only as a backstop. On a
+  schema turn that backstop can fire first — invalid StructuredOutput attempts and the
+  CLI's reminder use CLI turns — so a `max_turns` result there is NOT a cap stop: it
+  completes as a schema turn without a valid result (`end_turn`, no structured output).
 - **RESOLVED (PR #2): the 50ms wall-clock perf test is rewritten as deterministic
   invariants.** Root cause of the flake (three occurrences: twice under local load, once on
   a shared CI runner at 163ms): an absolute stopwatch budget only ~3x above the ~17ms median
