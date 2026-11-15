@@ -937,27 +937,34 @@ class ClaudeBackend(Backend):
         # The CLI's StructuredOutput pair (FR-1.3) is hidden from the stream;
         # its ids carry from the call's message to the result's.
         hidden_ids: set[str] = set()
-        # The FINAL response's last text (langchain `_final_text`
+        # The last VISIBLE response's text (langchain `_final_text`
         # semantics): an error result often carries no `result` text, and
-        # FR-1.3 keeps the turn's text on a completion. Reset whenever a new
-        # model response starts -- the CLI streams one AssistantMessage per
-        # content block, all sharing the response's `message_id`.
+        # FR-1.3 keeps the turn's text on a completion. It resets only when a
+        # new model response yields a visible item (text or a caller tool) --
+        # a hidden StructuredOutput-only response (e.g. after the CLI's
+        # reminder) is not a reply the caller saw. The CLI streams one
+        # AssistantMessage per content block, all sharing the response's
+        # `message_id`; a block with neither `message_id` nor `uuid` cannot
+        # be placed, so it counts as the same response.
         last_text: str | None = None
-        current_response: str | None = None
+        last_visible_response: str | None = None
         async for message in client.receive_response():
             for event in pending_events:
                 yield event
             pending_events.clear()
             if isinstance(message, AssistantMessage):
-                response = message.message_id or message.uuid
-                if response is None or response != current_response:
-                    last_text = None
-                    current_response = response
                 if round_cap is not None:
                     round_cap.observe(message)
-                for item in _without_structured_output(
-                    assistant_message_items(message), hidden_ids
+                visible = _without_structured_output(assistant_message_items(message), hidden_ids)
+                response = message.message_id or message.uuid
+                if (
+                    response is not None
+                    and response != last_visible_response
+                    and any(item.kind in ("text", "tool_use") for item in visible)
                 ):
+                    last_text = None
+                    last_visible_response = response
+                for item in visible:
                     if item.kind == "text":
                         last_text = cast(str, item.content["text"])
                     yield ItemCompleted(message=item)
@@ -1019,7 +1026,12 @@ class ClaudeBackend(Backend):
                     yield TurnFailed(turn_id=ctx.turn_id, error=_result_error(message))
                     return
                 result = turn_result_from_result_message(message, ctx.turn_id)
-                if ctx.output_schema is not None and is_max_turns_result(message):
+                backstop_on_schema_turn = (
+                    ctx.output_schema is not None
+                    and is_max_turns_result(message)
+                    and not (round_cap is not None and round_cap.hit)
+                )
+                if backstop_on_schema_turn:
                     # FR-1.3 over FR-6.5: on a schema turn the exact caller
                     # cap is `_CallerRoundCap` (a cap stop arrives as an
                     # aborted result, handled above). A `max_turns` result
@@ -1027,11 +1039,11 @@ class ClaudeBackend(Backend):
                     # StructuredOutput attempts or the CLI's reminder used
                     # up CLI turns -- a schema turn without a valid result,
                     # which completes as `end_turn`, text kept, not a false
-                    # `max_tool_rounds`.
+                    # `max_tool_rounds`. After OUR cap denial (`hit`) the cap
+                    # did end the turn, so `max_tool_rounds` stands.
                     result.end_reason = "end_turn"
                 if result.final_text is None and (
-                    is_structured_output_exhausted_result(message)
-                    or (ctx.output_schema is not None and is_max_turns_result(message))
+                    is_structured_output_exhausted_result(message) or backstop_on_schema_turn
                 ):
                     result.final_text = last_text
                 if ctx.output_schema is not None and isinstance(message.structured_output, dict):

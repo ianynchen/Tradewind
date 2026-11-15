@@ -1358,3 +1358,126 @@ async def test_capped_final_text_is_the_final_responses_text_only(
     completed = [e for e in events if isinstance(e, TurnCompleted)]
     assert completed[0].result.end_reason == "max_tool_rounds"
     assert completed[0].result.final_text is None
+
+
+# --- review round 5 ---
+
+
+async def test_max_turns_result_after_our_cap_stop_stays_max_tool_rounds(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the CLI reports `max_turns` AFTER our own cap denial, the cap is
+    what ended the turn: `max_tool_rounds`, not the schema-backstop
+    `end_turn` reading."""
+    from claude_agent_sdk import AssistantMessage, ToolPermissionContext, ToolUseBlock
+
+    class _CapThenMaxTurnsClient:
+        def __init__(self, options: Any) -> None:
+            self._options = options
+
+        async def connect(self, _prompt: str) -> None:
+            pass
+
+        async def receive_response(self) -> Any:
+            yield AssistantMessage(
+                content=[ToolUseBlock(id="t1", name="mcp__tradewind__x", input={})],
+                model="m",
+                message_id="msg-0",
+            )
+            await self._options.can_use_tool(
+                "mcp__tradewind__x", {}, ToolPermissionContext(tool_use_id="t1")
+            )
+            yield _success_result(
+                subtype="error_max_turns", is_error=True, terminal_reason="max_turns", result=None
+            )
+
+        async def disconnect(self) -> None:
+            pass
+
+    monkeypatch.setattr(claude_backend_module, "ClaudeSDKClient", _CapThenMaxTurnsClient)
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = await _collect_bounded(backend.run(_capped_schema_ctx(0)))
+
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.end_reason == "max_tool_rounds"
+
+
+async def test_reminder_path_keeps_the_last_visible_responses_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Response A answers in text; the CLI's reminder follows; response B is
+    only an invalid StructuredOutput call (hidden); then the backstop. The
+    caller saw A's text as the final reply, so `final_text` keeps it -- a
+    hidden SO-only response does not reset it."""
+    from claude_agent_sdk import (
+        AssistantMessage,
+        TextBlock,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
+
+    _install_fake_sdk_client(
+        monkeypatch,
+        [
+            AssistantMessage(
+                content=[TextBlock(text="the answer is 42")], model="m", message_id="msg-a"
+            ),
+            UserMessage(
+                content="[structured-output-enforce] You MUST call the StructuredOutput tool "
+                "to complete this request. Call this tool now."
+            ),
+            AssistantMessage(
+                content=[ToolUseBlock(id="so-b", name="StructuredOutput", input={"bad": 1})],
+                model="m",
+                message_id="msg-b",
+            ),
+            UserMessage(
+                content=[ToolResultBlock(tool_use_id="so-b", content="mismatch", is_error=True)]
+            ),
+            _success_result(
+                subtype="error_max_turns", is_error=True, terminal_reason="max_turns", result=None
+            ),
+        ],
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = await _collect_bounded(backend.run(_capped_schema_ctx(0)))
+
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.end_reason == "end_turn"
+    assert completed[0].result.final_text == "the answer is 42"
+    assert completed[0].result.structured_output is None
+
+
+async def test_messages_without_ids_are_one_response_for_final_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With neither `message_id` nor `uuid`, blocks cannot be told apart by
+    response: they are treated as the same response, so a later tool-only
+    block does not wipe the text before it."""
+    from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock
+
+    _install_fake_sdk_client(
+        monkeypatch,
+        [
+            AssistantMessage(content=[TextBlock(text="hello")], model="m"),
+            AssistantMessage(
+                content=[ToolUseBlock(id="t1", name="mcp__tradewind__x", input={})], model="m"
+            ),
+            _success_result(
+                subtype="error_max_structured_output_retries",
+                is_error=True,
+                result=None,
+                terminal_reason="structured_output_retry_exhausted",
+                errors=["no valid output"],
+            ),
+        ],
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = await _collect_bounded(backend.run(_make_ctx(output_schema=_SCHEMA)))
+
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.final_text == "hello"
