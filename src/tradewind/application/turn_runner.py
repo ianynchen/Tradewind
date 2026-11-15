@@ -524,6 +524,10 @@ class TurnRunner:
         final_text: str | None = None
         structured_output: dict[str, object] | None = None
         supervisor_task: asyncio.Task[None] | None = None
+        # The interrupt a fired limit sent: kept so the turn awaits it (and
+        # its error surfaces here) even when the supervisor was cancelled
+        # while the interrupt was still running.
+        interrupt_task: asyncio.Future[None] | None = None
         # One gate per turn; events it emits (and the supervisor's timeout
         # notice) are buffered here and drained into the store and stream
         # by the event loop below.
@@ -783,10 +787,22 @@ class TurnRunner:
                     )
                     # Shielded: the backend may answer with its terminal
                     # while this call is in flight, and the runner then
-                    # cancels this task; the interrupt itself must finish.
-                    await asyncio.shield(backend.interrupt(session_id))
+                    # cancels this task; the interrupt itself must finish,
+                    # so `stop_supervisor` awaits it.
+                    nonlocal interrupt_task
+                    interrupt_task = asyncio.ensure_future(backend.interrupt(session_id))
+                    await asyncio.shield(interrupt_task)
 
                 supervisor_task = asyncio.get_running_loop().create_task(supervisor.run(on_fire))
+
+                async def stop_supervisor() -> None:
+                    """Cancel the supervisor, then wait for an interrupt it
+                    sent; that interrupt's error is raised here."""
+                    supervisor_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await supervisor_task
+                    if interrupt_task is not None:
+                        await interrupt_task
 
                 # `aclosing` (not a bare `async for`) so that if THIS
                 # generator (`execute()`) is itself abandoned/aclosed mid-turn
@@ -827,17 +843,13 @@ class TurnRunner:
                             # terminal is consumed or the backend cleans up.
                             # A notice from a limit that fired just before
                             # still precedes the terminal.
-                            supervisor_task.cancel()
-                            with contextlib.suppress(asyncio.CancelledError):
-                                await supervisor_task
+                            await stop_supervisor()
                             for gate_event in await drain_gate_events():
                                 yield gate_event
                         self._tap(event, turn_id)
                         yield event
 
-                supervisor_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await supervisor_task
+                await stop_supervisor()
 
                 if terminal_status is None:
                     # A notice raised after the last backend event must
@@ -942,6 +954,19 @@ class TurnRunner:
                 supervisor_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError), anyio.CancelScope(shield=True):
                     await supervisor_task
+            if interrupt_task is not None and not interrupt_task.done():
+                # An abnormal end (a raising backend, an abandoned stream)
+                # while a limit's interrupt still runs: let it finish
+                # before the turn is finalized. Its error is logged, not
+                # raised, so it does not replace the error already in
+                # flight.
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await interrupt_task
+                    except Exception:
+                        _logger.exception(
+                            "interrupt after a fired limit raised", extra={"turn_id": turn_id}
+                        )
             if gate_events:
                 # Notices raised before an abnormal end (a raising backend,
                 # an abandoned stream) still reach the store.

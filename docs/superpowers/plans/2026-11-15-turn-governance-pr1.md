@@ -126,10 +126,10 @@
 **Interfaces:**
 - Produces:
   - `domain.supervision.next_deadline(now: float, state: SupervisorState, limits: Limits) -> tuple[float | None, str | None]` returning the next firing time and the limit name (`"model_silence"`, `"work_silence"`, `"hard_cap"`), `None` while approvals are pending.
-  - `class WorkSupervisor:` `started(id: str, kind: Literal["tool","background","subagent"], label: str, has_end_signal: bool = True)`, `active(id: str)`, `ended(id: str)`, `model_active()`, `engine_done()`, `open_items() -> list[WorkItem]`, `async def run(on_fire: Callable[[str, float, float], Awaitable[None]])`, `close_unsignalled_after_done() -> list[WorkItem]`.
+  - `class WorkSupervisor:` `started(id: str, kind: Literal["tool","background","subagent"], label: str, has_end_signal: bool = True)`, `active(id: str)`, `ended(id: str)`, `model_active()`, `engine_done()`, `open_items() -> list[WorkItem]`, `async def run(on_fire: Callable[[str, float, float], Awaitable[None]])`, `async def settled() -> bool` (wakes when `run()` ends: True = normal end, False = a limit fired or `run()` was cancelled; adapters await it before their terminal event while still reading the engine stream), `closed_after_done() -> list[WorkItem]` (read-only), `approvals_changed(count: int)` (wired to `PolicyGate.on_approval_change`).
   - Limits: `Limits(model_silence_s, work_silence_s, hard_cap_s | None)`; backend default for the hard cap: `None` when `capabilities().supports_work_supervisor` else `600.0`.
 - On fire, the runner sets `ctx.timeout_reason = {"limit": name, "value": v, "elapsed": e}`, emits one timeout notice (`ItemCompleted(kind="event")`, written to the store) **before** any terminal event, then calls `backend.interrupt()`; the synthesized terminal keeps `end_reason="timeout"`.
-- `engine_done()` + only unsignalled items open → those close after `work_silence_s` of no activity as a **normal end** (`close_unsignalled_after_done` returns them for the report).
+- `engine_done()` + only unsignalled items open → those close after `work_silence_s` of no activity as a **normal end** (`run()` closes them; `closed_after_done()` returns them for the report).
 
 - [ ] **Step 1: Write failing tests** (fake clock; no real sleeps)
   - `test_model_silence_fires_without_open_work`.

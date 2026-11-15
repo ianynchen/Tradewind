@@ -2164,6 +2164,84 @@ async def test_no_limit_fires_after_the_terminal_event(
     assert [m for m in stored if m.kind == "event"] == []
 
 
+class _SlowInterruptBackend(_ScriptedBackend):
+    """Answers a fired limit's interrupt with its terminal at once, while
+    its `interrupt()` call is still running (a slow SDK cancel)."""
+
+    def __init__(
+        self, profile: Profile, native_config: NativeStoreConfig, *, raises: bool = False
+    ) -> None:
+        super().__init__(profile, native_config, [])
+        self._raises = raises
+        self._interrupt_started = asyncio.Event()
+        self.interrupt_finished = False
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        yield TurnStarted(turn_id=ctx.turn_id)
+        await self._interrupt_started.wait()
+        yield TurnCompleted(
+            result=TurnResult(
+                turn_id=ctx.turn_id,
+                status="interrupted",
+                end_reason="interrupted",
+                final_text=None,
+                usage={},
+                cost_usd=None,
+            )
+        )
+
+    async def interrupt(self, session_id: str) -> None:  # noqa: ARG002 -- Backend interface
+        self._interrupt_started.set()
+        await asyncio.sleep(0.05)
+        self.interrupt_finished = True
+        if self._raises:
+            raise RuntimeError("engine cancel failed")
+
+
+def _record_interrupt_state_at_finalize(tw: Tradewind, fake: _SlowInterruptBackend) -> list[bool]:
+    seen: list[bool] = []
+    finalize = tw._store.finalize_turn
+
+    def recording_finalize(*args: Any, **kwargs: Any) -> None:
+        seen.append(fake.interrupt_finished)
+        finalize(*args, **kwargs)
+
+    tw._store.finalize_turn = recording_finalize  # type: ignore[method-assign]
+    return seen
+
+
+async def test_slow_interrupt_finishes_before_the_turn_finalizes(tmp_path: Path) -> None:
+    # The interrupt a fired limit sent must not outlive the turn (it could
+    # otherwise reach the next turn on this session).
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _SlowInterruptBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = fake
+    seen = _record_interrupt_state_at_finalize(tw, fake)
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    events = [event async for event in session.stream("hi", request_timeout_s=0.01)]
+
+    assert isinstance(events[-1], TurnCompleted)
+    assert _is_timeout_notice(events[-2])
+    assert seen == [True]
+
+
+async def test_error_from_a_slow_interrupt_surfaces_in_the_turn(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _SlowInterruptBackend(profile, NativeStoreConfig(), raises=True)
+    tw._backends["default"] = fake
+    seen = _record_interrupt_state_at_finalize(tw, fake)
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    with pytest.raises(RuntimeError, match="engine cancel failed"):
+        async for _ in session.stream("hi", request_timeout_s=0.01):
+            pass
+
+    assert seen == [True]
+
+
 @pytest.mark.parametrize("supervised", [True, False])
 @pytest.mark.parametrize("terminal_after_interrupt", [True, False])
 async def test_timeout_notice_before_terminal_on_every_backend(
