@@ -30,6 +30,7 @@ Commands:
 bash scripts/check.sh                                                        # hermetic; includes langchain conformance
 TRADEWIND_RUN_CLAUDE_INTEGRATION=1 uv run pytest tests/conformance/test_claude.py -v -m integration
 TRADEWIND_RUN_CODEX_INTEGRATION=1  uv run pytest tests/conformance/test_codex.py  -v -m integration
+TRADEWIND_RUN_LANGCHAIN_INTEGRATION=1 uv run pytest tests/conformance/test_langchain_live.py -v -m integration  # ANTHROPIC_API_KEY from the operator's environment
 uv run pytest tests/conformance/test_cursor.py -v      # always self-skips; no env gate exists
 ```
 
@@ -158,6 +159,7 @@ caller-facing summary.
 |---|---|---|
 | `TRADEWIND_RUN_CLAUDE_INTEGRATION=1` | `tests/conformance/test_claude.py`, `tests/integration/test_claude_live.py` | Requires a real Claude Code subscription login on the machine; real, billed-by-subscription API calls (~40s for the full matrix). |
 | `TRADEWIND_RUN_CODEX_INTEGRATION=1` | `tests/conformance/test_codex.py` | Requires a real ChatGPT/Codex subscription login; spawns real `codex app-server` subprocesses (~100s for the full matrix). |
+| `TRADEWIND_RUN_LANGCHAIN_INTEGRATION=1` | `tests/conformance/test_langchain_live.py` | Real Anthropic API calls for structured output (FR-1.3): proves the forced schema-tool call is accepted with caller tools bound. Needs `ANTHROPIC_API_KEY` in the operator's environment (read only from there, never from a file); `claude-haiku-4-5`, `max_tokens=256`, 5 model calls in total. |
 | `ANTHROPIC_API_KEY` | `tests/integration/test_langchain_live.py::test_...anthropic` | Real Anthropic API key; ACTIVE — key in git-ignored `.env`, run via `scripts/live-tests.sh`; passed 2026-09-02. |
 | `GROQ_API_KEY` | `tests/integration/test_langchain_live.py::test_...groq` | Free-tier Groq key (`console.groq.com`, `ChatGroq`, `openai/gpt-oss-120b`); ACTIVE — key in git-ignored `.env`, run via `scripts/live-tests.sh`; passed 2026-09-02. |
 | (none — Cursor) | `tests/conformance/test_cursor.py` | No env gate exists; the module skips unconditionally until a Cursor subscription is available and the skip is removed by hand. |
