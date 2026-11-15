@@ -93,7 +93,7 @@ tool's own name (`tool_host.py:438`, `claude_backend.py:656`,
 holding `{kind, fields, backend, native_name, summary}`. Existing brokers
 keep working; new brokers can use the shared vocabulary. The `tradewind` key is added only to the broker's copy of the arguments, never to the arguments the tool receives; if a caller tool has its own `tradewind` argument, the broker's copy uses the key `tradewind_action` instead. A new engine
 (Antigravity) uses the shared kind as the name for its built-in tools
-matching Codex's names: `shell`, `apply_patch` (`file_write`), `read_file` (`file_read`), `fetch_url`, and for `native` the engine's own tool name.
+matching Codex's names: `shell`, `apply_patch` (`file_write`), `read_file` (`file_read`), and for `native` the engine's own tool name.
 
 ## 2. Action policy
 

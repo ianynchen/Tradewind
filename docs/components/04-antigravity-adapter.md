@@ -91,7 +91,6 @@ its own.
 | tool name `mcp_<shim>_<tool>` for this turn's shim | identified only if the name starts with this turn's exact `mcp_tradewind-<8 hex>_` prefix **and** the rest is exactly a tool in the shim's own list (the shim is the only MCP server the engine has: workspace MCP config is a preflight stop, and the profile has none) | structural pass-through at the ACP request (`05` §2.3); gated once, as `caller_tool`, inside `ToolHost` |
 | any other `mcp_…` name | `native {unknown_tool: true}` (cannot be split reliably) | gate |
 | `tool_call` for a tool that never asks: `search_web` (`kind: search`) | `web_search {query}` | observe |
-| (none in the spike) a page read by `agy` itself | `fetch_url {url}` if a future version adds such a tool; until then unknown tools are `native` | gate |
 | `tool_call` `invoke_subagent` | `subagent {type: TypeName, task: Prompt}` | observe |
 | `tool_call` `manage_task` `send_input` | `input_to_running {target: TaskId, text: Input}` | observe |
 | `tool_call` `schedule` | `native` (schedules a later prompt in the session) | observe |
@@ -153,9 +152,22 @@ running `agy` use a probe process in an empty temp folder, so no workspace
 hook, skill or MCP config can load before the C1 answer (cost: one extra
 `agy` start, about 1.5 s, once per turn).
 
-1. **Workspace customizations (owner C1)** — the scan and question in
-   item 4's text below; it runs first and is answered before any `agy`
-   runs in the workspace.
+1. **Workspace customizations (owner C1)** — runs first and is answered
+   before any `agy` runs in the workspace: scan the cwd, the repo root and
+   the folders between for `.agents/` hooks, plugins, skills and MCP
+   config, and `.gemini/` and `.agent/` content (empty skill folders
+   ignored; nothing above the repo root — spike). Found → `Ask` with the
+   file list as `details` and choices `stop` (default), `delete`,
+   `proceed`. The change happens in `run()`, before `TurnStarted`:
+   `delete` copies only the scanned files to
+   `<data>/backups/<timestamp>-<turn id>/` (paths relative to the repo
+   root), then deletes them (a file already gone is skipped; if any copy
+   fails, nothing is deleted and `run()` raises `ConfigError`); never
+   restored; tracked files show as deletions — the user's responsibility;
+   a notice right after `TurnStarted` names the files and the backup path. `proceed` records
+   "Antigravity customizations loaded without broker control: <files>". Evidence: a repo-root `hooks.json` ran its
+   `SessionStart` and `PreInvocation` hooks at the first prompt with no
+   question.
 2. **Login and Auto (probe in a temp folder):** the probe runs `agy acp`
    with Tradewind's gemini-dir in an empty temp cwd, does `initialize`,
    `authenticate`, `session/new` (to read the `mode` options) and
@@ -190,22 +202,7 @@ hook, skill or MCP config can load before the C1 answer (cost: one extra
    - each run refreshes the built-in tool-name list (shipped fallback list
      from the spike for engine-auto on an unchecked version) and confirms
      the subagent transcript path.
-4. **Workspace customizations (owner C1) — details of item 1:** scan the cwd, the repo root and
-   the folders between for `.agents/` hooks, plugins, skills and MCP
-   config, and `.gemini/` and `.agent/` content (empty skill folders
-   ignored; nothing above the repo root — spike). Found → `Ask` with the
-   file list as `details` and choices `stop` (default), `delete`,
-   `proceed`. The change happens in `run()`, before `TurnStarted`:
-   `delete` copies only the scanned files to
-   `<data>/backups/<timestamp>-<turn id>/` (paths relative to the repo
-   root), then deletes them (a file already gone is skipped; if any copy
-   fails, nothing is deleted and `run()` raises `ConfigError`); never
-   restored; tracked files show as deletions — the user's responsibility;
-   a notice right after `TurnStarted` names the files and the backup path. `proceed` records
-   "Antigravity customizations loaded without broker control: <files>". Evidence: a repo-root `hooks.json` ran its
-   `SessionStart` and `PreInvocation` hooks at the first prompt with no
-   question.
-5. **Name collisions (C2):** a caller tool named like an `agy` built-in →
+4. **Name collisions (C2):** a caller tool named like an `agy` built-in →
    `Stop`.
 
 **Skills:** not separately blocked: prompt-triggered skills are off (prompt
@@ -224,8 +221,8 @@ and a skill's actions are ordinary actions.
    prompt append; set mode, model, effort; wait for the shim to connect
    (limit 30 s → `ConfigError`). Errors here raise `ConfigError`. After a
    `delete`, the file list and the backup path are logged at WARNING at
-   once, and included in any later `ConfigError` message or interrupted
-   record, so they are never lost.
+   once, and included in any later terminal record or `ConfigError`
+   message, so they are never lost.
 3. Emit `TurnStarted`, then any preflight notice; send `session/prompt`
    (with the schema block if set).
 4. Map updates to actions and work signals; answer requests through the
@@ -298,7 +295,7 @@ check), a new FR for the C1 preflight check.
   rule, every preflight check, structured output (valid first call; invalid
   then valid; no call → reminder → valid; 3 invalid → no reminder → `None`;
   early end drops the result; reminder content visible; `final_text`),
-  shim readiness wait, resume, interrupt, subagent work closing on work
+  shim readiness wait and its 30 s limit (→ `ConfigError`), resume, interrupt, subagent work closing on work
   silence, process report.
 - Live tests (`tests/conformance/test_antigravity.py`, env gate
   `TRADEWIND_RUN_ANTIGRAVITY_INTEGRATION`, `integration` marker, 3-minute
