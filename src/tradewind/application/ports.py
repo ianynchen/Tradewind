@@ -39,6 +39,7 @@ if TYPE_CHECKING:
         RetrySettings,
     )
     from tradewind.application.policy_gate import PolicyGate
+    from tradewind.application.supervisor import WorkSupervisor
     from tradewind.domain.policy import Rule
 
 
@@ -354,12 +355,12 @@ class TurnContext:
     # partial — never `failed`, never a fake clean finish.
     max_tool_rounds: int | None = None
     # Turn governance (docs/components/05-turn-governance.md §2): the runner
-    # always sets `policy`; adapters call `ctx.policy.gate(...)` /
-    # `.observe(...)`. `work` arrives with the supervisor (Task 4).
+    # always sets `policy` and `work`; adapters call
+    # `ctx.policy.gate(...)` / `.observe(...)` and report work and model
+    # activity through `ctx.work` (§3.1). The runner sets `timeout_reason`
+    # (limit, value, elapsed) before it interrupts on a fired limit.
     policy: PolicyGate | None = None
-    # Typed `object` until Task 4 adds `tradewind.application.supervisor`
-    # (then: `WorkSupervisor | None`).
-    work: object | None = None
+    work: WorkSupervisor | None = None
     timeout_reason: dict[str, object] | None = None
     preflight: dict[str, str] = field(default_factory=dict)
 

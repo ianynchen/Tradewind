@@ -60,11 +60,17 @@ class RetrySettings(BaseModel):
 
 class TurnDefaults(BaseModel):
     tier: TierName = "standard"
-    # Enforced since FR-6.6 (previously accepted-but-inert): a turn
-    # exceeding this wall-clock deadline is interrupted via the backend's
-    # own interrupt() and ends status="interrupted", end_reason="timeout".
-    # No disable knob -- raise it instead.
-    request_timeout_s: float = 600.0
+    # Work-supervisor limits (FR-6.6, 05-turn-governance §3.2), all
+    # per-turn overridable under the same names. A turn that hits one is
+    # interrupted via the backend's own interrupt() and ends
+    # status="interrupted", end_reason="timeout". The silence limits apply
+    # only on backends with `supports_work_supervisor`: model silence
+    # while no work is open, work silence while work is open.
+    model_silence_timeout_s: float = 300.0
+    work_silence_timeout_s: float = 1800.0
+    # The hard cap on total time. None = the backend default: no cap
+    # where the work supervisor runs, 600 s where it cannot (Cursor).
+    request_timeout_s: float | None = None
     compaction: CompactionSettings = CompactionSettings()
     retry: RetrySettings = RetrySettings()
 

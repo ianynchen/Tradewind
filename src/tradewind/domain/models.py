@@ -97,6 +97,10 @@ class Capabilities(BaseModel):
     # recorded in `PermissionRequested.reason` and the mirror everywhere a
     # broker is consulted.
     supports_deny_reason: bool
+    # Whether the adapter reports work and model activity through
+    # `ctx.work` (05-turn-governance §3). False (the default, and Cursor)
+    # means no silence limits apply and the hard cap defaults to 600 s.
+    supports_work_supervisor: bool = False
 
 
 class ModelCostTier(BaseModel):
@@ -463,6 +467,17 @@ def policy_record_notice(
             "outcome": outcome,
             "rule_ids": rule_ids,
         },
+    )
+
+
+def timeout_notice(*, limit: str, value: float, elapsed: float) -> NormalizedMessage:
+    """The mirrored `kind="event"` visibility item for a work-supervisor
+    limit that ended the turn (FR-6.6, 05-turn-governance §3.2): which
+    limit, its setting and the active seconds elapsed, all in seconds."""
+    return NormalizedMessage(
+        role="assistant",
+        kind="event",
+        content={"type": "turn_timeout", "limit": limit, "value": value, "elapsed": elapsed},
     )
 
 

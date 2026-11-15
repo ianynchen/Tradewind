@@ -46,7 +46,9 @@ from tradewind.application.config import (
     TradewindConfig,
     TurnDefaults,
 )
+from tradewind.application.policy_gate import PolicyGate
 from tradewind.application.ports import Backend, TurnContext
+from tradewind.application.supervisor import WorkSupervisor
 from tradewind.application.turn_runner import (
     _emulate_system_prompt,
     _fold_system_prompt,
@@ -80,6 +82,7 @@ from tradewind.domain.models import (
     TurnResult,
 )
 from tradewind.domain.policy import Action, Rule
+from tradewind.domain.supervision import Limits
 
 _VALID_ID = "33333333-3333-3333-3333-333333333333"
 
@@ -1934,6 +1937,189 @@ async def test_completed_turn_is_untouched_by_the_watchdog(tmp_path: Path) -> No
     assert result.end_reason == "end_turn"
 
 
+# --- FR-6.6 work supervisor (05-turn-governance §3) ---
+
+
+class _SupervisedInterruptibleBackend(_InterruptibleBackend):
+    """`_InterruptibleBackend` that declares `supports_work_supervisor`,
+    records the context, and records `ctx.timeout_reason` as it was when
+    `interrupt()` arrived. With `terminal_after_interrupt`, it ends its
+    stream with its own terminal event (as the SDK backends do) instead of
+    none."""
+
+    def __init__(
+        self,
+        profile: Profile,
+        native_config: NativeStoreConfig,
+        *,
+        supervised: bool = True,
+        terminal_after_interrupt: bool = False,
+    ) -> None:
+        super().__init__(profile, native_config)
+        self._supervised = supervised
+        self._terminal_after_interrupt = terminal_after_interrupt
+        self.contexts: list[TurnContext] = []
+        self.reason_at_interrupt: list[dict[str, object] | None] = []
+
+    def capabilities(self) -> Capabilities:
+        return (
+            super().capabilities().model_copy(update={"supports_work_supervisor": self._supervised})
+        )
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        self.contexts.append(ctx)
+        yield TurnStarted(turn_id=ctx.turn_id)
+        await self._interrupted.wait()
+        if self._terminal_after_interrupt:
+            yield TurnCompleted(
+                result=TurnResult(
+                    turn_id=ctx.turn_id,
+                    status="interrupted",
+                    end_reason="interrupted",
+                    final_text=None,
+                    usage={},
+                    cost_usd=None,
+                )
+            )
+
+    async def interrupt(self, session_id: str) -> None:
+        self.reason_at_interrupt.append(self.contexts[-1].timeout_reason)
+        await super().interrupt(session_id)
+
+
+def _is_timeout_notice(event: Event) -> bool:
+    return (
+        isinstance(event, ItemCompleted)
+        and event.message.kind == "event"
+        and event.message.content.get("type") == "turn_timeout"
+    )
+
+
+async def test_cursor_keeps_600s_default(tmp_path: Path) -> None:
+    # A backend that reports no work (Cursor: supports_work_supervisor
+    # False) keeps today's 600 s wall-clock cap and gets no silence
+    # limits, which it could never satisfy.
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _CtxRecordingBackend(
+        profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), _completed()]
+    )
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    await session.run("hi")
+
+    assert fake.capabilities().supports_work_supervisor is False
+    work = cast(WorkSupervisor, fake.contexts[0].work)
+    assert work.limits.hard_cap_s == 600.0
+
+
+async def test_supervised_backend_has_no_default_hard_cap(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _SupervisedInterruptibleBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    async for event in session.stream("hi"):
+        if isinstance(event, TurnStarted):
+            await session.stop()
+
+    work = cast(WorkSupervisor, fake.contexts[0].work)
+    assert work.limits == Limits(model_silence_s=300.0, work_silence_s=1800.0, hard_cap_s=None)
+    # Broker questions pause the limits: the gate's count reaches the
+    # supervisor.
+    gate = cast(PolicyGate, fake.contexts[0].policy)
+    assert gate.on_approval_change == work.approvals_changed
+
+
+async def test_explicit_request_timeout_still_applies(tmp_path: Path) -> None:
+    # A caller that sets a hard cap on a supervised backend still gets it.
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _SupervisedInterruptibleBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    result = await session.run("hi", request_timeout_s=0.2)
+
+    assert (result.status, result.end_reason) == ("interrupted", "timeout")
+    reason = fake.contexts[0].timeout_reason
+    assert reason is not None
+    assert (reason["limit"], reason["value"]) == ("hard_cap", 0.2)
+    assert cast(float, reason["elapsed"]) >= 0.2
+
+
+async def test_model_silence_override_ends_a_quiet_turn(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _SupervisedInterruptibleBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    result = await session.run("hi", model_silence_timeout_s=0.2)
+
+    assert result.end_reason == "timeout"
+    reason = fake.contexts[0].timeout_reason
+    assert reason is not None
+    assert (reason["limit"], reason["value"]) == ("model_silence", 0.2)
+
+
+@pytest.mark.parametrize(
+    "key", ["request_timeout_s", "model_silence_timeout_s", "work_silence_timeout_s"]
+)
+async def test_invalid_limit_override_raises_config_error_without_opening_a_turn(
+    tmp_path: Path, key: str
+) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _SupervisedInterruptibleBackend(profile, NativeStoreConfig())
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    for bad in (-1, 0, "60", True):
+        with pytest.raises(ConfigError, match=key):
+            await session.run("hi", **{key: bad})
+
+    assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == []
+
+
+@pytest.mark.parametrize("supervised", [True, False])
+@pytest.mark.parametrize("terminal_after_interrupt", [True, False])
+async def test_timeout_notice_before_terminal_on_every_backend(
+    tmp_path: Path, supervised: bool, terminal_after_interrupt: bool
+) -> None:
+    # Whether the backend answers interrupt() with its own terminal event
+    # or with none (the runner then synthesizes one), the caller learns
+    # WHY the turn ended before it ends: one notice, then the terminal.
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _SupervisedInterruptibleBackend(
+        profile,
+        NativeStoreConfig(),
+        supervised=supervised,
+        terminal_after_interrupt=terminal_after_interrupt,
+    )
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    events = [event async for event in session.stream("hi", request_timeout_s=0.2)]
+
+    notices = [event for event in events if _is_timeout_notice(event)]
+    assert len(notices) == 1
+    assert isinstance(events[-1], TurnCompleted)
+    assert _is_timeout_notice(events[-2])
+    notice = cast(ItemCompleted, events[-2]).message.content
+    assert (notice["limit"], notice["value"]) == ("hard_cap", 0.2)
+    # The reason was set before the backend was asked to stop.
+    assert fake.reason_at_interrupt == [fake.contexts[0].timeout_reason]
+    assert fake.reason_at_interrupt[0] is not None
+    # The notice is in the mirror, not only on the stream.
+    stored = tw._store.history(_VALID_ID, include_children=False, include_raw=False)
+    assert [m.content.get("type") for m in stored if m.kind == "event"] == ["turn_timeout"]
+    if not terminal_after_interrupt:
+        assert cast(TurnCompleted, events[-1]).result.end_reason == "timeout"
+
+
 async def test_reported_usage_triggers_compaction_when_estimate_would_not(
     tmp_path: Path,
 ) -> None:
@@ -2179,7 +2365,8 @@ async def test_runner_sets_policy_on_context(tmp_path: Path) -> None:
 
     assert backend.seen is not None
     assert backend.seen.policy is not None
-    assert backend.seen.work is None
+    assert isinstance(backend.seen.work, WorkSupervisor)
+    assert backend.seen.timeout_reason is None
     assert backend.seen.preflight == {}
 
 
