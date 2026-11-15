@@ -112,10 +112,13 @@ in a multi-user setting (separate OS users, environment allowlists, separate
 **The check.** A scripted conformance suite, outside CI, run against the
 installed `agy` with Tradewind's settings in broker mode. It plants traps
 and observes them directly, because ACP does not report every action. The check has its own
-time limit (default 15 minutes); hitting it records "inconclusive (timed
-out)" for that version, which is **not** a fail: broker-mode turns are
-refused for this attempt, and the next broker-mode turn runs the check
-again. A `stop()` while a turn waits in `prepare_turn` (for the check or the
+time limit (default 15 minutes); hitting it records the outcome **"timed out"**
+for that version, which is not a fail: the waiting broker-mode turns are
+refused with a notice, and the next broker-mode turn runs the check again,
+at most once per hour per version (backoff), so a slow check cannot run on
+every turn. (A single trap that stays inconclusive after its retries still
+makes the check fail.) The check does not hold the repo lock: it runs in its
+own throwaway workspace. A `stop()` while a turn waits in `prepare_turn` (for the check or the
 lock) cancels that wait: the Antigravity backend counts a turn as in flight
 from the start of `prepare_turn`, so `interrupt()` reaches it;
 `prepare_turn` returns, and the runner sees the stop request and records
@@ -206,14 +209,14 @@ calls. The builder may revisit a call only by raising it.
 | Login and token **(owner, M1)** | The spike finds where the token lives (keychain or file) and whether profiles are separate. If they cannot be separated, Tradewind shares the owner's login (accepted fallback). T3's `GEMINI_HOME` / `AGY_ACP_FORCE_FILE_STORAGE` are **not** used: they do not exist in 1.5.3 | A shared login adds no security risk (the token is already in the keychain); side effects are a shared quota and one account. |
 | Environment **(owner, M4)** | Inherit the owner's environment. Remove only variables that switch `agy` away from subscription auth (at least `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`; the spike lists the full set) | Scope rule: no more risk than the owner's terminal; tools need `SSH_AUTH_SOCK`, `GH_TOKEN`, deploy credentials, proxies. |
 | AI credits | Off in Tradewind's settings | Unattended turns must not spend paid credits when the quota runs out. |
-| Parallel turns | Allowed; the spike runs several in parallel on one profile (database locks, token refresh). If they conflict, turns on one profile are serialised | — |
+| Parallel turns | Allowed, also in one repo (shared repo lock; only a `set_aside` turn is exclusive). The spike runs several in parallel on one profile (database locks, token refresh); if they conflict, turns on one profile are serialised | — |
 
 ### Workspace and prompt
 
 | Decision | Choice | Why |
 |---|---|---|
 | Workspace customizations **(owner, C1)** | Before spawn, look in the cwd, the repo root and every folder between them for `.agents/`, `.gemini/`, `.agent/` content other than empty skill folders (hooks, plugins, skills, MCP config); the spike confirms `agy` loads from nowhere else. If found, call the caller's `on_workspace_customizations(files) -> "stop" \| "set_aside" \| "proceed"`. No callback, or a callback error → `stop` (`ConfigError` listing the files). `proceed`: `run()` emits a notice after `TurnStarted`: "Antigravity customizations loaded without broker control: <files>" | Hooks and plugins run without any approval request. |
-| `set_aside` details | Allowed only for files git does **not** track; if any found file is tracked, `set_aside` is refused and the turn stops with that reason (moving a tracked file is a deletion to git, which `git add -A` would commit). **Every** Antigravity turn takes the **per-repo lock** in `prepare_turn`, before crash recovery and before the C1 scan, and holds it until the end of `run()`; so no turn can scan a repo while another turn has files aside. The lock is an OS file lock (works across processes, e.g. Meridian and the CLI) plus an in-process lock for turns in one process; waiting for it never blocks the event loop and happens before the watchdog starts. `prepare_turn` returns the held lock to `run()` (on `TurnContext`), and the runner releases it if the turn stops between the two. The move and the restore happen inside `run()` in one `try/finally`, so every exit path restores. A journal entry is written before the move. Crash recovery restores an entry when the lock can be taken (an OS file lock is released when its process dies, so a free lock means the owner is gone; PIDs are recorded only for the log). Files merge into folders `agy` created meanwhile (e.g. `.agents/skills`). Cost: Antigravity turns in the same repo run one at a time | Restores after crashes and failures, never touches a live turn's files, never lets a parallel turn load hooks unasked, never commits a deletion. |
+| `set_aside` details | Allowed only for files git does **not** track; if any found file is tracked, `set_aside` is refused and the turn stops with that reason (moving a tracked file is a deletion to git, which `git add -A` would commit). **The repo** is the realpath of the cwd's git top-level (`git rev-parse --show-toplevel`; each git worktree is its own repo, which is how Meridian runs Antigravity work in parallel), or the realpath of the cwd when it is not in git. The **repo lock** is a shared/exclusive OS file lock (`flock`) on a lock file in Tradewind's data folder named by a hash of that path, plus an in-process reader/writer lock for turns in one process. **Every** Antigravity turn takes it **shared** in `prepare_turn`, before crash recovery and the C1 scan, and holds it to the end of the turn; normal turns therefore run in parallel. A turn whose answer is `set_aside` releases its shared hold, takes the lock **exclusive**, scans again, and keeps it exclusive until its files are restored; while it holds it, other turns in that repo wait. Waiting never blocks the event loop and can be cancelled: the lock is polled with `LOCK_NB` and a short sleep. Waiting happens before the watchdog starts; after 5 s of waiting, Tradewind logs it, and it has an optional caller limit (`lock_wait_timeout_s`, default none). **Release:** the held lock is an idempotent release handle on `TurnContext`. `prepare_turn` releases it on its own exceptions; the runner calls it in its outermost `finally` on every path (including a consumer that abandons the turn before `run()` starts, and runner errors between `prepare_turn` and `run()`); `run()`'s `finally` calls it too. The move and the restore happen inside `run()` in one `try/finally`. A journal entry is written before the move. Crash recovery restores an entry when the exclusive lock can be taken (an OS file lock is released when its process dies; PIDs are recorded only for the log). Files merge into folders `agy` created meanwhile (e.g. `.agents/skills`) | Restores after crashes and failures, never touches a live turn's files, never lets a parallel turn load hooks unasked, never commits a deletion, and keeps normal turns parallel. |
 | Empty skill folders | `agy` creates empty `.gemini/skills` and `.agents/skills` in the cwd; they are ignored by the check and left in place | They hold nothing that runs. |
 | Slash commands **(owner, M11)** | Off: a prompt is always a message to the model. Use the engine's own off switch where it exists; otherwise a prompt whose first non-whitespace character is `/` is sent with the plain-text prefix `Message: ` (so `/clear the old tests` reaches the model as `Message: /clear the old tests`); the mirror keeps the caller's original prompt. The spike and PR 1 confirm per engine that the prefixed form is not expanded. (Claude and Codex in PR 1, same rule.) | A prompt from a PR description must not run `/logout` or `/clear`. |
 | Skills | Not separately blocked. Prompt-triggered skills are off (slash commands); workspace skills fall under C1; default customizations are off; a skill's actions are tool calls and are decided like any other | A skill gives the model instructions, not permissions. |
@@ -320,9 +323,13 @@ it starts the FR-6.6 watchdog and before `TurnStarted`, so slow preparation
   kinds. The runner keeps a set of **running work**: tools between
   `tool_started` and `tool_ended`, background tasks/subagents/swarm members
   between `background_started` and `background_ended`, and **pending broker
-  questions** (the runner wraps every broker call it makes or that
-  `ToolHost` makes, and each backend's approval bridge reports
-  `approval_started`/`approval_ended`). The kinds are: `model`,
+  questions**. The only source for these is the runner: it wraps the
+  broker it puts on `TurnContext` (every backend and `ToolHost` call
+  `ctx.broker.decide`), counts pending calls with a counter, and reports
+  `approval_ended` in a `finally`, so a cancelled call never stays open.
+  Backends do not report approvals themselves. (The "broker error or
+  timeout → deny" rule in the Permissions table refers to the broker's own
+  error or its own timeout, not to these timers.) The kinds are: `model`,
   `tool_started`, `tool_output`, `tool_ended`, `background_started`,
   `background_progress`, `background_ended`, `approval_started`,
   `approval_ended`.
@@ -336,25 +343,35 @@ it starts the FR-6.6 watchdog and before `TurnStarted`, so slow preparation
     start/end activity for this time → timeout, measured from the most
     recent such activity across all running work. On Claude, which streams
     no command output, this is the time since the latest tool start or end;
-  - **hard limit** (`request_timeout_s`): type becomes `float | None`. Its
-    default becomes `None` on backends whose `supports_inactivity_watchdog`
-    is True, and stays 600 s on others (Cursor). The caller may set it per
-    turn. FR-6.6 is reworded to "every backend has either the inactivity
-    watchdog or a hard limit".
+  - **hard limit** (`request_timeout_s`): type becomes `float | None`, and
+    its config default becomes `None`, meaning "the backend's default": no
+    hard limit on backends whose `supports_inactivity_watchdog` is True, and
+    600 s on others (Cursor). An explicit number applies on every backend.
+    The caller may set it per turn. FR-6.6 is reworded to "every backend has
+    either the inactivity watchdog or a hard limit".
 - All limits are overridable per turn.
 - **Timeout record (all backends):** when a limit fires, the runner sets
   `ctx.timeout_reason` (limit name, value, elapsed) before it calls
   `backend.interrupt()`, and itself emits one `ItemCompleted(kind="event")`
-  timeout notice before the synthesized terminal event, so every backend
-  records which limit fired. Antigravity's process report reads the same
-  field.
+  timeout notice, written to the store like any backend item, before the
+  synthesized terminal event, so every backend records which limit fired.
+  If the backend emits its own terminal event after the interrupt (a race),
+  the notice is emitted before that terminal event, never after it.
+  Antigravity's process report reads the same field.
+- **Stop around `prepare_turn`:** the runner checks for a stop request
+  before and after `prepare_turn`; if one is set, it records the turn as
+  interrupted without calling `run()`. A terminal record without
+  `TurnStarted` is allowed for this case only. The Antigravity backend
+  registers the turn as in flight from the start of `prepare_turn` through
+  the end of `run()`, so `interrupt()` reaches it at every point.
 - Mapping notes: Claude's `StreamEvent`s (from `include_partial_messages`)
   are used only for `report_activity` and are never mapped to events or the
   mirror (a test proves a plain turn's events are identical with the flag on
   and off); Claude subagent messages (`parent_tool_use_id` set) are
-  `background_progress`, not `model`; `Task*Message` start/terminal
-  statuses (`TaskNotificationMessage`, `TaskUpdatedMessage.patch.status`)
-  are `background_started`/`background_ended`. Codex
+  `background_progress`, not `model`; `TaskStartedMessage` is
+  `background_started`, `TaskProgressMessage` is `background_progress`, and a
+  terminal status (`TaskNotificationMessage`, or
+  `TaskUpdatedMessage.patch.status`) is `background_ended`. Codex
   `item/autoApprovalReview/*` and `terminalInteraction`, and LangChain's
   in-turn compaction call, report activity too.
 - Wiring: PR 1 — Claude (`include_partial_messages`, tool-use/tool-result
@@ -437,12 +454,14 @@ its CLI reminder fires.
 
 ## Turn algorithm
 
-1. `prepare_turn` (before the watchdog and `TurnStarted`): take the
-   per-repo lock; recover any crash-journal entry for the repo; then resolve
-   the permission mode (broker, engine-auto, or no broker →
-   engine-auto); in broker mode, check the `agy` version against the record
-   (run the check if unrecorded, under its lock); detect workspace
-   customizations (C1) and get the caller's answer. No files move here.
+1. `prepare_turn` (before the watchdog and `TurnStarted`): resolve the
+   permission mode (broker, engine-auto, or no broker → engine-auto); in
+   broker mode, check the `agy` version against the record (run the check if
+   unrecorded, under the check lock); take the repo lock **shared**; recover
+   any crash-journal entry for the repo (taking the lock exclusive briefly
+   if one exists); detect workspace customizations (C1) and get the
+   caller's answer; if it is `set_aside`, switch to the **exclusive** lock
+   and scan again. No files move here.
 2. In `run()`, inside one `try/finally` that restores set-aside files and
    releases the lock: if the answer was `set_aside`, write the journal entry
    and move the files.
@@ -455,7 +474,8 @@ its CLI reminder fires.
 5. Answer `session/request_permission`s (Permissions and Tools tables).
 6. On the prompt result, apply the Stop reasons row and Structured output.
 7. Wait for idle (Turn end row). Record `agy`'s process group and its
-   descendant PIDs, close the session and terminate `agy` (descendants are
+   descendant PIDs with each process's start time (a PID whose start time
+   differs later is a reused PID and is not reported), close the session and terminate `agy` (descendants are
    not killed). Then list the recorded processes that are still alive,
    leaving out the Tradewind shim and `agy`'s own helper processes (the
    spike lists them); if any remain, emit the process report. Then emit the
