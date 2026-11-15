@@ -768,3 +768,39 @@ async def test_mcp_proxied_call_works_on_the_socket_path(monkeypatch: pytest.Mon
 
     assert reply == protocol.CallResponse(content=expected.content, is_error=False)
     assert expected.is_error is False
+
+
+async def test_stop_socket_force_stops_an_approved_handler_that_never_returns(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Why: a hung approved tool must not keep the turn's end open forever
+    # (time cap + force stop).
+    from tradewind.application import tool_host
+
+    monkeypatch.setattr(tool_host, "_STOP_SOCKET_GRACE_S", 0.2)
+    started = anyio.Event()
+
+    async def handler(**_: object) -> str:
+        started.set()
+        await anyio.sleep_forever()
+        return "never"
+
+    host = ToolHost(
+        [Tool(name="hang", description="d", input_schema={"type": "object"}, handler=handler)],
+        [],
+        _resolve_ref_raises,
+    )
+    socket_path = await host.serve_socket()
+    stream = await anyio.connect_unix(socket_path)
+    async with stream:
+        request = protocol.CallRequest(name="hang", arguments={})
+        await stream.send((protocol.encode_request(request) + "\n").encode("utf-8"))
+        with anyio.fail_after(5):
+            await started.wait()
+
+        with caplog.at_level("WARNING", logger="tradewind.application.tool_host"):
+            with anyio.fail_after(5):
+                await host.stop_socket()
+
+    assert [r.__dict__.get("tool") for r in caplog.records] == ["hang"]
+    assert not socket_path.exists()

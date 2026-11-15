@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import sys
 import tempfile
 import uuid
@@ -61,6 +62,13 @@ from mcp_types import TextContent
 from tradewind.domain.errors import ConfigError
 from tradewind.domain.models import McpServerDef, PermissionBroker, Tool, normalize_decision
 from tradewind.toolproxy import protocol
+
+_logger = logging.getLogger(__name__)
+
+#: How long `stop_socket()` waits for approved socket handlers still running
+#: (shielded, see `_call`) before it force-stops them. A plain time cap: a
+#: local handler has no progress channel to extend it.
+_STOP_SOCKET_GRACE_S: float = 30.0
 
 #: The result tool's name (05 §6). A caller tool of this name is refused.
 RESULT_TOOL_NAME: Final = "tradewind_submit_result"
@@ -193,6 +201,10 @@ class ToolHost:
         # pass the `self._socket_path is None` check and each start a
         # listener, leaking one.
         self._socket_lock = anyio.Lock()
+        # Shielded dispatch scopes of approved socket calls still running,
+        # mapped to their tool names: `stop_socket()` cancels them past its
+        # grace (a scope's own `cancel()` overrides its shield).
+        self._shielded_calls: dict[anyio.CancelScope, str] = {}
 
     async def __aenter__(self) -> ToolHost:
         exit_stack = AsyncExitStack()
@@ -408,6 +420,13 @@ class ToolHost:
         way, just not detectably from here (fix round 2, ruling: documented
         restriction, not fully enforced -- accepted risk). Tool handlers
         served by this socket must never call `stop_socket()`.
+
+        An approved socket call whose tool is already running is shielded
+        (see `_call`), so this waits for it to finish -- bounded: past
+        `_STOP_SOCKET_GRACE_S` seconds every such tool is force-stopped
+        (cancelled through its own scope, which overrides the shield), a
+        WARNING naming the tool is logged, and this returns once the server
+        has wound down.
         """
         listener = self._socket_listener
         keeper = self._socket_keeper
@@ -426,7 +445,17 @@ class ToolHost:
             )
         stop.set()
         await listener.aclose()
-        await keeper  # waits for the keeper's own TaskGroup to fully wind down
+        # Waits for the keeper's own TaskGroup to fully wind down. `asyncio.
+        # wait` with a timeout does not cancel `keeper` when it expires.
+        done, _ = await asyncio.wait({keeper}, timeout=_STOP_SOCKET_GRACE_S)
+        if not done:
+            for scope, tool_name in list(self._shielded_calls.items()):
+                _logger.warning(
+                    "approved tool did not finish within the socket stop grace; force-stopped",
+                    extra={"tool": tool_name, "grace_s": _STOP_SOCKET_GRACE_S},
+                )
+                scope.cancel()
+            await keeper
         socket_path.unlink(missing_ok=True)
         self._socket_listener = None
         self._socket_keeper = None
@@ -580,11 +609,17 @@ class ToolHost:
                 # handle to interrupt from here) -- a recorded Phase-3
                 # limitation, not a silent drop (spec + RUNBOOK).
                 return ToolOutcome(content=reason or "permission denied", is_error=True)
-        with anyio.CancelScope(shield=shield_dispatch):
-            if name in self._tools:
-                outcome = await self._call_local(self._tools[name], arguments)
-            else:
-                outcome = await self._call_mcp(name, arguments)
+        outcome = ToolOutcome(content=f"tool {name!r} was force-stopped", is_error=True)
+        with anyio.CancelScope(shield=shield_dispatch) as scope:
+            if shield_dispatch:
+                self._shielded_calls[scope] = name
+            try:
+                if name in self._tools:
+                    outcome = await self._call_local(self._tools[name], arguments)
+                else:
+                    outcome = await self._call_mcp(name, arguments)
+            finally:
+                self._shielded_calls.pop(scope, None)
         return outcome
 
     def _submit_result(
