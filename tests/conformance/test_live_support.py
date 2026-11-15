@@ -139,15 +139,16 @@ def test_live_turn():
 """
 
 
-@pytest.mark.parametrize("flags", [[], ["--showlocals"]])
+@pytest.mark.parametrize("flags", [["--showlocals"]])
 def test_completed_result_itself_never_prints_its_events(
     pytester: pytest.Pytester, monkeypatch: pytest.MonkeyPatch, flags: list[str]
 ) -> None:
     """Defence in depth for a caller that did NOT collect through
     `collect_events`: `completed_result` fails without any traceback, so
-    neither its `events` argument nor the caller's locals are printed
-    (default output and `--showlocals`; `--full-trace` overrides this, which
-    is what `collect_events` covers)."""
+    neither its `events` argument nor the caller's locals are printed --
+    shown here with `--showlocals`, the stricter mode (the default output is
+    covered by the `collect_events` test above); `--full-trace` overrides
+    this, which is what `collect_events` covers."""
     key = "-".join(["sk", "ant", "api03", "Q" * 6 + "zz" * 6])
     pytester.makepyfile(test_nested=_NESTED_PLAIN_COLLECTION)
     repo_root = str(Path(__file__).resolve().parents[2])
@@ -161,6 +162,7 @@ def test_completed_result_itself_never_prints_its_events(
     output = run.stdout.str() + run.stderr.str()
     assert "401 bad key sk-ant-[REDACTED]" in output
     assert key not in output
+    assert "QQQQQQzz" not in output
 
 
 async def test_collect_events_redacts_failures_as_they_arrive() -> None:
@@ -175,3 +177,42 @@ async def test_collect_events_redacts_failures_as_they_arrive() -> None:
     failed = events[-1]
     assert isinstance(failed, TurnFailed)
     assert failed.error == "bad sk-ant-[REDACTED]"
+
+
+async def test_collect_events_redacts_retry_notices_and_any_nested_text() -> None:
+    """Every string an event carries is redacted, not just `TurnFailed`: a
+    retry notice's `error` is the raw provider exception text (FR-6.6), and
+    a later assertion failure would print it."""
+    from tests.conformance.live_support import collect_events
+    from tradewind.domain.events import ItemCompleted, PermissionRequested
+    from tradewind.domain.models import NormalizedMessage, retry_notice
+
+    async def stream() -> Any:
+        yield TurnStarted(turn_id="t")
+        yield ItemCompleted(
+            message=retry_notice(
+                phase="model_call", attempt=1, max_attempts=2, delay_s=0.5, error=f"529 {_FAKE_KEY}"
+            )
+        )
+        yield ItemCompleted(
+            message=NormalizedMessage(
+                role="assistant",
+                kind="event",
+                content={"nested": [{"deep": f"x {_FAKE_KEY}"}], "count": 3},
+            )
+        )
+        yield PermissionRequested(
+            tool_name="t", tool_input={"k": _FAKE_KEY}, verdict="deny", reason=_FAKE_KEY
+        )
+
+    events = await collect_events(stream())
+
+    assert "AbC_dEf" not in repr(events)
+    retry = events[1]
+    assert isinstance(retry, ItemCompleted)
+    assert retry.message.content["error"] == "529 sk-ant-[REDACTED]"
+    assert retry.message.content["attempt"] == 1  # non-strings untouched
+    nested = events[2]
+    assert isinstance(nested, ItemCompleted)
+    assert nested.message.content == {"nested": [{"deep": "x sk-ant-[REDACTED]"}], "count": 3}
+    assert events[0] == TurnStarted(turn_id="t")
