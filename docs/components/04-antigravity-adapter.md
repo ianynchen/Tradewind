@@ -28,6 +28,19 @@ Single user, the owner's machine, login and environment; multi-user uses
 LangChain. Test for every safety decision: not worse than the owner's own
 `agy` use.
 
+## Goals, non-goals, anti-goals
+
+- Goals: a complete Antigravity backend with structured output, caller
+  tools and MCP servers, the agent's own tools under the caller's policy,
+  and sessions that continue; honest capability flags.
+- Non-goals: LiteLLM (deferred); `agy` print mode; the Meridian features
+  themselves; API-key or Vertex auth; passing `agy` questions to the caller
+  (later, for all backends); one `agy` process per session.
+- Anti-goals: in broker mode, `git push`, a merge or a deploy that runs
+  without the broker when the broker would deny it; a structured result
+  that is prose or does not validate; `--dangerously-skip-permissions`;
+  cutting off work that `agy` started (M10).
+
 ## Shape
 
 The adapter **maps** ACP onto `05`: messages → actions (policy `gate` /
@@ -74,7 +87,7 @@ its own.
 |---|---|---|
 | `request_permission`, `kind: execute`, `rawInput.CommandLine` | `shell {command, cwd, sandboxed = not BypassSandbox, interactive = IsDaemon}` | gate |
 | `kind: read`, `rawInput.Path` | `file_read {path, in_workspace}` | gate |
-| `kind: edit`, `rawInput.Path` (+`Content` or `Target`/`Replacement`) | `file_write {path, in_workspace, change}` | gate |
+| `kind: edit`, `rawInput.Path` (+`Content` or `Target`/`Replacement`) | `file_write {changes: [{path, change, in_workspace}]}` | gate |
 | tool name `mcp_<shim>_<tool>` for this turn's shim | `caller_tool {name, args, source}`: only if the name starts with this turn's exact `mcp_tradewind-<8 hex>_` prefix **and** the rest is exactly a tool in the shim's own list (the shim is the only MCP server the engine has: workspace MCP config is a preflight stop, and the profile has none) | gate |
 | any other `mcp_…` name | `native {unknown_tool: true}` (cannot be split reliably) | gate |
 | `tool_call` for a tool that never asks: `search_web` (`kind: search`) | `web_search {query}` | observe |
@@ -100,7 +113,7 @@ test.
 |---|---|---|---|
 | ag.no-escape | `shell` with `sandboxed=false` → **deny**, record | broker | d1: the shell is offline; `input_to_running` then stays in the sandbox |
 | ag.no-browser | `subagent` with `type=browser` → **stop**, record | both | spike item 1 |
-| ag.mode | `mode_change` with `to ne $turn.mode` → **stop**, record | broker | M7 (also watched: config updates that change the mode option) |
+| ag.mode | `mode_change` with `to ne default` (`$turn.engine_mode`) → **stop**, record | broker | M7 (also watched: config updates that change the mode option) |
 | ag.mode-auto | `mode_change` → allow, record | engine_auto | M7 |
 | ag.question | `question` → **stop** ("Antigravity asked: '<title>' — questions are not supported yet") | both | M5 |
 
@@ -135,10 +148,17 @@ broker mode they stall at their first approval (spike turns 12, 22, 24).
 
 ## Preflight checks (`05` §4)
 
-1. Login (auth errors above).
-2. **Auto available (owner, M9 safety):** in engine_auto (including the
-   no-broker case), if the session's `mode` options lack `auto` → `Stop`
-   ("update agy or set a broker"); never allow-all.
+Order matters: the workspace scan runs first, and checks that need a
+running `agy` use a probe process in an empty temp folder, so no workspace
+hook, skill or MCP config can load before the C1 answer (cost: one extra
+`agy` start, about 1.5 s, once per turn).
+
+1. **Workspace customizations (owner C1)** — see check 4 below; scanned
+   first, answered before any `agy` runs in the workspace.
+2. **Login and Auto (probe in a temp folder):** auth errors as above; in
+   engine_auto (including the no-broker case), if the `mode` options lack
+   `auto` → `Stop` ("update agy or set a broker"); never allow-all (owner,
+   M9 safety).
 3. **Version check (owner M2):** `agy --version` against Tradewind's record
    of verified versions (pass, fail or timed out, with findings). Before a
    broker-mode turn on an unrecorded version, the safety suite
@@ -153,6 +173,10 @@ broker mode they stall at their first approval (spike turns 12, 22, 24).
      waiting broker-mode turns `Stop` with "Antigravity safety check timed
      out for agy <version>; retry later", and the next broker-mode turn
      retries at most once per hour per version;
+   - a path is **risky** if it writes or reads outside the workspace,
+     reaches the network (loopback included) or runs a command without a
+     request reaching Tradewind (reads under the temp folder and `agy`'s
+     customization folder are expected);
    - one run at a time; it runs in its own task and records its result
      even if the waiting turn is stopped;
    - fail → `Stop` with the recorded findings, without rerunning; the owner
@@ -166,18 +190,43 @@ broker mode they stall at their first approval (spike turns 12, 22, 24).
    config, and `.gemini/` and `.agent/` content (empty skill folders
    ignored; nothing above the repo root — spike). Found → `Ask` with the
    file list as `details` and choices `stop` (default), `delete`,
-   `proceed`. The change happens in `run()` after `TurnStarted`:
+   `proceed`. The change happens in `run()`, before `TurnStarted`:
    `delete` copies only the scanned files to
    `<data>/backups/<timestamp>-<turn id>/` (paths relative to the repo
    root), then deletes them (a file already gone is skipped; if any copy
-   fails, nothing is deleted and the turn ends with `ConfigError`); never
+   fails, nothing is deleted and `run()` raises `ConfigError`); never
    restored; tracked files show as deletions — the user's responsibility;
-   a notice names the files and the backup path. `proceed` records
+   a notice right after `TurnStarted` names the files and the backup path. `proceed` records
    "Antigravity customizations loaded without broker control: <files>". Evidence: a repo-root `hooks.json` ran its
    `SessionStart` and `PreInvocation` hooks at the first prompt with no
    question.
 5. **Name collisions (C2):** a caller tool named like an `agy` built-in →
    `Stop`.
+
+**Skills:** not separately blocked: prompt-triggered skills are off (prompt
+rule), workspace skills fall under check 4, default customizations are off,
+and a skill's actions are ordinary actions.
+
+## Turn algorithm
+
+1. `prepare_turn` (before the watchdog and `TurnStarted`; the turn is
+   registered as in flight): resolve the mode; workspace scan and the
+   caller's answer; probe `agy` in a temp folder (login, Auto); version
+   check in broker mode; name collisions.
+2. `run()`, before `TurnStarted`: apply a `delete` answer; spawn `agy` in
+   the workspace in its own process group; `initialize`, `authenticate`,
+   `session/new` or `session/resume` with this turn's shim and the system
+   prompt append; set mode, model, effort; wait for the shim to connect.
+   Errors here raise `ConfigError`.
+3. Emit `TurnStarted`, then any preflight notice; send `session/prompt`
+   (with the schema block if set).
+4. Map updates to actions and work signals; answer requests through the
+   gate.
+5. On the prompt result: stop reasons, structured output.
+6. Wait for open work (`05` §3.3). An interrupt during this wait ends the
+   turn as interrupted and drops a recorded structured result.
+7. Process report if needed, then the terminal event; close the session;
+   terminate `agy` (descendants are not killed at a normal end).
 
 ## Structured output (owner way 1, M6; seam in `05` §6)
 
@@ -243,7 +292,8 @@ check), a new FR for the C1 preflight check.
   early end drops the result; reminder content visible; `final_text`),
   shim readiness wait, resume, interrupt, subagent work closing on work
   silence, process report.
-- Live tests (`tests/conformance/test_antigravity.py`, env gate, 3-minute
+- Live tests (`tests/conformance/test_antigravity.py`, env gate
+  `TRADEWIND_RUN_ANTIGRAVITY_INTEGRATION`, `integration` marker, 3-minute
   box, cheapest model) **must pass before the backend is used**: plain
   turn; structured output; a denied shell command never runs; an escape is
   denied in broker mode; a caller MCP tool through the shim; resume; an

@@ -33,7 +33,7 @@ grown about 15 special rules; expressed as rules of shared mechanisms they
 are:
 
 - **more capable** — callers (Meridian) add their own rules on every
-  backend that can intercept actions, e.g. `mcp merge_pull_request → ask`;
+  backend that can intercept actions, e.g. `caller_tool name=merge_pull_request → ask`;
 - **as safe** — owner safety rulings are floor rules that a caller can
   tighten but never loosen; one evaluation path to test;
 - **as fast** — a rule-table lookup per action, no extra round trips, and
@@ -91,9 +91,9 @@ tool's own name (`tool_host.py:438`, `claude_backend.py:656`,
 `langchain_backend.py:723`), Codex's `"shell"`/`"apply_patch"`
 (`codex_backend.py:751-757`) — plus one added argument key, `"tradewind"`,
 holding `{kind, fields, backend, native_name, summary}`. Existing brokers
-keep working; new brokers can use the shared vocabulary. A new engine
+keep working; new brokers can use the shared vocabulary. The `tradewind` key is added only to the broker's copy of the arguments, never to the arguments the tool receives; if a caller tool has its own `tradewind` argument, the broker's copy uses the key `tradewind_action` instead. A new engine
 (Antigravity) uses the shared kind as the name for its built-in tools
-(`shell`, `apply_patch` for `file_write`, …), matching Codex's names.
+matching Codex's names: `shell`, `apply_patch` (`file_write`), `read_file` (`file_read`), `fetch_url`, and for `native` the engine's own tool name.
 
 ## 2. Action policy
 
@@ -101,7 +101,8 @@ keep working; new brokers can use the shared vocabulary. A new engine
 
 - **`gate(action) -> Decision`** — the engine asks before it acts (Claude
   `can_use_tool`, Codex approval requests, ACP `session/request_permission`,
-  LangChain's loop, `ToolHost.call`). Outcomes: `allow`, `ask` (→ broker),
+  LangChain's loop, and `ToolHost.call` only where `turn_runner` gives
+  `ToolHost` a broker — Codex and Antigravity — so no call is gated twice). Outcomes: `allow`, `ask` (→ broker),
   `deny`, `stop`.
 - **`observe(action) -> Observation`** — Tradewind only sees an action that
   the engine never asks about. Adapters observe **only** tools that never
@@ -125,27 +126,36 @@ turn variables usable in matchers: $turn.mode, $turn.shim_server,
 
 ### 2.3 Evaluation order
 
-1. **Floor rules** — Tradewind's own (§2.4) **and each backend's floor
-   rules**, which carry owner safety rulings. All matching floor rules
-   apply; the strongest outcome wins (`stop > deny > ask > allow`). Floor
-   rules cannot be weakened.
-2. **Caller rules** (`SessionOptions.policy_rules`), first match wins; a
-   caller rule only takes effect if it is at least as strong as every
-   matching floor rule (a caller can turn a floor `ask` into `deny`, never
-   into `allow`).
-3. **Backend default rules**, first match wins (convenience defaults a
-   caller may override).
-4. **Mode default (gate only):** broker mode → `ask`; engine_auto → `ask` if
-   a broker is set, else `allow`. **Observe** default: `allow`.
+**Structural pass-throughs (before any rule):** the result tool
+(`$turn.result_tool`: `tradewind_submit_result` through the shim, Claude's
+`StructuredOutput`) is allowed and never asked; a call identified as this
+turn's shim at the **engine layer** (ACP request, Codex elicitation) is
+allowed there, because it is evaluated once, inside `ToolHost.call`. These
+are not rules and cannot be overridden.
+
+**Rules:**
+
+1. **Floor rules** — Tradewind's (§2.4) and each backend's floor rules
+   (owner safety rulings). Floor rules only `deny` or `stop` (plus
+   `record`). `F` = the strongest matching floor outcome, or none.
+2. **Chosen outcome `C`** = the first match among caller rules
+   (`SessionOptions.policy_rules`), then backend default rules, then the
+   mode default — gate: broker mode `ask`, engine_auto `ask` if a broker is
+   set else `allow`; observe: `allow`.
+3. **Final outcome** = the stronger of `F` and `C`
+   (`stop > deny > ask > allow`). So a caller can tighten anything and can
+   loosen only defaults, never a floor rule.
 
 `record` is the OR of every matching rule's flag. Only rules whose `modes`
-contain the turn's mode match.
+contain the turn's mode match. Turn variables include `$turn.mode`
+(`broker`/`engine_auto`) and `$turn.engine_mode` (the engine's own mode
+name, e.g. `default`/`auto`).
 
 ### 2.4 Tradewind floor rules
 
 - `missing_critical_field` → `deny`, record.
-- The result tool (`$turn.result_tool`) → `allow`, never asks.
-- Engine options that grant beyond this call are never chosen (§2.6).
+- Engine options that grant beyond this call are never chosen (§2.6, an
+  adapter contract rather than a rule).
 
 ### 2.5 Permission modes (owner C2, M9)
 
@@ -155,10 +165,16 @@ contain the turn's mode match.
 | **engine_auto** | `permission_mode="engine_auto"` | only what the engine's auto review sends to the client | `ask` if a broker is set, else `allow` |
 | no broker | runner's default allow-all broker (`is_default_allow_all`) | per backend: Antigravity → engine_auto (owner M9); Codex keeps its read-only sandbox; Claude, LangChain unchanged | as the resulting mode |
 
-Engine settings for engine_auto (PR 1 confirms exact names): Claude's auto
-permission mode (and whether `can_use_tool` still runs); Codex's
-auto-reviewer (`approvals_reviewer`) with the workspace-write sandbox;
-Antigravity's `auto` mode with `toolPermission: "request-review"`.
+Engine_auto per backend:
+- **Claude:** built-in tools stay off (`tools=[]`); only the engine-side
+  mode changes; caller tools still go through `can_use_tool` and the
+  policy, so only the mode default changes. If PR 1 finds that the SDK's
+  auto mode skips `can_use_tool`, Claude declares
+  `supports_engine_auto=False`.
+- **Codex:** the auto-reviewer (`approvals_reviewer`, exact setting
+  confirmed in PR 1) with the workspace-write sandbox.
+- **Antigravity:** `auto` mode with `toolPermission: "request-review"`.
+- **LangChain:** no engine of its own → `Unsupported`.
 
 ### 2.6 Answering an engine's options (adapter contract)
 
@@ -220,7 +236,9 @@ terminal event, on every backend.
 The turn ends when the engine reports done **and** no work item is open.
 Work with `has_end_signal=False` (e.g. `agy` subagents) is closed when it
 reports no activity for the work-silence limit **after the engine has
-reported done**; this is a **normal end**, not a timeout: the turn
+reported done**, provided no work item **with** an end signal is still
+open (if one is, the ordinary work-silence limit applies to the whole turn
+and ends it as a timeout); this close is a **normal end**, not a timeout: the turn
 completes, a structured result is kept, and the process report names the
 closed items. The terminal event comes after this point.
 
@@ -232,7 +250,9 @@ closed items. The terminal event comes after this point.
 | caller interrupt answered within 15 s | terminated | reported, not killed |
 | interrupt unanswered, or a limit fired | process group, then tree walk | killed; survivors reported |
 
-Process listing uses `ps` (no new dependency); a PID whose start time
+The report is emitted on a fired limit, on an interrupt, or when
+descendants are alive at a normal end. Process listing uses `ps` (no new
+dependency); a PID whose start time
 changed is not reported; the shim and the engine's own helper processes
 are excluded. **Process report:** one WARNING log entry and one
 `ItemCompleted(kind="event")` before the terminal event, with turn and
@@ -256,14 +276,20 @@ Check(id) -> Ok | Ask(question, details, choices, default_choice) | Stop(reason)
   `default_choice`, always the safe one. `stop()` cancels a waiting
   question or check.
 - The chosen answer is stored on `TurnContext.preflight`; **anything a
-  check needs to change (e.g. deleting files) is done by `run()` after
+  check needs to change (e.g. deleting files) is done by `run()`, before
   `TurnStarted`**, so a stop between `prepare_turn` and `run()` changes
-  nothing.
+  nothing and a failure can still raise `ConfigError`; the notice about it
+  is emitted right after `TurnStarted`.
 - `Stop(reason)` raises `ConfigError(reason)` before `TurnStarted`; no new
   error class.
+- A backend registers the turn as in flight from the start of
+  `prepare_turn`, so `interrupt()` reaches a turn that is waiting in it.
 - A stop request before or after `prepare_turn` records the turn as
   interrupted without calling `run()` — the only case of a terminal record
   without `TurnStarted` (FR-2 and the port docstring change).
+- Work that `run()` does before `TurnStarted` (e.g. applying a preflight
+  answer, spawning the engine) may still raise `ConfigError`; after
+  `TurnStarted`, failures end the turn with `TurnFailed`.
 
 ## 5. Prompt rule (owner M11)
 
@@ -287,8 +313,8 @@ refuses a caller tool of that name, and exposes `result_slot` (`attempts`,
 
 | | Gate | Observe | Work signals |
 |---|---|---|---|
-| **Claude** (`tools=[]`, built-ins off) | `can_use_tool` → `caller_tool` | none | `include_partial_messages` `StreamEvent`s → `model_active` (never mapped to events or the mirror; a test proves plain-turn events are unchanged); tool-use/tool-result blocks → `started`/`ended`; `TaskStartedMessage` → `started(background)`, `TaskProgressMessage` → `active`, `TaskNotificationMessage` / `TaskUpdatedMessage.patch.status` terminal → `ended`; messages with `parent_tool_use_id` → `active` of that task |
-| **Codex** | `commandExecution/requestApproval` → `shell`; `fileChange/requestApproval` → `file_write`; MCP elicitations for the shim → `caller_tool` via `ToolHost` (default rule allows at the engine layer, as today, so the broker is asked once) | `item/started` of commands run in the sandbox without a request → `shell` (observe default allow) | `item/started`/`item/completed`; `commandExecution/outputDelta`, `mcpToolCall/progress`, `autoApprovalReview/*`, `terminalInteraction` → `active`; message and reasoning deltas → `model_active` |
+| **Claude** (`tools=[]`, built-ins off) | `can_use_tool` → `caller_tool`; `$turn.result_tool` = `StructuredOutput` | none (no built-in tools; work-silence on Claude is time since the last tool start or end, because it streams no tool output) | `include_partial_messages` `StreamEvent`s → `model_active` (never mapped to events or the mirror; a test proves plain-turn events are unchanged); tool-use/tool-result blocks → `started`/`ended`; `TaskStartedMessage` → `started(background)`, `TaskProgressMessage` → `active`, `TaskNotificationMessage` / `TaskUpdatedMessage.patch.status` terminal → `ended`; messages with `parent_tool_use_id` → `active` of that task |
+| **Codex** | `commandExecution/requestApproval` → `shell`; `fileChange/requestApproval` → `file_write`; MCP elicitations for the shim → structural pass-through, then `caller_tool` inside `ToolHost`; other MCP elicitations → `mcp` (an unreadable tool name → `missing_critical_field`, keeping today's fail-closed rule) | `item/completed` of a command or file change that had **no** approval request → `shell`/`file_write` (record and after-the-fact stop only; `item/started` comes before a possible request, so it is never observed) | `item/started`/`item/completed`; `commandExecution/outputDelta`, `mcpToolCall/progress`, `autoApprovalReview/*`, `terminalInteraction` → `active`; message and reasoning deltas → `model_active` |
 | **LangChain** | its own loop → `caller_tool` | none | model stream chunks → `model_active`; tool execution → `started`/`ended`; in-turn compaction call → `model_active` |
 
 ## Port and interface changes (one ADR)
@@ -344,3 +370,5 @@ FR-8.1 (new flags); FR-2 and the port docstring (terminal record without
   cancellation.
 - Plain turns on Claude, Codex and LangChain produce exactly the same events
   as before.
+- Codex: a rule with `ask` on a command that Codex asks about reaches the
+  broker (never stopped at observe).
