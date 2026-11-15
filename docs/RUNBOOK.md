@@ -153,6 +153,27 @@ the adapter never has to import `application.turn_runner` itself — and default
 whichever broker is or isn't configured. See README.md's "Security defaults" section for the
 caller-facing summary.
 
+### Claude turn governance findings (claude-agent-sdk 0.2.151, CLI 2.1.258; task 8)
+
+- **engine_auto is not enabled on Claude.** The SDK's `auto` permission mode lets a model
+  classifier approve tool calls; `can_use_tool` is "not invoked for tool calls already
+  permitted by ... `permission_mode`" (`claude_agent_sdk/types.py:2110-2125`) and
+  `set_permission_mode` documents `'auto'` as "A model classifier approves or denies each
+  tool call" (`claude_agent_sdk/client.py:294`). Setting it would let caller tools bypass the
+  policy gate, so the adapter never sets `permission_mode`; `supports_engine_auto` stays
+  `False` for Claude (05 §2.5).
+- **Slash commands: prefix rule, not the CLI flag.** The CLI's `--disable-slash-commands`
+  ("Disable all skills") still intercepts built-ins: `claude -p --disable-slash-commands
+  "/cost"` answered "/cost isn't available in this environment." with `num_turns=0` and no
+  model call. So a prompt whose first non-whitespace character is `/` is sent as
+  `Message: <prompt>` (05 §5).
+- **No process report on Claude.** The CLI's PID is reachable only through private
+  attributes (`ClaudeSDKClient._transport._process`,
+  `_internal/transport/subprocess_cli.py:233,853`), and the CLI is spawned without a new
+  session, so it shares the caller's process group (a group walk would list the caller's
+  own processes). The adapter does not report descendants (05 §3.4) until the SDK exposes
+  the PID.
+
 ### Env gates for integration/live runs
 
 | Variable | Gates | Notes |

@@ -474,3 +474,184 @@ def test_is_max_turns_result_false_for_an_ordinary_error() -> None:
     # A genuine failure must keep failing -- only the caller's own cap is
     # reclassified as completion.
     assert is_max_turns_result(_result(subtype="error_during_execution", is_error=True)) is False
+
+
+# --- turn governance: work signals (05-turn-governance §7, Claude row) ---
+
+
+class _RecordingWork:
+    """Records every work signal in call order."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[object, ...]] = []
+
+    def started(
+        self,
+        id: str,  # noqa: A002
+        kind: str,
+        label: str,
+        has_end_signal: bool = True,  # noqa: ARG002 -- signature parity only
+    ) -> None:
+        self.calls.append(("started", id, kind, label))
+
+    def active(self, id: str) -> None:  # noqa: A002
+        self.calls.append(("active", id))
+
+    def ended(self, id: str) -> None:  # noqa: A002
+        self.calls.append(("ended", id))
+
+    def model_active(self) -> None:
+        self.calls.append(("model_active",))
+
+    def engine_done(self) -> None:
+        self.calls.append(("engine_done",))
+
+
+def _signals(messages: list[object]) -> list[tuple[object, ...]]:
+    from tradewind.adapters.claude_backend import report_work
+
+    work = _RecordingWork()
+    for message in messages:
+        report_work(work, message)  # type: ignore[arg-type]
+    return work.calls
+
+
+def test_task_messages_drive_work_signals() -> None:
+    """Background tasks hold the turn open (§3.3): each lifecycle message
+    maps to exactly one signal, and a terminal status from EITHER the
+    notification or the update closes the task (the SDK's own lifecycle
+    note: a killed task may report only through `task_updated`)."""
+    from claude_agent_sdk import (
+        TaskNotificationMessage,
+        TaskProgressMessage,
+        TaskStartedMessage,
+        TaskUpdatedMessage,
+    )
+
+    usage: Any = {"total_tokens": 1, "tool_uses": 0, "duration_ms": 1}
+    calls = _signals(
+        [
+            TaskStartedMessage(
+                subtype="task_started",
+                data={},
+                task_id="bg1",
+                description="build",
+                uuid="u1",
+                session_id="s",
+            ),
+            TaskProgressMessage(
+                subtype="task_progress",
+                data={},
+                task_id="bg1",
+                description="build",
+                usage=usage,
+                uuid="u2",
+                session_id="s",
+            ),
+            TaskUpdatedMessage(
+                subtype="task_updated", data={}, task_id="bg1", patch={"status": "running"}
+            ),
+            TaskNotificationMessage(
+                subtype="task_notification",
+                data={},
+                task_id="bg1",
+                status="completed",
+                output_file="/tmp/o",
+                summary="ok",
+                uuid="u3",
+                session_id="s",
+            ),
+            TaskStartedMessage(
+                subtype="task_started",
+                data={},
+                task_id="bg2",
+                description="watch",
+                uuid="u4",
+                session_id="s",
+            ),
+            TaskUpdatedMessage(
+                subtype="task_updated", data={}, task_id="bg2", patch={"status": "killed"}
+            ),
+        ]
+    )
+
+    assert calls == [
+        ("started", "bg1", "background", "build"),
+        ("active", "bg1"),
+        ("ended", "bg1"),
+        ("started", "bg2", "background", "watch"),
+        ("ended", "bg2"),
+    ]
+
+
+def test_tool_blocks_open_and_close_tool_work() -> None:
+    calls = _signals(
+        [
+            _assistant(
+                [
+                    TextBlock(text="let me check"),
+                    ToolUseBlock(id="t1", name="mcp__tradewind__x", input={}),
+                ]
+            ),
+            UserMessage(content=[ToolResultBlock(tool_use_id="t1", content="ok")]),
+            UserMessage(content="plain text echo"),
+        ]
+    )
+
+    assert calls == [("started", "t1", "tool", "mcp__tradewind__x"), ("ended", "t1")]
+
+
+def test_subagent_messages_report_activity_of_their_parent_tool() -> None:
+    """A subagent's own tool traffic arrives with `parent_tool_use_id`; it is
+    activity of the spawning call, so work silence does not fire while the
+    subagent is busy."""
+    calls = _signals(
+        [
+            _assistant(
+                [ToolUseBlock(id="sub-t", name="Read", input={})], parent_tool_use_id="agent-1"
+            ),
+            UserMessage(
+                content=[ToolResultBlock(tool_use_id="sub-t", content="x")],
+                parent_tool_use_id="agent-1",
+            ),
+        ]
+    )
+
+    assert calls == [
+        ("started", "sub-t", "tool", "Read"),
+        ("active", "agent-1"),
+        ("ended", "sub-t"),
+        ("active", "agent-1"),
+    ]
+
+
+def test_stream_events_are_model_activity_only_and_result_is_engine_done() -> None:
+    from claude_agent_sdk import StreamEvent
+
+    calls = _signals(
+        [
+            StreamEvent(uuid="e1", session_id="s", event={"type": "content_block_delta"}),
+            ResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=1,
+                is_error=False,
+                num_turns=1,
+                session_id="s",
+            ),
+        ]
+    )
+
+    assert calls == [("model_active",), ("engine_done",)]
+
+
+def test_slash_prompt_is_message() -> None:
+    """05 §5 (owner M11): a prompt is always a message to the model. The
+    bundled CLI's `--disable-slash-commands` still intercepts `/cost` (live
+    check, CLI 2.1.258), so the prefix rule applies."""
+    from tradewind.adapters.claude_backend import message_prompt
+
+    assert message_prompt("/clear") == "Message: /clear"
+    assert message_prompt("  /compact now") == "Message:   /compact now"
+    assert message_prompt("explain a/b") == "explain a/b"
+    assert message_prompt("") == ""
