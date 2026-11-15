@@ -104,6 +104,15 @@ class Matcher:
         return cls(op=d["op"], value=d.get("value"))
 
 
+def _lookup(action: Action, name: str) -> object:
+    """Field value for a matcher: `fields` first, then the action's flags."""
+    if name in action.fields:
+        return action.fields[name]
+    if name in ("missing_critical_field", "unknown_tool"):
+        return getattr(action, name)
+    return _MISSING
+
+
 @dataclass(frozen=True)
 class Rule:
     """A policy rule: when `kind` and every `where` matcher match, `outcome` applies."""
@@ -121,9 +130,7 @@ class Rule:
             return False
         if self.kind != "any" and self.kind != action.kind:
             return False
-        return all(
-            m.matches(action.fields.get(name, _MISSING), turn) for name, m in self.where.items()
-        )
+        return all(m.matches(_lookup(action, name), turn) for name, m in self.where.items())
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -163,20 +170,12 @@ def floor_tradewind() -> list[Rule]:
         Rule(
             id="floor.missing_critical_field",
             kind="any",
-            where={},
+            where={"missing_critical_field": Matcher("is_true")},
             outcome="deny",
             record=True,
             reason="action is missing a critical field",
         )
     ]
-
-
-def _matches_flag(rule: Rule, action: Action, turn: TurnVars) -> bool:
-    # `missing_critical_field` is a flag on the action, not a field; the
-    # Tradewind floor rule is the one place it is consulted.
-    if rule.id == "floor.missing_critical_field":
-        return action.missing_critical_field and rule.matches(action, turn)
-    return rule.matches(action, turn)
 
 
 def evaluate(
@@ -200,7 +199,7 @@ def evaluate(
     for rule in floor:
         if rule.outcome in ("allow", "ask"):
             raise ValueError(f"floor rule {rule.id!r} may only deny or stop")
-    floor_hits = [r for r in floor if _matches_flag(r, action, turn)]
+    floor_hits = [r for r in floor if r.matches(action, turn)]
     chosen = next((r for r in (*caller, *defaults) if r.matches(action, turn)), None)
     outcome: Outcome = chosen.outcome if chosen else mode_default
     reason = chosen.reason if chosen else ""

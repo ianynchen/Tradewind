@@ -165,3 +165,16 @@ def test_rule_round_trip_json_safe():
     assert Rule.from_dict(json.loads(json.dumps(d))) == rule
     m = Matcher("regex", "a.*")
     assert Matcher.from_dict(json.loads(json.dumps(m.to_dict()))) == m
+
+
+def test_tradewind_floor_does_not_deny_normal_action():
+    res = _run(_action(), floor=floor_tradewind(), mode_default="allow")
+    assert res.outcome == "allow"
+    assert res.rule_ids == ()
+
+
+def test_rule_can_match_unknown_tool_flag():
+    rule = Rule("c", "any", {"unknown_tool": Matcher("is_true")}, "deny")
+    flagged = Action("native", {}, "claude", "Mystery", {}, unknown_tool=True)
+    assert _run(flagged, caller=[rule], mode_default="allow").outcome == "deny"
+    assert _run(_action(), caller=[rule], mode_default="allow").outcome == "allow"
