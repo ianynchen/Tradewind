@@ -321,3 +321,37 @@ the system prompt (not enforceable); (2) subagent work has no idle signal
 over ACP — decide how the M10 "wait until all work ends" rule treats it;
 (3) the untested items above can be checked with the remaining budget or
 in PR 2's live tests.
+
+## Owner item 1 follow-up: browser and built-in file writes (turns 21–24)
+
+The owner chose to prove both now (budget raised to 25 turns).
+
+- **Built-in file writes outside the workspace — proven (turn 23,
+  answers `allow`).** `write_file` and `edit_file` on
+  `$HOME/agy-spike-outside3/…` each sent `session/request_permission`
+  (`kind: edit`, `rawInput` with `Path`, `Content` or `Target`/`Replacement`,
+  `allow_once`/`reject_once`); after `allow` they wrote outside the
+  workspace (the built-in file tools are not sandboxed). A write inside the
+  workspace also asked under strict. The broker sees the exact path and can
+  deny anything outside the workspace. (Turn 20's missing request came from
+  the turn ending first.) The folder was removed afterwards.
+- **Browser — still not observed acting (turns 21, 22, 24).**
+  - Turn 21 (browser on, "use the browser"): the model used `curl` instead
+    (sandboxed, then an escape; both asked).
+  - Turns 22 and 24: `invoke_subagent` with `TypeName: "browser"` started
+    with no request; the parent ended its turn after 7.7 s and 10.4 s even
+    when told to wait (turn 24 used `manage_subagents list` and
+    `schedule`). The browser subagent's transcript (turn 22) has one
+    planned step, `mcp_chrome_devtools_list_pages`, and nothing after it.
+    No canary hit in turns 11, 12, 22 or 24.
+  - `browserEnabled: false` had no visible effect (the `browser` command
+    and the 13-command list were the same with it on and off, no-prompt
+    runs).
+  - Interpretation (inferred, not proven): the browser is reachable only
+    through a browser subagent; its Chrome tools are MCP tools, which "default
+    to Ask" (antigravity.google/docs/permissions); subagent approval requests
+    are not delivered over ACP, so the browser subagent stalls at its first
+    tool. Behaviour while a parent turn is still active was never observed,
+    because the parent always ended its turn first.
+
+Turns used: 24 of 25.
