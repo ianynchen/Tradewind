@@ -72,6 +72,7 @@ in a multi-user setting (separate OS users, environment allowlists, separate
 ## Delivery (owner, M12)
 
 1. **Go/no-go spike** (below). Nothing else starts until it passes.
+   `jsonschema` is approved as a declared dependency (owner, 2026-11-15).
 2. **PR 1 — shared parts, all backends:** engine-auto permission mode
    (Claude, Codex, Antigravity-ready), slash commands off (Claude, Codex), the
    backend-neutral broker vocabulary (`native`), the result-tool seam in
@@ -125,17 +126,36 @@ command, and it happens without a `session/request_permission` reaching
 Tradewind. Reads under the system temp directory and `agy`'s own
 customization directory are expected.
 
+**Evidence per trap.** A trap passes only with positive evidence that it was
+attempted: either a `session/request_permission` for it reached Tradewind,
+or the trap fired (marker present, canary hit). No evidence → the trap is
+**inconclusive**; it is retried up to twice, then the check fails. The check
+answers every approval request with **allow** (so that an action which
+would have run is observable) and records each request; it runs in a
+throwaway workspace under the system temp directory; the "external" canary
+is a second local listener reached through a non-loopback interface
+address, so no outside host is needed. Workspace hooks, plugins and MCP
+servers are tested by the C1 detector (planted files must be detected); the
+check does not run them.
+
+**Where it lives.** A module in `src/` (`tradewind.adapters.antigravity_check`),
+because it runs automatically; its own unit tests use the fake ACP agent.
+
 **First run:** if any risky path runs without asking, work stops and the
 findings go to the owner. No adapter code is written before it passes.
 
 **Every new `agy` version (owner: use the latest, no pin, no separate
-copy):** Tradewind records the versions that passed in its data folder.
-Before the first turn on an unrecorded version, it runs the check
-automatically (minutes, a little quota). Pass → the version is recorded and
-the turn runs. Fail → broker-mode turns on that version are refused with the
-findings; engine-auto turns still run, because there `agy`'s own safety
-decides. Google's server-side flags can change behaviour without a version
-change; the owner can rerun the check at any time.
+copy):** Tradewind records **pass and fail, with the findings**, per version
+in its data folder. Before the first **broker-mode** turn on an unrecorded
+version, it runs the check automatically (minutes, a little quota), under a
+lock so only one check runs at a time; other turns wait for its result. The
+check runs before the turn's watchdog starts, so it does not use the turn's
+time. Pass → the turn runs. Fail → broker-mode turns on that version are
+refused with the recorded findings, without rerunning the check;
+engine-auto turns are not checked, because there `agy`'s own safety
+decides. The owner reruns the check on demand (e.g. after Google changes
+server-side flags), and each run also refreshes the list of `agy` built-in
+tool names (C2).
 
 ## Owns
 
@@ -163,10 +183,12 @@ calls. The builder may revisit a call only by raising it.
 | Decision | Choice | Why |
 |---|---|---|
 | Process model | One `agy acp` process per turn, as Codex does: spawn, `initialize`, `authenticate`, `session/new` (first turn) or `session/resume`, prompt, close, terminate | `turn_runner` builds a new `ToolHost` and shim socket per turn, and the port has no session-close hook. Measured on 1.5.3: 1.3–1.8 s to a ready session, no large unpack. |
-| Turn end **(owner, M10)** | The turn ends only when `agy` reports the root agent idle **and** no background task, subagent or swarm member running (ACP work-state/plan/tool updates; spike confirms the signal). Then `session/close` (if advertised) and terminate | Never cut off work. A turn can last as long as its longest background task. |
-| Interrupt **(owner, M10)** | `session/cancel`, wait for the prompt response (stop reason `cancelled`); no response in 15 s → stop the whole process tree: `agy` is spawned in its own process group, then the tree is walked (T3 Code's method) and every descendant is signalled; survivors are reported by name and PID in a notice | A group kill misses processes that open their own terminal session; no method is complete on macOS, so the honest best is stop-and-report. |
+| Turn end **(owner, M10)** | The turn waits until `agy` reports the root agent idle **and** no background task, subagent or swarm member running (ACP work-state/plan/tool updates; the spike confirms the signal). **The terminal event (`TurnCompleted`/`TurnFailed`) is emitted only after that idle point**, so the caller cannot start the next turn while work runs; output from background work during the wait is part of the turn's events. Then `session/close` (if advertised) and terminate `agy` itself. **Descendant processes still alive at a normal end are not killed** (e.g. a `nohup deploy.sh &` that `agy` does not track); they are reported (Process report row) | Never cut off work. A turn can last as long as its longest background task. |
+| Interrupt **(owner, M10)** | `session/cancel`, wait for the prompt response (stop reason `cancelled`); no response in 15 s → stop the whole process tree: `agy` is spawned in its own process group, then the tree is walked (T3 Code's method) and every descendant is signalled; survivors are reported. An interrupt during the idle wait ends the turn as interrupted and drops any recorded structured result | A group kill misses processes that open their own terminal session; no method is complete on macOS, so the honest best is stop-and-report. |
+| Watchdog **(owner, C-A)** | The FR-6.6 watchdog (`request_timeout_s`, default 600 s) stays. The caller sets the limit per turn for long work (e.g. Meridian: 60 min for deploy turns, 10 min for reviews). When it fires: interrupt as above, `end_reason="timeout"`, and a process report. The version check runs before the watchdog starts | Keeps the protection against a stuck agent; only the caller knows which work is long. An activity-based timer is a possible later improvement once the work-state signal is proven. |
+| Process report **(owner, C-A)** | On a watchdog timeout, an interrupt, or descendants alive at a normal end: one WARNING log entry **and** a notice stored with the turn, containing turn id, session id, backend, limit and elapsed time (timeout), each live process (name, PID, full command line, start time), `agy`'s last reported work state, and the last tool call | Debugging: the same record for all three cases, findable in logs and in history. |
 | Auth | `SubscriptionAuth` only; `ApiKeyAuth` → `ConfigError`. After `initialize`, `authenticate {methodId: "oauth-personal"}`. Not logged in (stdout/stderr line `Open the following link to authenticate the ACP server:` or JSON-RPC `-32000`) → `ConfigError` naming the login command; `SUBSCRIPTION_REQUIRED` → `ConfigError` "no eligible subscription". Failures before `TurnStarted` raise, as on other backends | Strings from T3 Code (`antigravityAuthSupport.ts:26-27,166-171`, `AntigravityAuth.ts:124-126`). |
-| Settings isolation **(owner, M1)** | Spawn with `--gemini-dir <Tradewind profile dir>` and `--disable-telemetry`, so Tradewind's `settings.json` (strictest tool permissions, no allow rules, AI credits off, sandbox on, `--include-default-customizations=false`) is separate from the owner's interactive `agy`. The profile dir comes from config (new `NativeStoreConfig.antigravity_dir`; FR-10.4: Tradewind reads no files or env by itself) | The owner's personal allow rules must not widen what the broker sees. |
+| Settings isolation **(owner, M1)** | Spawn with `--gemini-dir <Tradewind profile dir>`, `--disable-telemetry` and `--include-default-customizations=false`, so Tradewind's `settings.json` (strictest tool permissions, no allow rules, AI credits off, sandbox on) is separate from the owner's interactive `agy`. The profile dir comes from config (new `NativeStoreConfig.antigravity_dir`; FR-10.4: Tradewind reads no files or env by itself) | The owner's personal allow rules must not widen what the broker sees. |
 | Login and token **(owner, M1)** | The spike finds where the token lives (keychain or file) and whether profiles are separate. If they cannot be separated, Tradewind shares the owner's login (accepted fallback). T3's `GEMINI_HOME` / `AGY_ACP_FORCE_FILE_STORAGE` are **not** used: they do not exist in 1.5.3 | A shared login adds no security risk (the token is already in the keychain); side effects are a shared quota and one account. |
 | Environment **(owner, M4)** | Inherit the owner's environment. Remove only variables that switch `agy` away from subscription auth (at least `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`; the spike lists the full set) | Scope rule: no more risk than the owner's terminal; tools need `SSH_AUTH_SOCK`, `GH_TOKEN`, deploy credentials, proxies. |
 | AI credits | Off in Tradewind's settings | Unattended turns must not spend paid credits when the quota runs out. |
@@ -176,23 +198,43 @@ calls. The builder may revisit a call only by raising it.
 
 | Decision | Choice | Why |
 |---|---|---|
-| Workspace customizations **(owner, C1)** | Before spawn, look in the cwd and the repo root for `.agents/`, `.gemini/`, `.agent/` content other than empty skill folders (hooks, plugins, skills, MCP config). If found, call the caller's `on_workspace_customizations(files) -> "stop" \| "set_aside" \| "proceed"`. No callback, or a callback error → `stop` (`ConfigError` listing the files). `set_aside` moves the files to a backup folder outside the workspace and restores them after the turn (also after a failure or interrupt). `proceed` emits a notice "Antigravity customizations loaded without broker control: <files>" | Hooks and plugins run without any approval request. Moving files aside, not deleting, means the agent cannot commit a deletion and the repo is not damaged. |
+| Workspace customizations **(owner, C1)** | Before spawn, look in the cwd, the repo root and every folder between them for `.agents/`, `.gemini/`, `.agent/` content other than empty skill folders (hooks, plugins, skills, MCP config); the spike confirms `agy` loads from nowhere else. If found, call the caller's `on_workspace_customizations(files) -> "stop" \| "set_aside" \| "proceed"`. No callback, or a callback error → `stop` (`ConfigError` listing the files). `proceed` emits a notice "Antigravity customizations loaded without broker control: <files>" | Hooks and plugins run without any approval request. |
+| `set_aside` details | Allowed only for files git does **not** track; if any found file is tracked, `set_aside` is refused and the turn stops with that reason (moving a tracked file is a deletion to git, which `git add -A` would commit). Untracked files move to a backup folder in Tradewind's data folder, with a **journal** entry written first; they are restored after the turn (normal end, failure or interrupt), merging into folders `agy` created meanwhile (e.g. `.agents/skills`). At start-up, any journal entry left by a crash is restored before anything else. Only one turn per repo may have files set aside at a time; other turns in that repo wait | Restores after crashes, never commits a deletion, and parallel turns cannot see a half-restored repo. |
 | Empty skill folders | `agy` creates empty `.gemini/skills` and `.agents/skills` in the cwd; they are ignored by the check and left in place | They hold nothing that runs. |
-| Slash commands **(owner, M11)** | Off: a prompt is always a message to the model. Use `agy`'s setting if ACP honours it; otherwise prefix a prompt that starts with `/`. (Claude and Codex in PR 1.) | A prompt from a PR description must not run `/logout` or `/clear`. |
+| Slash commands **(owner, M11)** | Off: a prompt is always a message to the model. Use the engine's own off switch where it exists; otherwise a prompt whose first non-whitespace character is `/` is sent with the plain-text prefix `Message: ` (so `/clear the old tests` reaches the model as `Message: /clear the old tests`); the mirror keeps the caller's original prompt. The spike and PR 1 confirm per engine that the prefixed form is not expanded. (Claude and Codex in PR 1, same rule.) | A prompt from a PR description must not run `/logout` or `/clear`. |
 | Skills | Not separately blocked. Prompt-triggered skills are off (slash commands); workspace skills fall under C1; default customizations are off; a skill's actions are tool calls and are decided like any other | A skill gives the model instructions, not permissions. |
 
 ### Permissions
 
 | Decision | Choice | Why |
 |---|---|---|
-| Permission modes **(owner, C2/M9)** | **Broker mode** (a broker is set): session mode `default`, every approval request → broker. **Engine-auto** (`permission_mode="engine_auto"`, opt-in per session; PR 1 for all three backends): `agy` Auto mode with the sandbox; Claude's auto mode; Codex's auto-reviewer with the workspace-write sandbox. **No broker on Antigravity → engine-auto** (owner, M9: the caller accepts the risk; documented). Antigravity's Auto over ACP needs `agy` ≥ 1.5.4; without it, engine-auto raises `ConfigError` ("update agy or set a broker"), never allow-all | The owner works in auto mode by habit; the broker stays available for merge/deploy. Engine auto modes differ in strength (README table): Codex and `agy` auto-run anything inside their sandbox. |
+| Permission modes **(owner, C2/M9)** | **Broker mode** (a broker is set, `permission_mode` not `engine_auto`): session mode `default`, every approval request → broker. **Engine-auto** (`permission_mode="engine_auto"`, opt-in per session; PR 1 for all three backends): `agy` Auto mode with the sandbox; Claude's auto mode; Codex's auto-reviewer with the workspace-write sandbox (PR 1 discovers the exact Claude and Codex settings). **No broker on Antigravity → engine-auto** (owner, M9; documented as the caller's accepted risk). "No broker" means the runner's default allow-all broker, detected with `is_default_allow_all` as Codex does (`turn_runner.py:88-102`); Codex's own no-broker behaviour (read-only sandbox) does not change. Antigravity's Auto over ACP is expected in `agy` ≥ 1.5.4 (the spike confirms it); where Auto is not offered, engine-auto raises `ConfigError` ("update agy or set a broker") in `run()` before `TurnStarted`, never allow-all; the capability flag is True and the check is at run time (`capabilities()` takes no context) | The owner works in auto mode by habit; the broker stays available for merge/deploy. Engine auto modes differ in strength (README table): Codex and `agy` auto-run anything inside their sandbox. |
+| Who decides, per mode | See the table "Decisions per mode" below | — |
 | Sandbox **(owner, M3)** | On in both modes. In broker mode, a command that must leave the sandbox reaches the broker as a request; the spike confirms such requests reach the client | Contains what an approved script does; the risky steps (push, merge, deploy) show up as explicit escape requests. |
 | Answering a request | Broker allow → `allow_once`. Broker deny → `reject_once`; the turn continues. Broker error or timeout → deny | One decision per call. |
-| No `allow_once` offered **(owner)** | Broker allow → the narrowest allow option that is scoped to this conversation; **never** an option that persists to settings or switches to Auto mode; emit a notice naming the grant (e.g. "agy granted 'commands starting with git' for this conversation"). Broker deny → `reject_once`. Neither a matching allow nor a reject offered → cancel (→ `TurnFailed`, M5). Log every request's full option list | Matches what the owner would click in `agy`; nothing reaches beyond the conversation. |
+| No `allow_once` offered **(owner)** | Broker allow → the narrowest allow option that is scoped to this conversation; **never** an option that persists to settings or switches to Auto mode; emit a notice naming the grant (e.g. "agy granted 'commands starting with git' for this conversation"). Broker deny → `reject_once`; if only a `reject_always` is offered, use it only if it is scoped to this conversation, else cancel. Neither a usable allow nor a usable reject → cancel (→ `TurnFailed`, M5). Log every request's full option list | Matches what the owner would click in `agy`; nothing reaches beyond the conversation. |
 | Mode changes **(owner, M7)** | Watch `current_mode_update` and config updates. Broker mode: a change away from `default` stops the turn with `TurnFailed("Antigravity changed the session mode from default to <m>; stopped to keep the broker in control")`. Engine-auto: logged only | The broker must not lose control silently. |
 | Adapter-started cancels **(owner, M5)** | The adapter records its own cancels and ends the turn with `TurnFailed` and the real reason: "Antigravity asked a question: '<title>' (questions are not supported yet)" for `interaction_*` requests, "no allow/reject option for <request>" otherwise. Settings ask the agent to ask as few questions as `agy` allows | A caller-less cancel was otherwise recorded as "turn ended without emitting a terminal event". |
 | Broker vocabulary **(owner, M8)** | Requests are mapped (PR 1 defines the shared kinds): `shell {command, cwd}`; `apply_patch {changes: [{path, kind}]}` with `agy`'s raw content under `native_args`; `fetch_url {url}`; `subagent {task}`; `read_outside_workspace {path}`; everything without a shared meaning (browser, `send_command_input`, web search, new tools) → `native {backend: "antigravity", tool, args, summary, unrecognised}`. A known kind whose critical field (command, path, url) cannot be read → **deny** with "unrecognised Antigravity request". Meridian's broker default for `native` and `unrecognised` is "ask me" | One rule ("no push to main") holds on every backend; an `agy` update can make Tradewind stricter, never silently looser. |
-| FR-4.4 terminate | A broker `terminate` → reject the call, then interrupt; `end_reason="broker_terminated"` (Codex's pattern) | Consistency. |
+| FR-4.4 terminate | On the `request_permission` path, a broker `terminate` → reject the call, then interrupt; `end_reason="broker_terminated"` (Codex's pattern). On the shim path, terminate is not deliverable (`tool_host.py:443-446`), exactly as on Codex; documented | Consistency. |
+
+### Decisions per mode
+
+Who decides each kind of request. "Broker" means the caller's broker;
+"engine" means the engine's own auto review.
+
+| Request | Broker mode | Engine-auto, broker set | Engine-auto, no broker |
+|---|---|---|---|
+| `agy` approval request (`session/request_permission`) for a built-in tool | Broker | Engine (Auto mode does not ask; if it still asks, the broker answers) | Engine (if it still asks: allow once) |
+| Sandbox escape request | Broker | Broker (`agy` asks the client) | Allow once (owner M9: caller accepts the risk) |
+| Shim tool (caller tools, caller MCP servers) | Broker, inside `ToolHost` | Broker, inside `ToolHost` | Allowed (default allow-all broker) |
+| `tradewind_submit_result` | Never asked | Never asked | Never asked |
+
+Claude and Codex in engine-auto: the engine decides its own tools; caller
+tools still go through Tradewind's broker path as today. PR 1 discovers the
+exact settings: Claude's permission mode for auto and whether `can_use_tool`
+still runs for anything; Codex's auto-reviewer configuration
+(`approvals_reviewer` and the sandbox mode).
 
 ### Tools
 
@@ -201,7 +243,7 @@ calls. The builder may revisit a call only by raising it.
 | Built-in tools | Enabled; decided per the permission mode | Meridian needs shell, git and file edits. |
 | Client capabilities | `fs.readTextFile=false`, `fs.writeTextFile=false`, `terminal=false` | The agent uses its own tools; Tradewind is not its file system or terminal. |
 | Caller tools and MCP servers | All through the one `ToolHost` stdio shim in `session/new`/`session/resume` `mcpServers` (`{name, command, args, env: [{name, value}]}`); `ToolHost` gets the broker on this backend, as on Codex | One tool path; `ToolHost.call()` is the gate for shim calls. |
-| Shim identification **(owner, C2)** | The shim gets a new random name every turn (`tradewind-<8 hex>`). A `session/request_permission` is auto-accepted only if its `toolCallId` was first announced in a `tool_call` with `_meta.is_mcp_tool_call == true` **and** the shim's server name; everything else goes to the broker. A caller tool whose name equals an `agy` built-in tool name → `ConfigError` (list from the spike). Title matching is never used for approval. If `agy` stops sending these fields, shim calls fall back to the broker (asked twice), never to auto-accept | The broker is asked exactly once per call and nothing is approved on a guess. |
+| Shim identification **(owner, C2)** | The shim gets a new random name every turn (`tradewind-<8 hex>`). A `session/request_permission` is auto-accepted only if its `toolCallId` was first announced in a `tool_call` with `_meta.is_mcp_tool_call == true` **and** the shim's server name; everything else goes to the broker. A caller tool whose name equals an `agy` built-in tool name → `ConfigError` (list recorded by the version check). Title matching is never used for approval. Accepted exception: if `agy` stops sending these fields, shim calls fall back to the broker and are asked twice, never auto-accepted | The broker is asked exactly once per call in the normal case, and nothing is approved on a guess. |
 | Shim denials | Emit `PermissionRequested` for a shim-path denial using Codex's `_denied_shim_permission_event` pattern | FR-4.1. |
 | Abandoned shim calls | When `agy` gives up on a shim call (its MCP timeout, or the peer disconnects), `ToolHost` cancels the pending call, including a pending broker question | An "ask" broker answered late must not run a merge that the model will retry. (Small `ToolHost` change, PR 1.) |
 
@@ -214,7 +256,7 @@ calls. The builder may revisit a call only by raising it.
 | System prompt | `_meta.antigravity.systemPrompt.append` on every `session/new` and `session/resume`, if advertised | `agy` keeps none of it between processes. `supports_system_prompt=True` ("appended"). |
 | Model and effort | Model via `session/set_config_option` `model`, validated against its values (unknown → `ConfigError`); then effort via the option with `category == "thought_level"`, validated after the model is set; an unknown level → `Unsupported` | T3 Code `AntigravityAcpSupport.ts:217-298`. |
 | Resume | `session/resume` with the stored native id; drop updates with `_meta.isReplay == true` | `session/load` replays tool calls. |
-| Stop reasons | `end_turn` → see Structured output; `cancelled` caused by the caller → interrupted (no terminal event); `cancelled` caused by the adapter → `TurnFailed` (M5); `max_tokens` → `TurnCompleted(end_reason="max_tokens")`; `refusal` (on Antigravity: quota exhausted) → `TurnFailed("Antigravity quota exhausted", reset time if given)`; `max_turn_requests` → `TurnFailed("agent turn limit reached")`; JSON-RPC error → `TurnFailed` with the message | `EndReason` is shared; no new member. |
+| Stop reasons | `end_turn` → see Structured output; `cancelled` caused by the caller → interrupted (no terminal event); `cancelled` caused by the adapter → `TurnFailed` (M5); `max_tokens` → `TurnCompleted(end_reason="max_tokens")`; `refusal` → `TurnFailed("Antigravity refused the turn (agy uses this for quota exhaustion)", plus a reset time if the text gives one)` — the message does not claim quota for certain, because a real model refusal uses the same value; `max_turn_requests` → `TurnFailed("agent turn limit reached")`; JSON-RPC error → `TurnFailed` with the message | `EndReason` is shared; no new member. |
 | Hidden API errors | The spike checks whether 1.5.x still returns API errors as text plus `end_turn`. Tradewind does not read `agy`'s private database. If they are still hidden, it is documented as a known limit | — |
 | Usage | Turn usage from the `session/prompt` result: input = `inputTokens + cachedReadTokens`, output = `outputTokens + thoughtTokens` | T3 Code `adapter.ts:303-317`. Quota windows out of scope. |
 | Tool-round cap | `supports_tool_round_cap=False` | Calls `agy` approves itself are invisible, so an exact cap is impossible. |
@@ -225,19 +267,40 @@ PR 1 (one ADR, REQUIREMENTS in the same PR): `permission_mode` /
 engine-auto on Claude, Codex and the port (with a capability flag); slash
 commands off on Claude and Codex (Codex: verify whether the app server
 expands them; test either way); the shared broker vocabulary including
-`native`; the result-tool seam — a backend declares it needs the result tool,
-`turn_runner` passes the effective `output_schema` to `ToolHost`, which
-serves `tradewind_submit_result`, skips the broker for it, refuses a caller
-tool with that name, and exposes the recorded result; abandoned-call
-cancellation in `ToolHost`; a fake backend that exercises the seam.
+`native`; the result-tool seam; abandoned-call cancellation in `ToolHost`; a
+fake backend that exercises the seam; `jsonschema` declared in
+`pyproject.toml`; a pre-turn hook on the port, `async def prepare_turn(self,
+ctx: TurnContext) -> None` (default no-op), which `turn_runner` awaits before
+it starts the FR-6.6 watchdog and before `TurnStarted`, so slow preparation
+(the Antigravity version check) does not use the turn's time.
+
+**Result-tool seam (defined in the ADR):**
+- A backend declares `uses_result_tool: ClassVar[bool] = False` (True on
+  Antigravity). It is a backend attribute, not a capability flag.
+- When it is True and the turn's effective `output_schema` is set,
+  `turn_runner` builds `ToolHost(..., result_schema=<schema>)`.
+- `ToolHost` then serves `tradewind_submit_result` (input schema = the
+  schema), never asks the broker for it, refuses a caller tool with that
+  name (`ConfigError`), validates each call with `jsonschema`, and counts
+  attempts. It exposes `ToolHost.result_slot` with `attempts: int`,
+  `last_valid: dict | None` and `clear() -> None`. A 4th call is answered
+  "No more attempts." and not recorded.
+- The adapter reads `result_slot` at the end of the turn, and calls
+  `clear()` when the turn ends early (Structured output step 8).
+- The name the model actually sees for the tool (`agy` may namespace MCP
+  tools by server name) is confirmed in the spike; the instruction block
+  and the reminder use that exact name.
 
 PR 2: `BackendName` gains `"antigravity"` and the backend registry entry;
 `NativeStoreConfig.antigravity_dir`; the `on_workspace_customizations`
 callback in `SessionOptions`; the verified-version record; `turn_runner`
 passes the broker to `ToolHost` for `antigravity` as for `codex`.
 
-REQUIREMENTS to update (in the PR that changes the behaviour): glossary
-("four backends"), FR-1.3 (the Antigravity reminder exchange), FR-3.1,
+REQUIREMENTS to update (in the PR that changes the behaviour): PR 1 — a new
+FR for `permission_mode` / engine-auto, a new FR for "a prompt is always a
+message" (slash commands off), the FR-4 broker vocabulary (`native`), the
+result-tool seam; PR 2 — glossary ("four backends"), FR-1.3 (the Antigravity
+reminder exchange), FR-3.1,
 FR-4.1, FR-6.3/6.4 (store isolation mandatory here; no transcript
 reconcile), FR-8.2, NFR-4 (latest `agy` plus the automatic check, not an
 exact pin).
@@ -251,8 +314,8 @@ When `ctx.output_schema` is set:
 2. The turn's prompt gets a trailing instruction block: "When you have
    finished, call `tradewind_submit_result` exactly once with your final
    answer." The mirror keeps only the caller's prompt.
-3. Each call is validated with `jsonschema` (pending owner approval of the
-   dependency; it is already in `uv.lock` through `mcp`). Valid → recorded;
+3. Each call is validated with `jsonschema` (owner-approved; declared in
+   `pyproject.toml` in PR 1). Valid → recorded;
    the tool answers "Result recorded." Invalid → the tool returns the
    validation errors. **The last valid result wins.**
 4. `tradewind_submit_result` tool calls are hidden from events and the
@@ -263,7 +326,8 @@ When `ctx.output_schema` is set:
    the reminder: "Call `tradewind_submit_result` now with your final
    answer."
 6. **Everything the agent does after the reminder stays visible** — text,
-   thinking and tool calls (owner, M6). The reminder itself is recorded as a
+   thinking and tool calls (owner, M6) — except `tradewind_submit_result`
+   calls, which stay hidden as in step 4. The reminder itself is recorded as a
    notice ("Tradewind reminded the agent to submit its result"), not as a
    user message. **`final_text` is the text of the main answer**, the one
    before the reminder. FR-1.3 states this Antigravity difference.
@@ -296,9 +360,11 @@ its CLI reminder fires.
 
 ## Turn algorithm
 
-1. Check the `agy` version against the verified record (run the check if
-   new). Check workspace customizations (C1). Check the permission mode
-   (broker, engine-auto, or no broker → engine-auto).
+1. Before the watchdog starts (a pre-turn step the runner calls, see the
+   Watchdog row): resolve the permission mode (broker, engine-auto, or no
+   broker → engine-auto); in broker mode, check the `agy` version against the
+   record (run the check if unrecorded, under its lock); check workspace
+   customizations (C1) and restore any crash journal.
 2. Spawn `agy acp` in its own process group (Settings isolation, Environment
    rows), `initialize`, `authenticate`, `session/new` or `session/resume`
    with this turn's shim and the system prompt append. Set `mode`
@@ -307,8 +373,9 @@ its CLI reminder fires.
 4. Map `session/update`s; hide `tradewind_submit_result`; watch the mode (M7).
 5. Answer `session/request_permission`s (Permissions and Tools tables).
 6. On the prompt result, apply the Stop reasons row and Structured output.
-7. Wait for idle (Turn end row), close the session, stop the process tree,
-   restore any set-aside workspace files.
+7. Wait for idle (Turn end row), then emit the terminal event, close the
+   session, terminate `agy` (descendants alive at a normal end are reported,
+   not killed), and restore any set-aside workspace files.
 
 ## Acceptance
 
@@ -329,7 +396,9 @@ its CLI reminder fires.
   `TRADEWIND_RUN_ANTIGRAVITY_INTEGRATION`, `integration` marker, 3-minute
   time box, cheapest model), run once by the operator: plain turn; structured
   output; a denied shell command never runs (marker file); a caller tool
-  through the shim; resume continues context; engine-auto turn.
+  through the shim; resume continues context; engine-auto turn (only where
+  the installed `agy` offers Auto over ACP; otherwise the test asserts the
+  `ConfigError`).
 - RUNBOOK: login, the profile dir, what the check covers and how to rerun it,
   engine-auto strength per engine, the ToS note. ARCHITECTURE §3.1, README
   capability matrix, CHANGELOG.
