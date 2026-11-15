@@ -268,14 +268,21 @@ async def test_unsignalled_work_after_engine_done_is_normal_end() -> None:
     assert fired.calls == []
     assert clock.now == 1900.0
     assert sup.open_items() == []
-    assert [item.id for item in sup.close_unsignalled_after_done()] == ["sub1"]
+    assert [item.id for item in sup.closed_after_done()] == ["sub1"]
+    assert await sup.settled() is True
 
 
 async def test_unsignalled_work_is_not_closed_before_engine_done() -> None:
-    sup = _supervisor(_Clock())
+    clock = _Clock()
+    fired = _Fired()
+    sup = _supervisor(clock)
     sup.started("sub1", "subagent", "agy subagent", has_end_signal=False)
 
-    assert sup.close_unsignalled_after_done() == []
+    await sup.run(fired)
+
+    # The engine never said done: quiet work is stuck work, a timeout.
+    assert fired.calls == [("work_silence", 1800.0, 1800.0)]
+    assert sup.closed_after_done() == []
     assert [item.id for item in sup.open_items()] == ["sub1"]
 
 
@@ -292,4 +299,67 @@ async def test_signalled_open_work_after_done_times_out_on_work_silence() -> Non
     # An item that can say "ended" never did: the whole turn times out.
     assert fired.calls == [("work_silence", 1800.0, 1800.0)]
     assert {item.id for item in sup.open_items()} == {"sub1", "t1"}
-    assert sup.close_unsignalled_after_done() == []
+    assert sup.closed_after_done() == []
+
+
+# --- settled(): what an adapter awaits before its terminal event (§3.3) ---
+
+
+async def test_settled_is_true_when_the_engine_is_done_and_no_work_is_open() -> None:
+    clock = _Clock()
+    fired = _Fired()
+    sup = _supervisor(clock)
+    sup.started("t1", "tool", "bash")
+    settled = asyncio.ensure_future(sup.settled())
+
+    def finish() -> None:
+        # The adapter kept reading the engine: the tool ends, then done.
+        assert not settled.done()
+        sup.ended("t1")
+        sup.engine_done()
+
+    clock.at(10.0, finish)
+
+    await sup.run(fired)
+
+    assert await settled is True
+    assert fired.calls == []
+
+
+async def test_settled_is_true_after_unsignalled_work_closes() -> None:
+    clock = _Clock()
+    sup = _supervisor(clock)
+    sup.started("sub1", "subagent", "agy subagent", has_end_signal=False)
+    sup.engine_done()
+    settled = asyncio.ensure_future(sup.settled())
+
+    await sup.run(_Fired())
+
+    assert await settled is True
+    assert [item.id for item in sup.closed_after_done()] == ["sub1"]
+
+
+async def test_settled_is_false_when_a_limit_fired() -> None:
+    clock = _Clock()
+    fired = _Fired()
+    sup = _supervisor(clock)
+    settled = asyncio.ensure_future(sup.settled())
+
+    await sup.run(fired)
+
+    assert fired.calls == [("model_silence", 300.0, 300.0)]
+    assert await settled is False
+
+
+async def test_settled_is_false_when_run_is_cancelled() -> None:
+    # The runner cancels the supervisor at the turn's end; an adapter
+    # still waiting must not hang.
+    sup = _supervisor(_Clock())
+    sup.approvals_changed(1)
+    run = asyncio.ensure_future(sup.run(_Fired()))
+    settled = asyncio.ensure_future(sup.settled())
+    await _settle()
+
+    run.cancel()
+
+    assert await settled is False

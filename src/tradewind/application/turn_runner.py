@@ -781,7 +781,10 @@ class TurnRunner:
                             message=timeout_notice(limit=limit, value=value, elapsed=elapsed)
                         )
                     )
-                    await backend.interrupt(session_id)
+                    # Shielded: the backend may answer with its terminal
+                    # while this call is in flight, and the runner then
+                    # cancels this task; the interrupt itself must finish.
+                    await asyncio.shield(backend.interrupt(session_id))
 
                 supervisor_task = asyncio.get_running_loop().create_task(supervisor.run(on_fire))
 
@@ -819,6 +822,16 @@ class TurnRunner:
                         elif isinstance(event, TurnFailed):
                             terminal_status = "failed"
                             error = event.error
+                        if isinstance(event, TurnCompleted | TurnFailed):
+                            # The turn is over: no limit may fire while the
+                            # terminal is consumed or the backend cleans up.
+                            # A notice from a limit that fired just before
+                            # still precedes the terminal.
+                            supervisor_task.cancel()
+                            with contextlib.suppress(asyncio.CancelledError):
+                                await supervisor_task
+                            for gate_event in await drain_gate_events():
+                                yield gate_event
                         self._tap(event, turn_id)
                         yield event
 

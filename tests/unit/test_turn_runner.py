@@ -22,6 +22,8 @@ error-path tests in test_client_sessions.py (task-9 fix round 1):
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import warnings
 from collections.abc import AsyncIterator, Sequence
 from contextlib import aclosing
@@ -39,6 +41,7 @@ from pydantic import ConfigDict, Field, SecretStr
 
 from tradewind.adapters.langchain_backend import LangchainBackend
 from tradewind.application import client as _client
+from tradewind.application import turn_runner as _turn_runner
 from tradewind.application.client import Tradewind
 from tradewind.application.config import (
     CompactionSettings,
@@ -2081,6 +2084,84 @@ async def test_invalid_limit_override_raises_config_error_without_opening_a_turn
             await session.run("hi", **{key: bad})
 
     assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == []
+
+
+class _GatedClock:
+    """Fake clock whose `sleep` returns only when the test opens the gate
+    (then the clock reads whatever the test set it to)."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.gate = asyncio.Event()
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:  # noqa: ARG002 -- woken by the test
+        await self.gate.wait()
+
+
+class _CleanupAfterTerminalBackend(_ScriptedBackend):
+    """A supervised backend that, after its terminal event is consumed,
+    lets the fake clock run past every limit before its stream ends (slow
+    post-terminal cleanup)."""
+
+    def __init__(
+        self, profile: Profile, native_config: NativeStoreConfig, clock: _GatedClock
+    ) -> None:
+        super().__init__(profile, native_config, [])
+        self._clock = clock
+        self.contexts: list[TurnContext] = []
+        self.interrupts = 0
+
+    def capabilities(self) -> Capabilities:
+        return super().capabilities().model_copy(update={"supports_work_supervisor": True})
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        self.contexts.append(ctx)
+        # Engine I/O: the supervisor task starts its wait meanwhile.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        yield TurnStarted(turn_id=ctx.turn_id)
+        yield _completed()
+        self._clock.now = 100_000.0
+        self._clock.gate.set()
+        # Enough loop turns for a still-running supervisor to wake and
+        # fire (it needs a few); no real time passes.
+        for _ in range(100):
+            await asyncio.sleep(0)
+
+    async def interrupt(self, session_id: str) -> None:  # noqa: ARG002 -- Backend interface
+        self.interrupts += 1
+
+
+async def test_no_limit_fires_after_the_terminal_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Once the backend's terminal is out, the turn is over: a limit must
+    # not set timeout_reason, interrupt a finished turn, or write a
+    # timeout notice after the terminal.
+    clock = _GatedClock()
+    monkeypatch.setattr(
+        _turn_runner,
+        "WorkSupervisor",
+        functools.partial(WorkSupervisor, clock=clock, sleep=clock.sleep),
+    )
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _CleanupAfterTerminalBackend(profile, NativeStoreConfig(), clock)
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    events = [event async for event in session.stream("hi")]
+
+    assert isinstance(events[-1], TurnCompleted)
+    assert events[-1].result.status == "completed"
+    assert not any(_is_timeout_notice(event) for event in events)
+    assert fake.contexts[0].timeout_reason is None
+    assert fake.interrupts == 0
+    stored = tw._store.history(_VALID_ID, include_children=False, include_raw=False)
+    assert [m for m in stored if m.kind == "event"] == []
 
 
 @pytest.mark.parametrize("supervised", [True, False])

@@ -10,7 +10,6 @@ starts `run()` as a task and wires the policy gate's approval count to
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import time
 from collections.abc import Awaitable, Callable
 from typing import cast
@@ -67,6 +66,8 @@ class WorkSupervisor:
         self._last_model_at = float("-inf")
         self._last_work_at = float("-inf")
         self._changed = asyncio.Event()
+        self._settled = asyncio.Event()
+        self._normal_end = False
 
     def _active_now(self) -> float:
         now = self._clock()
@@ -129,13 +130,26 @@ class WorkSupervisor:
         """The work items still open, in the order they started."""
         return list(self._open.values())
 
-    def close_unsignalled_after_done(self) -> list[WorkItem]:
-        """Close the open work that has no end signal, as a normal end,
-        once the engine is done and no item with an end signal is open.
+    def closed_after_done(self) -> list[WorkItem]:
+        """The work without an end signal that `run()` closed as a normal
+        end after the engine was done (§3.3), for the process report;
+        `[]` when none was."""
+        return list(self._closed_after_done)
 
-        Returns every item closed this way (for the process report);
-        returns `[]` while the conditions do not hold. Idempotent.
-        """
+    async def settled(self) -> bool:
+        """Wait until `run()` ends; True for a normal end (the engine is
+        done and no work is open, unsignalled work closed after done
+        included), False when a limit fired or `run()` was cancelled.
+
+        Adapters await this before they emit their terminal event, and
+        keep reading the engine's stream meanwhile (§3.3)."""
+        await self._settled.wait()
+        return self._normal_end
+
+    def _close_unsignalled_after_done(self) -> bool:
+        """Close the open work that has no end signal, as a normal end,
+        when the engine is done and no item with an end signal is open.
+        Returns whether it closed anything."""
         if (
             self._engine_done
             and self._open
@@ -143,7 +157,8 @@ class WorkSupervisor:
         ):
             self._closed_after_done.extend(self._open.values())
             self._open.clear()
-        return list(self._closed_after_done)
+            return True
+        return False
 
     def _state(self) -> SupervisorState:
         started_at = self._started_at if self._started_at is not None else self._active_now()
@@ -164,11 +179,11 @@ class WorkSupervisor:
         try:
             await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
         finally:
+            # Cancelled, not awaited: awaiting them here and suppressing
+            # their CancelledError would also swallow a cancellation of
+            # this task (the runner's stop at the turn's end).
             for waiter in waiters:
                 waiter.cancel()
-            for waiter in waiters:
-                with contextlib.suppress(asyncio.CancelledError):
-                    await waiter
 
     async def run(self, on_fire: OnFire) -> None:
         """Supervise until the turn ends normally or a limit fires.
@@ -178,12 +193,20 @@ class WorkSupervisor:
         `on_fire(limit, value, elapsed)` once: `limit` is the limit's
         name, `value` its setting and `elapsed` the active seconds since
         `run()` started. The caller cancels the task when the turn's
-        stream ends first.
+        stream ends first. `settled()` wakes when this returns, whichever
+        way.
         """
+        try:
+            await self._supervise(on_fire)
+        finally:
+            self._settled.set()
+
+    async def _supervise(self, on_fire: OnFire) -> None:
         self._started_at = self._active_now()
         while True:
             self._changed.clear()
             if self._engine_done and not self._open:
+                self._normal_end = True
                 return
             now = self._active_now()
             deadline, name = next_deadline(now, self._state(), self.limits)
@@ -193,7 +216,8 @@ class WorkSupervisor:
             if deadline > now:
                 await self._wait(deadline - now)
                 continue
-            if name == "work_silence" and self.close_unsignalled_after_done():
+            if name == "work_silence" and self._close_unsignalled_after_done():
+                self._normal_end = True
                 return
             if name == "hard_cap":
                 value = cast(float, self.limits.hard_cap_s)
