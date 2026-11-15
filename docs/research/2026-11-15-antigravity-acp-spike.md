@@ -208,3 +208,83 @@ goes through broker-checked MCP tools in the shim.
   hold the M10 idle wait open.
 
 Turns used: 12 of 20.
+
+## Task 6 — sessions, interrupt, parallel turns (turns 13–15, 18–19)
+
+- **Resume across processes (turns 13–14):** process A (`session/new`,
+  system-prompt append "End every reply with the word ZEBRA.", "remember
+  ORCHID") and a new process B (`session/resume`, **no** append) — B
+  answered "The secret word was ORCHID. ZEBRA". No update carried
+  `_meta.isReplay`; nothing was replayed. The append still applied in B
+  (or the model copied its earlier reply); Tradewind keeps sending it every
+  turn, as designed.
+- **Interrupt (turn 15):** `sleep 60 && touch marker-late` in the
+  foreground; `session/cancel` after 12 s → `session/prompt` returned
+  `cancelled` **1.2 s** later, the tool call `failed`; after 60 s no
+  `marker-late` and no `sleep` process remained. The sandboxed command was
+  **not** in `agy`'s process group (`pgrep -g` listed only `agy`), so a
+  process-group kill alone would miss such commands; the design's
+  process-tree walk is required.
+- **Parallel turns (turns 18–19):** two processes on the same
+  `--gemini-dir` at once both completed (`end_turn`), no lock or token
+  errors.
+- `sessionCapabilities.close` is advertised (Task 2).
+
+## Workspace customizations, C1 (no-prompt runs + turn 16)
+
+- A planted skill in `.agents/skills/<name>/SKILL.md` is loaded (shows in
+  `available_commands_update`) from the **cwd, the repo root and the
+  folders between**; **not** from a folder above the repo root; a skill in
+  the cwd's `.gemini/skills` was not loaded.
+- A repo-root `.agents/hooks.json` (format from
+  antigravity.google/docs/hooks) with `SessionStart` and `PreInvocation`
+  command hooks: nothing ran at `session/new`, and **both hooks ran at the
+  first prompt** (turn 16), with the cwd two folders below the root, with
+  **no trust question and no approval request**. The C1 rule (detect;
+  stop / delete / proceed) is necessary, and its scan area is right.
+
+## Task 7 — Auto mode (turn 17)
+
+agy 1.5.9 offers `auto` over ACP. With `mode=auto` and
+`toolPermission: "request-review"`: `touch` in the workspace and a
+sandboxed `curl` ran **without** a request (the sandbox still blocked the
+network: exit 7, no canary hit); the escape (`BypassSandbox: true`) was
+**sent to the client** as `session/request_permission` (`allow_once`,
+`reject_once`), not decided by Auto's own review. (`strict` overrides Auto
+per the docs, so engine-auto needs `request-review`.)
+
+## Not covered (budget kept for the owner)
+
+- Whether API errors still arrive as text plus `end_turn` (no error was
+  provoked).
+- `agy`'s MCP call timeout.
+- A signal for background **subagent** work (turns 11–12 showed none over
+  ACP: `invoke_subagent` completes at once and nothing follows).
+- The list of `agy` helper processes (none appeared in `agy`'s process
+  group during turns 15).
+
+## Verdict
+
+**GO, with the owner rulings already made and three items for the owner.**
+
+Risky paths found and their status:
+
+| Path | Status |
+|---|---|
+| Input into a running command (`manage_task send_input`) runs with no request | Closed by ruling **d1**: broker mode denies every escape, so all input stays in the offline sandbox |
+| Workspace hooks run with no request (turn 16) | Closed by ruling **C1** (detect → stop / delete / proceed) |
+| `invoke_subagent` starts with no request | Not a bypass: subagent tool calls stall without running (turn 12) |
+| `schedule` runs with no request | Schedules a later prompt; that prompt's tools ask as usual |
+| `search_web` runs with no request | Server-side search; the query goes to Google — **owner to accept** |
+
+Design corrections from the evidence (not owner rulings): shim calls are
+identified by the exact `mcp_<per-turn shim name>_` tool-name prefix
+(there is no `_meta.is_mcp_tool_call`); Tradewind waits for the shim to
+connect before `session/prompt`; engine-auto uses `request-review`
+(not `strict`); in engine-auto, escapes still reach the client.
+
+For the owner: (1) accept `search_web` without approval, or forbid it in
+the system prompt (not enforceable); (2) subagent work has no idle signal
+over ACP — decide how the M10 "wait until all work ends" rule treats it;
+(3) the untested items above can be checked with the remaining budget or
+in PR 2's live tests.
