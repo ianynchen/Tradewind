@@ -1923,3 +1923,152 @@ async def test_interrupt_while_settling_ends_without_a_terminal(
     await stopping
 
     assert not any(isinstance(e, TurnCompleted | TurnFailed) for e in events)
+
+
+# --- review fixes: settle edge cases and PermissionRequested on stop ---
+
+
+class _SettledAtOnceWork:
+    """A `ctx.work` with one open background item whose `settled()` answers
+    True at once -- in the same loop step as the first late message."""
+
+    def __init__(self) -> None:
+        from tradewind.domain.supervision import WorkItem
+
+        self.signals: list[str] = []
+        self._open = [WorkItem("bg1", "background", "build", True)]
+
+    def open_items(self) -> list[Any]:
+        return list(self._open)
+
+    async def settled(self) -> bool:
+        return True
+
+    def __getattr__(self, name: str) -> Any:
+        def signal(*_: object) -> None:
+            self.signals.append(name)
+
+        return signal
+
+
+async def test_message_read_in_the_settling_step_is_still_mirrored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If `settled()` and the next engine message finish in the same step,
+    the message is still reported and mirrored before the terminal."""
+    from claude_agent_sdk import AssistantMessage, TextBlock
+
+    class _ImmediateClient:
+        def __init__(self, _options: object) -> None:
+            pass
+
+        async def connect(self, _prompt: str) -> None:
+            pass
+
+        async def receive_response(self) -> Any:
+            yield _success_result(result="started")
+
+        async def receive_messages(self) -> Any:
+            yield AssistantMessage(content=[TextBlock(text="late text")], model="m", uuid="late")
+            await anyio.sleep_forever()
+
+        async def disconnect(self) -> None:
+            pass
+
+    monkeypatch.setattr(claude_backend_module, "ClaudeSDKClient", _ImmediateClient)
+    ctx = _make_ctx(output_schema=None)
+    work = _SettledAtOnceWork()
+    ctx.work = cast(Any, work)
+
+    events = await _collect_bounded(ClaudeBackend(_profile(), NativeStoreConfig()).run(ctx))
+
+    texts = [e.message.content.get("text") for e in events if isinstance(e, ItemCompleted)]
+    assert texts == ["late text"]
+    assert isinstance(events[-1], TurnCompleted)
+
+
+async def test_policy_stop_reports_the_stopped_call_as_a_denial() -> None:
+    """FR-4.1, as on Codex's shim path: a stopped call is reported as a
+    deny `PermissionRequested` naming the reason."""
+    from claude_agent_sdk import PermissionResultDeny, ToolPermissionContext
+
+    from tradewind.adapters.claude_backend import _make_can_use_tool
+
+    pending: list[object] = []
+    stop_reason: list[str | None] = [None]
+    policy = _policy(_NoBroker(), caller=[_caller_rule("drop_db", "stop", "dangerous")])
+    can_use_tool = _make_can_use_tool(policy, cast(Any, pending), [False], stop_reason)
+
+    result = await can_use_tool(
+        "mcp__tradewind__drop_db", {"t": "x"}, ToolPermissionContext(tool_use_id="t1")
+    )
+
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is True
+    assert stop_reason == ["dangerous"]
+    [event] = pending
+    assert isinstance(event, PermissionRequested)
+    assert (event.tool_name, event.verdict, event.reason) == ("drop_db", "deny", "dangerous")
+
+
+def _open_tool_then(result: ResultMessage, *, background: bool = False) -> list[object]:
+    from claude_agent_sdk import AssistantMessage, TaskStartedMessage, ToolUseBlock
+
+    script: list[object] = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="mcp__tradewind__x", input={})],
+            model="m",
+            uuid="a1",
+        )
+    ]
+    if background:
+        script.append(
+            TaskStartedMessage(
+                subtype="task_started",
+                data={},
+                task_id="bg1",
+                description="build",
+                uuid="u1",
+                session_id="s",
+            )
+        )
+    return [*script, result]
+
+
+@pytest.mark.parametrize("background", [False, True])
+async def test_error_result_fails_at_once_whatever_is_open(
+    monkeypatch: pytest.MonkeyPatch, background: bool
+) -> None:
+    """A failed engine result is never held for open work: the error text
+    reaches the caller at once instead of a work-silence timeout."""
+    from tradewind.application.supervisor import WorkSupervisor
+    from tradewind.domain.supervision import Limits
+
+    failed = _success_result(subtype="error_during_execution", is_error=True, errors=["boom"])
+    _install_fake_sdk_client(monkeypatch, _open_tool_then(failed, background=background))
+    ctx = _make_ctx(output_schema=None)
+    ctx.broker = cast(Any, _AllowBroker())
+    ctx.work = WorkSupervisor(Limits(300.0, 1800.0, None))  # never run: settle would hang
+
+    events = await _collect_bounded(ClaudeBackend(_profile(), NativeStoreConfig()).run(ctx))
+
+    assert isinstance(events[-1], TurnFailed)
+    assert events[-1].error == "boom"
+
+
+async def test_open_plain_tool_item_does_not_hold_the_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only background or subagent work holds a finished turn (05 §3.3); a
+    tool item the engine left open does not."""
+    from tradewind.application.supervisor import WorkSupervisor
+    from tradewind.domain.supervision import Limits
+
+    _install_fake_sdk_client(monkeypatch, _open_tool_then(_success_result()))
+    ctx = _make_ctx(output_schema=None)
+    ctx.broker = cast(Any, _AllowBroker())
+    ctx.work = WorkSupervisor(Limits(300.0, 1800.0, None))  # never run: settle would hang
+
+    events = await _collect_bounded(ClaudeBackend(_profile(), NativeStoreConfig()).run(ctx))
+
+    assert isinstance(events[-1], TurnCompleted)

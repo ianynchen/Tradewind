@@ -173,6 +173,11 @@ caller-facing summary.
   session, so it shares the caller's process group (a group walk would list the caller's
   own processes). The adapter does not report descendants (05 §3.4) until the SDK exposes
   the PID.
+- **Late engine output after settle reaches the mirror only through reconcile.** The model's
+  reply to an injected task-notification turn that arrives after the turn has settled, and
+  later `ResultMessage`s read while settling, are not mirrored live; they reach the mirror
+  through reconcile at the next turn (the native session id is unchanged within one client
+  connection).
 
 ### Env gates for integration/live runs
 

@@ -780,6 +780,12 @@ def _make_can_use_tool(
             # `_drive_client` maps the aborted result.
             reason = decision.reason or f"turn stopped by policy at {bare_name!r}"
             stop_reason[0] = reason
+            # FR-4.1: reported as a denial, as Codex's shim path does.
+            pending_events.append(
+                PermissionRequested(
+                    tool_name=bare_name, tool_input=input_dict, verdict="deny", reason=reason
+                )
+            )
             return PermissionResultDeny(message=reason, interrupt=True)
         if decision.outcome == "deny":
             pending_events.append(
@@ -1214,40 +1220,38 @@ class ClaudeBackend(Backend):
                     # error, but that cap only exists because the caller
                     # set `ctx.max_tool_rounds` -- it completes honestly
                     # with `end_reason="max_tool_rounds"` instead (FR-6.5).
-                    terminal: Event = TurnFailed(turn_id=ctx.turn_id, error=_result_error(message))
-                else:
-                    result = turn_result_from_result_message(message, ctx.turn_id)
-                    backstop_on_schema_turn = (
-                        ctx.output_schema is not None
-                        and is_max_turns_result(message)
-                        and not (round_cap is not None and round_cap.hit)
-                    )
-                    if backstop_on_schema_turn:
-                        # FR-1.3 over FR-6.5: on a schema turn the exact caller
-                        # cap is `_CallerRoundCap` (a cap stop arrives as an
-                        # aborted result, handled above). A `max_turns` result
-                        # here is the BACKSTOP firing because invalid
-                        # StructuredOutput attempts or the CLI's reminder used
-                        # up CLI turns -- a schema turn without a valid result,
-                        # which completes as `end_turn`, text kept, not a false
-                        # `max_tool_rounds`. After OUR cap denial (`hit`) the cap
-                        # did end the turn, so `max_tool_rounds` stands.
-                        result.end_reason = "end_turn"
-                    if result.final_text is None and (
-                        is_structured_output_exhausted_result(message) or backstop_on_schema_turn
-                    ):
-                        result.final_text = last_text
-                    if ctx.output_schema is not None and isinstance(
-                        message.structured_output, dict
-                    ):
-                        # FR-1.3, additive: `final_text` stays the model's prose
-                        # (`ResultMessage.result`); the result is ADDED beside
-                        # it. No valid result leaves it None -- still a
-                        # completion, text kept (module docstring).
-                        result.structured_output = cast(
-                            "dict[str, object]", message.structured_output
-                        )
-                    terminal = TurnCompleted(result=result)
+                    # Never held for open work: the error reaches the
+                    # caller now, not after a work-silence timeout.
+                    yield TurnFailed(turn_id=ctx.turn_id, error=_result_error(message))
+                    return
+                result = turn_result_from_result_message(message, ctx.turn_id)
+                backstop_on_schema_turn = (
+                    ctx.output_schema is not None
+                    and is_max_turns_result(message)
+                    and not (round_cap is not None and round_cap.hit)
+                )
+                if backstop_on_schema_turn:
+                    # FR-1.3 over FR-6.5: on a schema turn the exact caller
+                    # cap is `_CallerRoundCap` (a cap stop arrives as an
+                    # aborted result, handled above). A `max_turns` result
+                    # here is the BACKSTOP firing because invalid
+                    # StructuredOutput attempts or the CLI's reminder used
+                    # up CLI turns -- a schema turn without a valid result,
+                    # which completes as `end_turn`, text kept, not a false
+                    # `max_tool_rounds`. After OUR cap denial (`hit`) the cap
+                    # did end the turn, so `max_tool_rounds` stands.
+                    result.end_reason = "end_turn"
+                if result.final_text is None and (
+                    is_structured_output_exhausted_result(message) or backstop_on_schema_turn
+                ):
+                    result.final_text = last_text
+                if ctx.output_schema is not None and isinstance(message.structured_output, dict):
+                    # FR-1.3, additive: `final_text` stays the model's prose
+                    # (`ResultMessage.result`); the result is ADDED beside
+                    # it. No valid result leaves it None -- still a
+                    # completion, text kept (module docstring).
+                    result.structured_output = cast("dict[str, object]", message.structured_output)
+                terminal = TurnCompleted(result=result)
                 # 05 §3.3: the turn ends when the engine is done AND no work
                 # is open; meanwhile the engine is still read.
                 settled = [True]
@@ -1272,8 +1276,9 @@ class ClaudeBackend(Backend):
     ) -> AsyncIterator[Event]:
         """Wait, before the terminal event, until no work is open (05 §3.3).
 
-        A no-op when no work is open at the engine's result (every plain
-        turn) or `ctx.work` is unset. Otherwise reads on through
+        A no-op unless background or subagent work is open at the engine's
+        result (so for every plain turn), or when `ctx.work` is unset; never
+        run for an error result, which fails at once. Otherwise reads on through
         `receive_messages()` -- `receive_response()` stops at the result,
         but a background task's end arrives after it -- reporting work
         signals and mirroring what arrives, until `ctx.work.settled()`
@@ -1288,7 +1293,12 @@ class ClaudeBackend(Backend):
         pitfall class the runner's supervisor task also avoids).
         """
         work = ctx.work
-        if work is None or not work.open_items():
+        if work is None or not any(
+            item.kind in ("background", "subagent") for item in work.open_items()
+        ):
+            # Only background or subagent work outlives the engine's result;
+            # a tool item it left open (no tool result) must not hold a
+            # finished turn for the work-silence limit.
             return
         messages = client.receive_messages()
         waits: dict[str, asyncio.Future[Any]] = {
@@ -1300,25 +1310,34 @@ class ClaudeBackend(Backend):
         try:
             while True:
                 await asyncio.wait(waits.values(), return_when=asyncio.FIRST_COMPLETED)
+                # A message that finished in the same step as `settled()` or
+                # a stop is still reported and mirrored first.
+                read_next = False
+                message_wait = waits.get("message")
+                if message_wait is not None and message_wait.done():
+                    del waits["message"]
+                    try:
+                        message = message_wait.result()
+                    except StopAsyncIteration:
+                        # The engine's stream ended; only the supervisor (or
+                        # a stop) can end the wait now.
+                        message = None
+                    if message is not None:
+                        read_next = True
+                        for event in pending_events:
+                            yield event
+                        pending_events.clear()
+                        report_work(work, message)
+                        for event in _settle_phase_events(message, hidden_ids):
+                            yield event
                 if "stop" in waits and waits["stop"].done():
                     settled[0] = False
                     return
                 if waits["settled"].done():
                     settled[0] = cast(bool, waits["settled"].result())
                     return
-                try:
-                    message = waits.pop("message").result()
-                except StopAsyncIteration:
-                    # The engine's stream ended; only the supervisor (or a
-                    # stop) can end the wait now.
-                    continue
-                for event in pending_events:
-                    yield event
-                pending_events.clear()
-                report_work(work, message)
-                for event in _settle_phase_events(message, hidden_ids):
-                    yield event
-                waits["message"] = asyncio.ensure_future(anext(messages))
+                if read_next:
+                    waits["message"] = asyncio.ensure_future(anext(messages))
         finally:
             # Cancelled, not awaited (as in `WorkSupervisor._wait`): awaiting
             # them and suppressing their CancelledError would also swallow a
