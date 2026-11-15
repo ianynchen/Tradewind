@@ -27,7 +27,7 @@ import pytest
 from langchain_anthropic import ChatAnthropic
 from langchain_core.language_models import BaseChatModel
 
-from tests.conformance.live_support import completed_result
+from tests.conformance.live_support import collect_events, completed_result
 from tradewind.adapters.langchain_backend import _STRUCTURED_OUTPUT_TOOL, LangchainBackend
 from tradewind.application.client import Tradewind
 from tradewind.application.config import NativeStoreConfig, TradewindConfig
@@ -104,7 +104,7 @@ async def test_structured_output_live() -> None:
         ),
     )
 
-    events = [e async for e in session.stream('Return {"ok": true}.', max_tool_rounds=2)]
+    events = await collect_events(session.stream('Return {"ok": true}.', max_tool_rounds=2))
 
     result = completed_result(events)
     assert result.end_reason == "end_turn"
@@ -142,13 +142,12 @@ async def test_structured_output_after_a_tool_round_live() -> None:
         ),
     )
 
-    events = [
-        e
-        async for e in session.stream(
+    events = await collect_events(
+        session.stream(
             "Call the get_answer tool once, then tell me the answer it gave.",
             max_tool_rounds=1,
         )
-    ]
+    )
 
     assert len(calls) == 1
     result = completed_result(events)
