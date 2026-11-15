@@ -72,11 +72,46 @@ def test_kill_tree_term_then_kill_and_ignores_gone(monkeypatch):
             raise ProcessLookupError
 
     monkeypatch.setattr(pr.os, "kill", fake_kill)
-    kill_tree([_p(7), _p(8)], grace_s=0.0, sleep=lambda _s: None)
+    procs = [_p(7), _p(8)]
+    kill_tree(procs, grace_s=0.0, sleep=lambda _s: None, list_fn=lambda: procs)
     assert (7, signal.SIGTERM) in sent
     assert (8, signal.SIGTERM) in sent
-    # 7 never died in the fake, so it is killed after the grace.
     assert (7, signal.SIGKILL) in sent
+
+
+def test_kill_tree_does_not_signal_reused_pid(monkeypatch):
+    sent = []
+    monkeypatch.setattr(pr.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    rec = [_p(7, start="a"), _p(8, start="a")]
+    listings = iter([rec, [_p(7, start="a"), _p(8, start="NEW")]])
+    kill_tree(rec, grace_s=0.0, sleep=lambda _s: None, list_fn=lambda: next(listings))
+    assert (8, signal.SIGTERM) in sent
+    assert (8, signal.SIGKILL) not in sent
+    assert (7, signal.SIGKILL) in sent
+
+
+def test_kill_tree_returns_early_when_nothing_alive(monkeypatch):
+    sent = []
+    slept = []
+    monkeypatch.setattr(pr.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    kill_tree([_p(7, start="a")], sleep=slept.append, list_fn=lambda: [_p(7, start="b")])
+    assert sent == [] and slept == []
+
+
+def test_kill_tree_survives_permission_error(monkeypatch, caplog):
+    sent = []
+
+    def fake_kill(pid, sig):
+        sent.append((pid, sig))
+        if pid == 7:
+            raise PermissionError
+
+    monkeypatch.setattr(pr.os, "kill", fake_kill)
+    procs = [_p(7), _p(8)]
+    with caplog.at_level(logging.WARNING):
+        kill_tree(procs, grace_s=0.0, sleep=lambda _s: None, list_fn=lambda: procs)
+    assert (8, signal.SIGTERM) in sent and (8, signal.SIGKILL) in sent
+    assert any("7" in r.getMessage() for r in caplog.records)
 
 
 def test_kill_tree_real_child():

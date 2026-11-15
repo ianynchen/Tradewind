@@ -7,7 +7,6 @@ and its start time, so a reused PID is never taken for the recorded one.
 
 from __future__ import annotations
 
-import contextlib
 import logging
 import os
 import signal
@@ -90,18 +89,33 @@ def kill_tree(
     *,
     grace_s: float = 3.0,
     sleep: Callable[[float], None] = time.sleep,
+    list_fn: Callable[[], list[ProcInfo]] = list_processes,
 ) -> None:
-    """SIGTERM every process, then SIGKILL after `grace_s`. A process that
-    is already gone is ignored."""
-    _signal_all(procs, signal.SIGTERM)
+    """SIGTERM every process, then SIGKILL after `grace_s`. Before each
+    phase the processes are listed again and only those whose PID and
+    start time still match are signalled, so a reused PID is never hit.
+    When none is left, the wait and the SIGKILL are skipped."""
+    live = _matching(procs, list_fn)
+    if not live:
+        return
+    _signal_all(live, signal.SIGTERM)
     sleep(grace_s)
-    _signal_all(procs, signal.SIGKILL)
+    _signal_all(_matching(live, list_fn), signal.SIGKILL)
+
+
+def _matching(procs: Sequence[ProcInfo], list_fn: Callable[[], list[ProcInfo]]) -> list[ProcInfo]:
+    running = {(p.pid, p.start) for p in list_fn()}
+    return [p for p in procs if (p.pid, p.start) in running]
 
 
 def _signal_all(procs: Sequence[ProcInfo], sig: signal.Signals) -> None:
     for p in procs:
-        with contextlib.suppress(ProcessLookupError):
+        try:
             os.kill(p.pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            _logger.warning("cannot send %s to pid %d: permission denied", sig.name, p.pid)
 
 
 def _name(command: str) -> str:
