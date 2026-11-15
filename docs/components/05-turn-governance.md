@@ -120,8 +120,8 @@ Every rule may set `record: true`, which emits one notice
 Rule(id, kind, where: {field: matcher}, outcome, record=False,
      modes={"broker", "engine_auto"}, reason)
 matcher: equals | prefix | regex | glob (paths) | is_true | is_false | ne
-turn variables usable in matchers: $turn.mode, $turn.shim_server,
-     $turn.workspace, $turn.result_tool
+turn variables usable in matchers: $turn.mode, $turn.engine_mode,
+     $turn.shim_server, $turn.workspace, $turn.result_tool
 ```
 
 ### 2.3 Evaluation order
@@ -146,7 +146,7 @@ are not rules and cannot be overridden.
    (`stop > deny > ask > allow`). So a caller can tighten anything and can
    loosen only defaults, never a floor rule.
 
-`record` is the OR of every matching rule's flag. Only rules whose `modes`
+`record` is the OR of the `record` flags of every matching floor rule and of the rule that gave `C` (rules after the first match do not count). Only rules whose `modes`
 contain the turn's mode match. Turn variables include `$turn.mode`
 (`broker`/`engine_auto`) and `$turn.engine_mode` (the engine's own mode
 name, e.g. `default`/`auto`).
@@ -284,9 +284,11 @@ Check(id) -> Ok | Ask(question, details, choices, default_choice) | Stop(reason)
   error class.
 - A backend registers the turn as in flight from the start of
   `prepare_turn`, so `interrupt()` reaches a turn that is waiting in it.
-- A stop request before or after `prepare_turn` records the turn as
-  interrupted without calling `run()` — the only case of a terminal record
-  without `TurnStarted` (FR-2 and the port docstring change).
+- A stop request before or after `prepare_turn`, or a stop, limit or
+  error while `run()` is still before `TurnStarted`, ends the turn with a
+  terminal record and no `TurnStarted` (the runner's existing synthesized
+  terminal, `turn_runner.py:720-745`). These are the only such cases
+  (FR-2 and the port docstring change).
 - Work that `run()` does before `TurnStarted` (e.g. applying a preflight
   answer, spawning the engine) may still raise `ConfigError`; after
   `TurnStarted`, failures end the turn with `TurnFailed`.
@@ -316,6 +318,17 @@ refuses a caller tool of that name, and exposes `result_slot` (`attempts`,
 | **Claude** (`tools=[]`, built-ins off) | `can_use_tool` → `caller_tool`; `$turn.result_tool` = `StructuredOutput` | none (no built-in tools; work-silence on Claude is time since the last tool start or end, because it streams no tool output) | `include_partial_messages` `StreamEvent`s → `model_active` (never mapped to events or the mirror; a test proves plain-turn events are unchanged); tool-use/tool-result blocks → `started`/`ended`; `TaskStartedMessage` → `started(background)`, `TaskProgressMessage` → `active`, `TaskNotificationMessage` / `TaskUpdatedMessage.patch.status` terminal → `ended`; messages with `parent_tool_use_id` → `active` of that task |
 | **Codex** | `commandExecution/requestApproval` → `shell`; `fileChange/requestApproval` → `file_write`; MCP elicitations for the shim → structural pass-through, then `caller_tool` inside `ToolHost`; other MCP elicitations → `mcp` (an unreadable tool name → `missing_critical_field`, keeping today's fail-closed rule) | `item/completed` of a command or file change that had **no** approval request → `shell`/`file_write` (record and after-the-fact stop only; `item/started` comes before a possible request, so it is never observed) | `item/started`/`item/completed`; `commandExecution/outputDelta`, `mcpToolCall/progress`, `autoApprovalReview/*`, `terminalInteraction` → `active`; message and reasoning deltas → `model_active` |
 | **LangChain** | its own loop → `caller_tool` | none | model stream chunks → `model_active`; tool execution → `started`/`ended`; in-turn compaction call → `model_active` |
+
+## Notes for REQUIREMENTS and RUNBOOK
+
+- On Codex, observe sees only completed commands that had no request; a
+  broad caller rule such as `shell → ask` therefore stops a turn after any
+  sandboxed command Codex ran without asking (e.g. `ls`). Write narrow
+  rules.
+- Engine-auto strength per engine: on Claude (built-ins off) engine_auto
+  changes only the mode default for caller tools; on Codex and
+  Antigravity the engine's auto review decides its own tools inside its
+  sandbox.
 
 ## Port and interface changes (one ADR)
 

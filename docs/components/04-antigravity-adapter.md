@@ -88,9 +88,10 @@ its own.
 | `request_permission`, `kind: execute`, `rawInput.CommandLine` | `shell {command, cwd, sandboxed = not BypassSandbox, interactive = IsDaemon}` | gate |
 | `kind: read`, `rawInput.Path` | `file_read {path, in_workspace}` | gate |
 | `kind: edit`, `rawInput.Path` (+`Content` or `Target`/`Replacement`) | `file_write {changes: [{path, change, in_workspace}]}` | gate |
-| tool name `mcp_<shim>_<tool>` for this turn's shim | `caller_tool {name, args, source}`: only if the name starts with this turn's exact `mcp_tradewind-<8 hex>_` prefix **and** the rest is exactly a tool in the shim's own list (the shim is the only MCP server the engine has: workspace MCP config is a preflight stop, and the profile has none) | gate |
+| tool name `mcp_<shim>_<tool>` for this turn's shim | identified only if the name starts with this turn's exact `mcp_tradewind-<8 hex>_` prefix **and** the rest is exactly a tool in the shim's own list (the shim is the only MCP server the engine has: workspace MCP config is a preflight stop, and the profile has none) | structural pass-through at the ACP request (`05` §2.3); gated once, as `caller_tool`, inside `ToolHost` |
 | any other `mcp_…` name | `native {unknown_tool: true}` (cannot be split reliably) | gate |
 | `tool_call` for a tool that never asks: `search_web` (`kind: search`) | `web_search {query}` | observe |
+| (none in the spike) a page read by `agy` itself | `fetch_url {url}` if a future version adds such a tool; until then unknown tools are `native` | gate |
 | `tool_call` `invoke_subagent` | `subagent {type: TypeName, task: Prompt}` | observe |
 | `tool_call` `manage_task` `send_input` | `input_to_running {target: TaskId, text: Input}` | observe |
 | `tool_call` `schedule` | `native` (schedules a later prompt in the session) | observe |
@@ -113,8 +114,7 @@ test.
 |---|---|---|---|
 | ag.no-escape | `shell` with `sandboxed=false` → **deny**, record | broker | d1: the shell is offline; `input_to_running` then stays in the sandbox |
 | ag.no-browser | `subagent` with `type=browser` → **stop**, record | both | spike item 1 |
-| ag.mode | `mode_change` with `to ne default` (`$turn.engine_mode`) → **stop**, record | broker | M7 (also watched: config updates that change the mode option) |
-| ag.mode-auto | `mode_change` → allow, record | engine_auto | M7 |
+| ag.mode | `mode_change` with `to ne $turn.engine_mode` → **stop**, record | broker | M7 (also watched: config updates that change the mode option) |
 | ag.question | `question` → **stop** ("Antigravity asked: '<title>' — questions are not supported yet") | both | M5 |
 
 **Default rules** (a caller may override):
@@ -122,7 +122,7 @@ test.
 | id | rule | modes | Owner ruling |
 |---|---|---|---|
 | ag.search | `web_search` → allow, **record** ("Antigravity searched: '<query>'") | both | spike item 2 |
-| tw.shim | `caller_tool` on `$turn.shim_server` → allow at the engine layer (the broker is asked once, inside `ToolHost`, as on Codex) | both | C2 |
+| ag.mode-auto | `mode_change` → allow, record | engine_auto | M7 |
 
 `agy` built-in tools reach the broker under the shared names (`shell`, `apply_patch` for `file_write`, …; `05` §1.1).
 
@@ -153,9 +153,14 @@ running `agy` use a probe process in an empty temp folder, so no workspace
 hook, skill or MCP config can load before the C1 answer (cost: one extra
 `agy` start, about 1.5 s, once per turn).
 
-1. **Workspace customizations (owner C1)** — see check 4 below; scanned
-   first, answered before any `agy` runs in the workspace.
-2. **Login and Auto (probe in a temp folder):** auth errors as above; in
+1. **Workspace customizations (owner C1)** — the scan and question in
+   item 4's text below; it runs first and is answered before any `agy`
+   runs in the workspace.
+2. **Login and Auto (probe in a temp folder):** the probe runs `agy acp`
+   with Tradewind's gemini-dir in an empty temp cwd, does `initialize`,
+   `authenticate`, `session/new` (to read the `mode` options) and
+   `session/close`, then exits; the probe conversation stays in Tradewind's
+   gemini-dir and is never resumed. auth errors as above; in
    engine_auto (including the no-broker case), if the `mode` options lack
    `auto` → `Stop` ("update agy or set a broker"); never allow-all (owner,
    M9 safety).
@@ -185,7 +190,7 @@ hook, skill or MCP config can load before the C1 answer (cost: one extra
    - each run refreshes the built-in tool-name list (shipped fallback list
      from the spike for engine-auto on an unchecked version) and confirms
      the subagent transcript path.
-4. **Workspace customizations (owner C1):** scan the cwd, the repo root and
+4. **Workspace customizations (owner C1) — details of item 1:** scan the cwd, the repo root and
    the folders between for `.agents/` hooks, plugins, skills and MCP
    config, and `.gemini/` and `.agent/` content (empty skill folders
    ignored; nothing above the repo root — spike). Found → `Ask` with the
@@ -216,8 +221,11 @@ and a skill's actions are ordinary actions.
 2. `run()`, before `TurnStarted`: apply a `delete` answer; spawn `agy` in
    the workspace in its own process group; `initialize`, `authenticate`,
    `session/new` or `session/resume` with this turn's shim and the system
-   prompt append; set mode, model, effort; wait for the shim to connect.
-   Errors here raise `ConfigError`.
+   prompt append; set mode, model, effort; wait for the shim to connect
+   (limit 30 s → `ConfigError`). Errors here raise `ConfigError`. After a
+   `delete`, the file list and the backup path are logged at WARNING at
+   once, and included in any later `ConfigError` message or interrupted
+   record, so they are never lost.
 3. Emit `TurnStarted`, then any preflight notice; send `session/prompt`
    (with the schema block if set).
 4. Map updates to actions and work signals; answer requests through the
