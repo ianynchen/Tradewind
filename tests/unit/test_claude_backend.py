@@ -1481,3 +1481,36 @@ async def test_messages_without_ids_are_one_response_for_final_text(
 
     completed = [e for e in events if isinstance(e, TurnCompleted)]
     assert completed[0].result.final_text == "hello"
+
+
+async def test_block_without_ids_after_an_identified_response_keeps_its_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mixed ids: response `msg-a` says "x"; then a block with neither
+    `message_id` nor `uuid` holds a caller tool. The id-less block cannot be
+    placed in a new response, so it does not reset the text -- `final_text`
+    stays "x"."""
+    from claude_agent_sdk import AssistantMessage, TextBlock, ToolUseBlock
+
+    _install_fake_sdk_client(
+        monkeypatch,
+        [
+            AssistantMessage(content=[TextBlock(text="x")], model="m", message_id="msg-a"),
+            AssistantMessage(
+                content=[ToolUseBlock(id="t1", name="mcp__tradewind__x", input={})], model="m"
+            ),
+            _success_result(
+                subtype="error_max_structured_output_retries",
+                is_error=True,
+                result=None,
+                terminal_reason="structured_output_retry_exhausted",
+                errors=["no valid output"],
+            ),
+        ],
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = await _collect_bounded(backend.run(_make_ctx(output_schema=_SCHEMA)))
+
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.final_text == "x"
