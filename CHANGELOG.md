@@ -23,7 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     mirror (live and on reconcile), is auto-allowed without consulting the
     broker, and does not use up a caller tool round; `max_tool_rounds`
     still holds exactly for caller tools (the adapter stops the first call
-    past the cap and ends the turn as `max_tool_rounds`).
+    past the cap and ends the turn as `max_tool_rounds`). A single model
+    response that holds both a StructuredOutput call and a caller call past
+    the cap therefore ends as `max_tool_rounds` with
+    `structured_output=None`.
   - `langchain` makes ONE extra model call after the tool loop ends
     (`end_turn`), with `tool_choice` forced to a single schema tool. The
     call emits no content (its retry/compaction notices still appear) and

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import Any, cast
 
+import anyio
 import pytest
 from claude_agent_sdk import CLIConnectionError, ResultMessage
 
@@ -777,11 +778,15 @@ def _install_cli_like_client(
     responses: list[list[tuple[str, str]]],
     *,
     ask_before_streaming: bool = False,
+    split_blocks: bool = False,
 ) -> list[object]:
     """`responses`: one list of `(tool_use_id, tool_name)` per model
     response. A response with no tools ends the turn. Records every
     permission result. `ask_before_streaming` sends a response's permission
-    request BEFORE its message reaches the stream consumer."""
+    request BEFORE its message reaches the stream consumer. `split_blocks`
+    streams a response the way the real CLI does: one `AssistantMessage`
+    per content block, all sharing the response's `message_id`, each with
+    its own `uuid`."""
     import asyncio
 
     from claude_agent_sdk import (
@@ -809,7 +814,31 @@ def _install_cli_like_client(
                     content=[ToolUseBlock(id=i, name=n, input={}) for i, n in tools],
                     model="claude-sonnet-4-5",
                     message_id=f"msg-{index}",
+                    uuid=f"uuid-{index}",
                 )
+                if split_blocks and tools:
+                    for block_index, (i, n) in enumerate(tools):
+                        yield AssistantMessage(
+                            content=[ToolUseBlock(id=i, name=n, input={})],
+                            model="claude-sonnet-4-5",
+                            message_id=f"msg-{index}",
+                            uuid=f"uuid-{index}-{block_index}",
+                        )
+                    results = [
+                        await can_use_tool(n, {}, ToolPermissionContext(tool_use_id=i))
+                        for i, n in tools
+                    ]
+                    decisions.extend(results)
+                    if any(isinstance(r, PermissionResultDeny) and r.interrupt for r in results):
+                        yield _success_result(terminal_reason="aborted_tools", result=None)
+                        return
+                    yield UserMessage(
+                        content=[
+                            ToolResultBlock(tool_use_id=i, content="ok", is_error=None)
+                            for i, _ in tools
+                        ]
+                    )
+                    continue
 
                 async def ask(tools: list[tuple[str, str]] = tools) -> list[object]:
                     return [
@@ -907,17 +936,21 @@ async def test_schema_turn_with_cap_one_runs_exactly_one_caller_round(
 async def test_structured_output_call_is_not_a_caller_round(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Cap 0, and the model calls StructuredOutput directly: that is not a
-    caller round, so the turn completes with its result."""
-    decisions = _install_cli_like_client(monkeypatch, [[("so", "StructuredOutput")], []])
+    """Cap 1: the model calls StructuredOutput first, then one caller tool.
+    Only the caller call is a round, so it is still inside the cap."""
+    from claude_agent_sdk import PermissionResultAllow
+
+    decisions = _install_cli_like_client(
+        monkeypatch, [[("so", "StructuredOutput")], [("t1", "mcp__tradewind__x")], []]
+    )
     backend = ClaudeBackend(_profile(), NativeStoreConfig())
 
-    events = [event async for event in backend.run(_capped_schema_ctx(0))]
+    events = [event async for event in backend.run(_capped_schema_ctx(1))]
 
+    assert [type(d) for d in decisions] == [PermissionResultAllow, PermissionResultAllow]
     completed = [e for e in events if isinstance(e, TurnCompleted)]
     assert completed[0].result.end_reason == "end_turn"
     assert completed[0].result.structured_output == {"answer": 1}
-    assert len(decisions) == 1
 
 
 async def test_cap_holds_when_the_permission_request_overtakes_the_stream(
@@ -1030,3 +1063,144 @@ async def test_structured_output_reminder_in_the_live_stream_is_not_surfaced(
     events = [event async for event in backend.run(_make_ctx(output_schema=_SCHEMA))]
 
     assert not any(isinstance(e, ItemCompleted) for e in events)
+
+
+async def test_parallel_calls_of_one_response_are_one_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI streams one response as several AssistantMessages (one per
+    block) sharing `message_id`, each with its own `uuid`: the round is the
+    response, so cap 1 allows both parallel calls."""
+    from claude_agent_sdk import PermissionResultAllow
+
+    decisions = _install_cli_like_client(
+        monkeypatch,
+        [[("t1", "mcp__tradewind__x"), ("t2", "mcp__tradewind__y")], []],
+        split_blocks=True,
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_capped_schema_ctx(1))]
+
+    assert [type(d) for d in decisions] == [PermissionResultAllow, PermissionResultAllow]
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.end_reason == "end_turn"
+
+
+async def test_broker_still_decides_calls_inside_the_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The cap only refuses calls PAST it; a call inside it still goes to
+    the caller's broker, whose denial is a broker denial (event + reason,
+    no interrupt), not a cap stop."""
+    from claude_agent_sdk import PermissionResultDeny
+
+    from tradewind.domain.models import Denial
+
+    class _DenyBroker:
+        async def decide(self, _tool_name: str, _tool_input: dict[str, object]) -> object:
+            return Denial(reason="not this one")
+
+    decisions = _install_cli_like_client(monkeypatch, [[("t1", "mcp__tradewind__x")], []])
+    ctx = _capped_schema_ctx(1)
+    ctx.broker = cast(Any, _DenyBroker())
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(ctx)]
+
+    assert len(decisions) == 1
+    denial = decisions[0]
+    assert isinstance(denial, PermissionResultDeny)
+    assert denial.message == "not this one"
+    assert denial.interrupt is False
+    permission = [e for e in events if isinstance(e, PermissionRequested)]
+    assert len(permission) == 1
+    assert permission[0].verdict == "deny"
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.end_reason == "end_turn"
+
+
+async def test_slow_consumer_never_turns_a_waiting_call_into_a_cap_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`session.stream()`'s consumer paces `_drive_client`: while it is slow,
+    a permission request can wait a long time for its message. The wait
+    must last as long as the turn does -- no deadline may decide "over the
+    cap" for a call inside it. (A lookup deadline under its old name is
+    shrunk to 10 ms here, so reintroducing one fails this test fast.)"""
+    import asyncio
+
+    from claude_agent_sdk import (
+        AssistantMessage,
+        PermissionResultAllow,
+        TextBlock,
+        ToolPermissionContext,
+        ToolUseBlock,
+    )
+
+    monkeypatch.setattr(claude_backend_module, "_ROUND_LOOKUP_TIMEOUT_S", 0.01, raising=False)
+    decisions: list[object] = []
+
+    class _SlowConsumerClient:
+        def __init__(self, options: Any) -> None:
+            self._options = options
+
+        async def connect(self, _prompt: str) -> None:
+            pass
+
+        async def receive_response(self) -> Any:
+            ask = asyncio.ensure_future(
+                self._options.can_use_tool(
+                    "mcp__tradewind__x", {}, ToolPermissionContext(tool_use_id="t1")
+                )
+            )
+            await asyncio.sleep(0)  # the request is in flight before any message
+            yield AssistantMessage(content=[TextBlock(text="thinking aloud")], model="m")
+            yield AssistantMessage(
+                content=[ToolUseBlock(id="t1", name="mcp__tradewind__x", input={})],
+                model="m",
+                message_id="msg-0",
+            )
+            decisions.append(await ask)
+            yield _success_result(structured_output={"answer": 1})
+
+        async def disconnect(self) -> None:
+            pass
+
+    monkeypatch.setattr(claude_backend_module, "ClaudeSDKClient", _SlowConsumerClient)
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events: list[object] = []
+    async for event in backend.run(_capped_schema_ctx(1)):
+        events.append(event)
+        if isinstance(event, ItemCompleted):
+            await anyio.sleep(0.1)  # a slow consumer: far past any lookup deadline
+
+    assert [type(d) for d in decisions] == [PermissionResultAllow]
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.end_reason == "end_turn"
+
+
+async def test_call_without_a_tool_use_id_goes_to_the_broker_uncounted() -> None:
+    """The wire protocol always sends a `tool_use_id`; if one were ever
+    missing, the call cannot be placed in a round. It is not treated as a
+    cap stop: the broker decides it, as on a plain turn."""
+    from claude_agent_sdk import PermissionResultAllow, ToolPermissionContext
+
+    from tradewind.adapters.claude_backend import _CallerRoundCap, _make_can_use_tool
+
+    asked: list[str] = []
+
+    class _RecordingBroker:
+        async def decide(self, tool_name: str, _tool_input: dict[str, object]) -> Verdict:
+            asked.append(tool_name)
+            return "allow"
+
+    round_cap = _CallerRoundCap(0)
+    can_use_tool = _make_can_use_tool(cast(Any, _RecordingBroker()), [], [False], round_cap)
+
+    result = await can_use_tool("mcp__tradewind__x", {}, ToolPermissionContext(tool_use_id=None))
+
+    assert isinstance(result, PermissionResultAllow)
+    assert asked == ["x"]
+    assert round_cap.hit is False

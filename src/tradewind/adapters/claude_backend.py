@@ -552,13 +552,6 @@ def _make_precompact_hook(pending_events: list[Event]) -> HookCallback:
     return on_pre_compact
 
 
-# How long a permission request may wait for the stream to show the model
-# response that holds its call (`_CallerRoundCap.is_over_cap`). The SDK queues
-# that message before it even reads the request, so this is a deadlock guard
-# only; past it the call is treated as over the cap (fail closed).
-_ROUND_LOOKUP_TIMEOUT_S = 30.0
-
-
 class _CallerRoundCap:
     """Exact caller-tool-round cap for a schema turn (FR-6.5 with FR-1.3).
 
@@ -570,6 +563,11 @@ class _CallerRoundCap:
     block, all sharing it) holding at least one caller tool call. The
     permission bridge asks `is_over_cap` per call. Per-turn state, touched
     only from this turn's event loop.
+
+    A single response holding BOTH a StructuredOutput call and a caller call
+    past the cap ends the turn as `max_tool_rounds` with
+    `structured_output=None`: the caller call is refused with an interrupt,
+    which aborts the whole response, StructuredOutput included.
     """
 
     def __init__(self, cap: int) -> None:
@@ -600,15 +598,29 @@ class _CallerRoundCap:
 
     async def is_over_cap(self, tool_use_id: str | None) -> bool:
         """Whether the call `tool_use_id` belongs to a round past the cap.
-        Waits for the stream to show it: the SDK may start this permission
-        handler before `_drive_client` has read the message holding it."""
+
+        Waits for the stream to show the call: the SDK may start this
+        permission handler before `_drive_client` has read the message
+        holding it (it queues that message first, but a slow
+        `session.stream()` consumer paces `_drive_client`). There is
+        deliberately NO deadline: one would turn a slow consumer into a
+        false `max_tool_rounds` stop. The wait is bounded by the turn
+        itself -- the SDK cancels the handler on `close()` or a
+        `control_cancel_request`, and the turn's watchdog/disconnect ends
+        everything.
+
+        A missing `tool_use_id` (the wire protocol always sends one) cannot
+        be placed in a round: it is logged and NOT counted -- the broker
+        decides the call, as on an uncapped turn -- rather than treated as
+        a cap stop."""
         if tool_use_id is None:
-            return True  # the wire protocol always sends one; fail closed
-        with anyio.move_on_after(_ROUND_LOOKUP_TIMEOUT_S):
-            while tool_use_id not in self._round_of_call:
-                await self._changed.wait()
-        round_number = self._round_of_call.get(tool_use_id)
-        return round_number is None or round_number > self.cap
+            _logger.warning(
+                "permission request without tool_use_id; not counted against max_tool_rounds"
+            )
+            return False
+        while tool_use_id not in self._round_of_call:
+            await self._changed.wait()
+        return self._round_of_call[tool_use_id] > self.cap
 
 
 def _make_can_use_tool(
