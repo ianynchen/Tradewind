@@ -127,6 +127,51 @@ def test_finalize_turn_persists_status_usage_cost_final_text(tmp_path: Path) -> 
     assert completed_at is not None
 
 
+def test_finalize_turn_persists_structured_output_as_json(tmp_path: Path) -> None:
+    """FR-1.3: a schema turn's structured result is durable beside its prose
+    `final_text`, not folded into it."""
+    store = _store_with_session(tmp_path)
+    store.begin_turn("sess-1", "turn-1", None)
+
+    store.finalize_turn(
+        "turn-1",
+        status="completed",
+        final_text="Here is the answer.",
+        usage={},
+        cost_usd=None,
+        error=None,
+        structured_output={"answer": 42},
+    )
+
+    conn = sqlite3.connect(str(tmp_path / "sessions.db"))
+    try:
+        row = conn.execute(
+            "SELECT final_text, structured_output_json FROM turns WHERE turn_id = ?", ("turn-1",)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == ("Here is the answer.", '{"answer": 42}')
+
+
+def test_finalize_turn_without_structured_output_stores_null(tmp_path: Path) -> None:
+    # The default: a plain turn's row is exactly what it was before the column existed.
+    store = _store_with_session(tmp_path)
+    store.begin_turn("sess-1", "turn-1", None)
+
+    store.finalize_turn(
+        "turn-1", status="completed", final_text="x", usage={}, cost_usd=None, error=None
+    )
+
+    conn = sqlite3.connect(str(tmp_path / "sessions.db"))
+    try:
+        row = conn.execute(
+            "SELECT structured_output_json FROM turns WHERE turn_id = ?", ("turn-1",)
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == (None,)
+
+
 def test_finalize_turn_unknown_turn_id_raises_value_error(tmp_path: Path) -> None:
     store = _store_with_session(tmp_path)
     with pytest.raises(ValueError):

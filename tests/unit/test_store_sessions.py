@@ -63,6 +63,7 @@ def test_migrate_on_fresh_file_records_every_migration_as_applied(tmp_path: Path
     assert _applied_migration_ids(db_path) == [
         "0001_tradewind_schema",
         "0002_tradewind_meta",
+        "0003_tradewind_turn_structured_output",
     ]
 
 
@@ -74,6 +75,7 @@ def test_migrate_is_idempotent(tmp_path: Path) -> None:
     assert _applied_migration_ids(db_path) == [
         "0001_tradewind_schema",
         "0002_tradewind_meta",
+        "0003_tradewind_turn_structured_output",
     ]
 
 
@@ -98,11 +100,44 @@ def test_migrate_upgrades_a_store_left_at_an_older_migration(tmp_path: Path) -> 
     assert _applied_migration_ids(db_path) == [
         "0001_tradewind_schema",
         "0002_tradewind_meta",
+        "0003_tradewind_turn_structured_output",
     ]
     fresh = SqliteSessionStore(tmp_path / "fresh.db")
     fresh.migrate()
     upgraded = SqliteSessionStore(db_path)
     assert _domain_schema(upgraded._conn) == _domain_schema(fresh._conn)
+
+
+def test_store_at_0002_upgrades_to_structured_output_keeping_its_turns(tmp_path: Path) -> None:
+    """Migration 0003 (FR-1.3) on a store written before it: every existing
+    turn row survives untouched and reads NULL in the new column."""
+    from yoyo import get_backend, read_migrations
+
+    from tradewind.adapters.sqlite_store import _MIGRATION_TABLE, _MIGRATIONS_DIR
+
+    db_path = tmp_path / "sessions.db"
+    backend = get_backend(f"sqlite:///{db_path}", migration_table=_MIGRATION_TABLE)
+    migrations = read_migrations(str(_MIGRATIONS_DIR))
+    with backend.lock():
+        backend.apply_migrations(backend.to_apply(migrations)[:2])
+    old = SqliteSessionStore(db_path)
+    old.create_session(_row())
+    old.begin_turn("sess-1", "turn-1", None)
+    old._conn.execute("UPDATE turns SET final_text = 'kept' WHERE turn_id = 'turn-1'")
+    old._conn.commit()
+    old._conn.close()
+
+    SqliteSessionStore(db_path).migrate()
+
+    assert _applied_migration_ids(db_path)[-1] == "0003_tradewind_turn_structured_output"
+    conn = sqlite3.connect(str(db_path))
+    try:
+        row = conn.execute(
+            "SELECT final_text, structured_output_json FROM turns WHERE turn_id = 'turn-1'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert row == ("kept", None)
 
 
 def test_in_memory_store_schema_matches_a_migrated_file_store(tmp_path: Path) -> None:
@@ -280,6 +315,7 @@ def test_older_store_migrates_forward_to_meta_without_touching_data(tmp_path: Pa
     assert _applied_migration_ids(db_path) == [
         "0001_tradewind_schema",
         "0002_tradewind_meta",
+        "0003_tradewind_turn_structured_output",
     ]
     assert reopened.get_session("sess-1") is not None
 

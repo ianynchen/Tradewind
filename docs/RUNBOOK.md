@@ -21,7 +21,7 @@ permanent self-skip.
 | `interrupt_midturn` | PASS | PASS (flaky — see below) | PASS | BLOCKED: no cursor subscription |
 | `resume_continues_context` | PASS | PASS | PASS | BLOCKED: no cursor subscription |
 | `history_flat_and_tree` | PASS | PASS | PASS | BLOCKED: no cursor subscription |
-| `structured_output` | SKIP (`supports_structured_output=False`) | SKIP (`supports_structured_output=False`) | PASS | BLOCKED: no cursor subscription |
+| `structured_output` | PASS (fake model, forced schema-tool call) | NOT YET RUN LIVE (scenario rewritten for `TurnResult.structured_output`; spend-capped at $0.05) | PASS before the rewrite; NOT YET RE-RUN for `structured_output` | BLOCKED: no cursor subscription |
 | `system_prompt_respected` | PASS | PASS | PASS | BLOCKED: no cursor subscription |
 
 Commands:
@@ -30,6 +30,7 @@ Commands:
 bash scripts/check.sh                                                        # hermetic; includes langchain conformance
 TRADEWIND_RUN_CLAUDE_INTEGRATION=1 uv run pytest tests/conformance/test_claude.py -v -m integration
 TRADEWIND_RUN_CODEX_INTEGRATION=1  uv run pytest tests/conformance/test_codex.py  -v -m integration
+TRADEWIND_RUN_LANGCHAIN_INTEGRATION=1 uv run pytest tests/conformance/test_langchain_live.py -v -m integration  # ANTHROPIC_API_KEY from the operator's environment
 uv run pytest tests/conformance/test_cursor.py -v      # always self-skips; no env gate exists
 ```
 
@@ -158,6 +159,7 @@ caller-facing summary.
 |---|---|---|
 | `TRADEWIND_RUN_CLAUDE_INTEGRATION=1` | `tests/conformance/test_claude.py`, `tests/integration/test_claude_live.py` | Requires a real Claude Code subscription login on the machine; real, billed-by-subscription API calls (~40s for the full matrix). |
 | `TRADEWIND_RUN_CODEX_INTEGRATION=1` | `tests/conformance/test_codex.py` | Requires a real ChatGPT/Codex subscription login; spawns real `codex app-server` subprocesses (~100s for the full matrix). |
+| `TRADEWIND_RUN_LANGCHAIN_INTEGRATION=1` | `tests/conformance/test_langchain_live.py` | Real Anthropic API calls for structured output (FR-1.3): proves the forced schema-tool call is accepted with caller tools bound. Needs `ANTHROPIC_API_KEY` in the operator's environment (read only from there, never from a file); `claude-haiku-4-5`, `max_tokens=256`, 5 model calls in total. |
 | `ANTHROPIC_API_KEY` | `tests/integration/test_langchain_live.py::test_...anthropic` | Real Anthropic API key; ACTIVE — key in git-ignored `.env`, run via `scripts/live-tests.sh`; passed 2026-09-02. |
 | `GROQ_API_KEY` | `tests/integration/test_langchain_live.py::test_...groq` | Free-tier Groq key (`console.groq.com`, `ChatGroq`, `openai/gpt-oss-120b`); ACTIVE — key in git-ignored `.env`, run via `scripts/live-tests.sh`; passed 2026-09-02. |
 | (none — Cursor) | `tests/conformance/test_cursor.py` | No env gate exists; the module skips unconditionally until a Cursor subscription is available and the skip is removed by hand. |
@@ -348,6 +350,14 @@ library) — they are read only by the test files that need real credentials to 
   only ever sets `max_turns` from the caller's own `max_tool_rounds`, that "error" is the
   caller's requested cap working — `_drive_client` must reclassify it as an honest
   `max_tool_rounds` completion BEFORE the generic `is_error` → `TurnFailed` branch.
+- **The bundled claude CLI runs a response's tools BEFORE its `max_turns` check**, so
+  `max_turns` cannot be an exact tool-round cap (`max_tool_rounds=0` still ran the first
+  response's tools). Tradewind enforces `max_tool_rounds` itself through the permission
+  callback (`_CallerRoundCap`: count caller rounds per model response, refuse the first
+  call past the cap with an interrupt) and keeps `max_turns` only as a backstop. On a
+  schema turn that backstop can fire first — invalid StructuredOutput attempts and the
+  CLI's reminder use CLI turns — so a `max_turns` result there is NOT a cap stop: it
+  completes as a schema turn without a valid result (`end_turn`, no structured output).
 - **RESOLVED (PR #2): the 50ms wall-clock perf test is rewritten as deterministic
   invariants.** Root cause of the flake (three occurrences: twice under local load, once on
   a shared CI runner at 163ms): an absolute stopwatch budget only ~3x above the ~17ms median

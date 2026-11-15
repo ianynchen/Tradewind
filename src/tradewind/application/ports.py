@@ -160,9 +160,12 @@ class SessionStorePort(ABC):
         usage: dict[str, object] | None,
         cost_usd: float | None,
         error: str | None,
+        structured_output: dict[str, object] | None = None,
     ) -> None:
         """Close `turn_id`, persisting its terminal `status`, `final_text`,
-        `usage`, `cost_usd`, and `error`, and setting `completed_at` to now.
+        `usage`, `cost_usd`, `error`, and `structured_output` (FR-1.3: the
+        schema turn's result, None on any other turn), and setting
+        `completed_at` to now.
 
         Failure modes:
             ValueError: `turn_id` does not exist. (Not `SessionNotFound`:

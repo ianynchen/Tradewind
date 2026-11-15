@@ -71,6 +71,7 @@ from tradewind.domain.models import (
     SessionRow,
     SubscriptionAuth,
     TierName,
+    Tool,
     TurnResult,
 )
 
@@ -307,12 +308,62 @@ async def test_history_flat_and_tree(harness: ClaudeHarness) -> None:
     await matrix.history_flat_and_tree(cast(Any, harness))
 
 
-async def test_structured_output(harness: ClaudeHarness) -> None:
-    # Expected to skip: `ClaudeBackend.capabilities().supports_structured_
-    # output` is False (module docstring) -- exercises the skip machinery,
-    # not structured output, same as `test_langchain.py`'s own copy of this
-    # test (task-9 brief).
+async def test_structured_output(harness: ClaudeHarness, monkeypatch: pytest.MonkeyPatch) -> None:
+    # Kept cheap (live, billed): the scenario's tiny prompt and tool-round
+    # cap, plus a hard spend cap on this one test via the SDK's own
+    # `max_budget_usd` -- set here, not in the adapter, which exposes no
+    # budget option.
+    real_build_options = ClaudeBackend._build_options
+
+    def capped_build_options(self: ClaudeBackend, *args: Any, **kwargs: Any) -> Any:
+        options = real_build_options(self, *args, **kwargs)
+        options.max_budget_usd = 0.05
+        return options
+
+    monkeypatch.setattr(ClaudeBackend, "_build_options", capped_build_options)
     await matrix.structured_output(cast(Any, harness))
+
+
+async def test_plain_tool_round_cap_zero(
+    harness: ClaudeHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FR-6.5 live: `max_tool_rounds=0` on a plain turn means NO tool
+    executes, even though the model is told to call one. The CLI runs a
+    response's tools before its own `max_turns` check, so this pins the
+    adapter's exact round cap against the real engine. Cheap: one tiny
+    instruction, and a hard $0.05 spend cap via the SDK's `max_budget_usd`
+    (set here, not in the adapter, which exposes no budget option)."""
+    real_build_options = ClaudeBackend._build_options
+
+    def capped_build_options(self: ClaudeBackend, *args: Any, **kwargs: Any) -> Any:
+        options = real_build_options(self, *args, **kwargs)
+        options.max_budget_usd = 0.05
+        return options
+
+    monkeypatch.setattr(ClaudeBackend, "_build_options", capped_build_options)
+
+    executed: list[dict[str, object]] = []
+
+    async def probe(**kwargs: object) -> str:
+        executed.append(kwargs)
+        return "ok"
+
+    tool = Tool(
+        name="probe_tool",
+        description="Probe.",
+        input_schema={"type": "object", "properties": {"x": {"type": "string"}}, "required": ["x"]},
+        handler=probe,
+    )
+    harness.script_tool_calls_then_text(
+        [matrix.ScriptedToolCall(name="probe_tool", args={"x": "a"}, id="call_a")],
+        final_text="done",
+    )
+    session = await harness.tradewind.create(str(uuid.uuid4()), SessionOptions(tools=[tool]))
+
+    result = await session.run("go", max_tool_rounds=0)
+
+    assert executed == []
+    assert result.end_reason == "max_tool_rounds"
 
 
 async def test_system_prompt_respected(harness: ClaudeHarness) -> None:

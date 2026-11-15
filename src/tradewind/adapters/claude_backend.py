@@ -59,10 +59,28 @@ of scope for this adapter (it only ever reads `ctx.load_history()` through
 `resume=<native id>`'s own transcript, never manually reconstructing
 messages from `StoredMessage`s the way `LangchainBackend` does).
 
-Deferred, matching `LangchainBackend`'s own precedent: `ctx.output_schema`
-raises `Unsupported` (`capabilities().supports_structured_output` is
-False -- the SDK has no `output_schema`-shaped request parameter to wire it
-to). `ModelSpec.effort` is also not wired to `ClaudeAgentOptions.effort`:
+Structured output (FR-1.3): `ctx.output_schema` rides the SDK's native
+`ClaudeAgentOptions.output_format` (`{"type": "json_schema", "schema": ...}`,
+rendered by the SDK as the CLI's `--json-schema`). The CLI adds its own
+`StructuredOutput` tool, validates the model's call against the schema, and
+reports the result as `ResultMessage.structured_output`; this adapter ADDS
+it as `TurnResult.structured_output` (the field every structured-output
+backend sets), while `final_text` stays the model's prose
+(`ResultMessage.result`). Additive means the turn's events and mirror are
+exactly a plain turn's: the CLI's `StructuredOutput` `tool_use`/`tool_result`
+pair is engine plumbing, hidden from the live stream AND from
+`native_transcript_items` (so reconcile never backfills it); the tool is
+auto-allowed without consulting the broker; and it does not cost the caller
+a tool round -- `_build_options` gives the CLI's `max_turns` headroom for it,
+and `_CallerRoundCap` keeps `max_tool_rounds` exact for caller tools (on
+every capped turn, schema or not). A schema turn that ends without a valid
+result -- a clean finish with no `structured_output` (the
+CLI silently disables structured output when it rejects a schema at init),
+or the CLI's own `error_max_structured_output_retries` -- still COMPLETES,
+keeping its text, with `structured_output=None`; an honest partial
+(`max_tool_rounds`, `max_tokens`) keeps its `end_reason`.
+
+`ModelSpec.effort` is not wired to `ClaudeAgentOptions.effort`:
 the task-10 brief's options list does not name it, and GUIDELINES §1.1
 treats an unlisted option as out of scope rather than a silent addition;
 flagged in the task-10 report for controller follow-up alongside the two
@@ -108,7 +126,6 @@ from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import Backend, TurnContext
 from tradewind.application.tool_host import ToolHost
 from tradewind.domain.compaction import compose_replay_prompt
-from tradewind.domain.errors import Unsupported
 from tradewind.domain.events import (
     Event,
     ItemCompleted,
@@ -150,6 +167,30 @@ _ABORTED_TERMINAL_REASONS = frozenset({"aborted_streaming", "aborted_tools"})
 # `ctx.broker`/`ToolHost.call()` so both see the same bare tool names the
 # caller declared.
 _MCP_SERVER_NAME = "tradewind"
+
+# The CLI's own structured-output tool (added by `--json-schema`). Built-in
+# tools are disabled (`tools=[]`) and every caller tool arrives prefixed
+# `mcp__tradewind__`, so this bare name can only ever be that tool.
+_STRUCTURED_OUTPUT_TOOL = "StructuredOutput"
+
+
+def _without_structured_output(
+    items: list[NormalizedMessage], hidden_ids: set[str]
+) -> list[NormalizedMessage]:
+    """Drop the CLI's `StructuredOutput` `tool_use` items (recording their
+    ids in `hidden_ids`) and the `tool_result` items answering them: engine
+    plumbing for structured output, never a caller-visible tool event
+    (FR-1.3, module docstring). `hidden_ids` spans messages -- the result
+    arrives in a later message than the call."""
+    kept: list[NormalizedMessage] = []
+    for item in items:
+        if item.kind == "tool_use" and item.content.get("name") == _STRUCTURED_OUTPUT_TOOL:
+            hidden_ids.add(cast(str, item.content.get("id")))
+            continue
+        if item.kind == "tool_result" and item.content.get("tool_use_id") in hidden_ids:
+            continue
+        kept.append(item)
+    return kept
 
 
 def _strip_server_prefix(tool_name: str) -> str:
@@ -275,6 +316,17 @@ def is_max_turns_result(result: ResultMessage) -> bool:
     return result.terminal_reason == "max_turns" or result.subtype == "error_max_turns"
 
 
+def is_structured_output_exhausted_result(result: ResultMessage) -> bool:
+    """Whether `result` is the CLI's own "no attempt produced schema-valid
+    structured output" error result. The CLI flags it as an error, but the
+    turn simply ended without a valid result -- FR-1.3 completes it with
+    `structured_output=None`, keeping its text, rather than failing it."""
+    return (
+        result.subtype == "error_max_structured_output_retries"
+        or result.terminal_reason == "structured_output_retry_exhausted"
+    )
+
+
 def _end_reason(result: ResultMessage) -> EndReason:
     if is_max_turns_result(result):
         return "max_tool_rounds"
@@ -370,6 +422,17 @@ def native_transcript_items(
     found among `entries` is treated as "not present yet" and nothing is
     dropped.
     """
+    # StructuredOutput call ids from EVERY entry, before the cut: the cut can
+    # fall right after the call, leaving only its result to drop.
+    hidden_ids: set[str] = {
+        cast(str, block.get("id"))
+        for entry in entries
+        if isinstance(entry.message, dict) and isinstance(entry.message.get("content"), list)
+        for block in cast("list[Any]", entry.message["content"])
+        if isinstance(block, dict)
+        and block.get("type") == "tool_use"
+        and block.get("name") == _STRUCTURED_OUTPUT_TOOL
+    }
     if after_native_id is not None:
         index = next((i for i, e in enumerate(entries) if e.uuid == after_native_id), None)
         if index is not None:
@@ -395,7 +458,9 @@ def native_transcript_items(
         # independently testable.
         for item in entry_items:
             item.native_id = entry.uuid
-        items.extend(entry_items)
+        # The live stream hides the CLI's StructuredOutput pair, so the
+        # transcript read must too -- else reconcile would backfill it.
+        items.extend(_without_structured_output(entry_items, hidden_ids))
     return items
 
 
@@ -488,12 +553,104 @@ def _make_precompact_hook(pending_events: list[Event]) -> HookCallback:
     return on_pre_compact
 
 
+class _CallerRoundCap:
+    """Exact caller-tool-round cap for any capped turn (FR-6.5).
+
+    The CLI's own `max_turns` cannot do this: the bundled CLI runs response
+    k's tools BEFORE its `max_turns` check, so `max_turns = N + 1` still
+    let `max_tool_rounds=0` run the first response's tools; and a schema
+    turn needs extra `max_turns` headroom for the StructuredOutput call
+    (FR-1.3), which would admit one more caller round. So the adapter
+    enforces the cap itself and `max_turns` is only a backstop
+    (`_build_options`). `_drive_client` feeds this every `AssistantMessage`
+    (`observe`); a round is one model response (`message_id` -- the CLI
+    streams one `AssistantMessage` per content block, all sharing it)
+    holding at least one caller tool call; StructuredOutput calls never
+    count. The permission bridge asks `is_over_cap` per call and refuses
+    the first call past the cap with an interrupt. Per-turn state, touched
+    only from this turn's event loop.
+
+    A single response holding BOTH a StructuredOutput call and a caller call
+    past the cap ends the turn as `max_tool_rounds` with
+    `structured_output=None`: the caller call is refused with an interrupt,
+    which aborts the whole response, StructuredOutput included.
+    """
+
+    def __init__(self, cap: int) -> None:
+        self.cap = cap
+        # Set once a call was refused for the cap; `_drive_client` then maps
+        # the CLI's aborted result to an honest `max_tool_rounds` completion.
+        self.hit = False
+        self._round_of_response: dict[str, int] = {}
+        self._round_of_call: dict[str, int] = {}
+        self._changed = anyio.Event()
+
+    def observe(self, message: AssistantMessage) -> None:
+        caller_ids = [
+            block.id
+            for block in message.content
+            if isinstance(block, ToolUseBlock) and block.name != _STRUCTURED_OUTPUT_TOOL
+        ]
+        if not caller_ids:
+            return
+        response = message.message_id or message.uuid or caller_ids[0]
+        round_number = self._round_of_response.setdefault(
+            response, len(self._round_of_response) + 1
+        )
+        for call_id in caller_ids:
+            self._round_of_call[call_id] = round_number
+        self._changed.set()
+        self._changed = anyio.Event()
+
+    async def is_over_cap(self, tool_use_id: str | None) -> bool:
+        """Whether the call `tool_use_id` belongs to a round past the cap.
+
+        Waits for the stream to show the call: the SDK may start this
+        permission handler before `_drive_client` has read the message
+        holding it (it queues that message first, but a slow
+        `session.stream()` consumer paces `_drive_client`). There is
+        deliberately NO deadline: one would turn a slow consumer into a
+        false `max_tool_rounds` stop. The wait is bounded by the turn
+        itself -- the SDK cancels the handler on `close()` or a
+        `control_cancel_request`, and the turn's watchdog/disconnect ends
+        everything.
+
+        A missing `tool_use_id` (the wire protocol always sends one) cannot
+        be placed in a round: it is logged and NOT counted -- the broker
+        decides the call, as on an uncapped turn -- rather than treated as
+        a cap stop."""
+        if tool_use_id is None:
+            _logger.warning(
+                "permission request without tool_use_id; not counted against max_tool_rounds"
+            )
+            return False
+        while tool_use_id not in self._round_of_call:
+            await self._changed.wait()
+        return self._round_of_call[tool_use_id] > self.cap
+
+
 def _make_can_use_tool(
-    broker: PermissionBroker, pending_events: list[Event], terminate_flag: list[bool]
+    broker: PermissionBroker,
+    pending_events: list[Event],
+    terminate_flag: list[bool],
+    round_cap: _CallerRoundCap | None = None,
 ) -> CanUseTool:
     async def can_use_tool(
-        tool_name: str, tool_input: dict[str, Any], _context: ToolPermissionContext
+        tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
     ) -> PermissionResult:
+        if tool_name == _STRUCTURED_OUTPUT_TOOL:
+            # FR-1.3: the CLI's own structured-output tool is plumbing, not
+            # a caller tool -- the broker never sees it.
+            return PermissionResultAllow()
+        if round_cap is not None and await round_cap.is_over_cap(context.tool_use_id):
+            # FR-6.5: the caller's cap, enforced here exactly (not a
+            # broker verdict, so no PermissionRequested). Interrupting
+            # ends the CLI's loop; `_drive_client` reports the honest
+            # `max_tool_rounds` completion.
+            round_cap.hit = True
+            return PermissionResultDeny(
+                message=f"max_tool_rounds ({round_cap.cap}) reached", interrupt=True
+            )
         bare_name = _strip_server_prefix(tool_name)
         input_dict = cast("dict[str, object]", tool_input)
         decision = await broker.decide(bare_name, input_dict)
@@ -553,21 +710,20 @@ class ClaudeBackend(Backend):
         return self._native_ids.pop(session_id, None)
 
     def capabilities(self) -> Capabilities:
-        # Exactly the table in the task-10 brief. `supports_structured_
-        # output=False`: the SDK has no `output_schema`-shaped request
-        # parameter (mirrors `LangchainBackend`'s own deferral, module
-        # docstring).
+        # Exactly the table in the task-10 brief, plus structured output
+        # via the SDK's native `output_format` (module docstring).
         return Capabilities(
             supports_system_prompt=True,
-            supports_structured_output=False,
+            supports_structured_output=True,
             supports_interactive_permissions=True,
             supports_in_process_tools=True,
             supports_native_resume=True,
             supports_fork=True,
             supports_transcript_read=True,
-            # Enforced natively via `ClaudeAgentOptions.max_turns` (FR-6.5):
-            # see `_build_options` for the rounds->turns mapping and
-            # `_drive_client` for the honest `max_tool_rounds` completion.
+            # Enforced exactly by `_CallerRoundCap` through the permission
+            # bridge (FR-6.5), with `ClaudeAgentOptions.max_turns` as a
+            # backstop (`_build_options`); `_drive_client` reports the honest
+            # `max_tool_rounds` completion.
             supports_tool_round_cap=True,
             # The engine owns the turn; re-running a started turn could
             # duplicate tool side effects (FR-6.6): pre-turn connect retry
@@ -637,7 +793,11 @@ class ClaudeBackend(Backend):
             )
 
     def _build_options(
-        self, ctx: TurnContext, pending_events: list[Event], terminate_flag: list[bool]
+        self,
+        ctx: TurnContext,
+        pending_events: list[Event],
+        terminate_flag: list[bool],
+        round_cap: _CallerRoundCap | None = None,
     ) -> ClaudeAgentOptions:
         system_prompt = (
             {"type": "preset", "preset": "claude_code", "append": ctx.system_prompt}
@@ -647,27 +807,41 @@ class ClaudeBackend(Backend):
         return ClaudeAgentOptions(
             tools=[],
             mcp_servers=cast("dict[str, Any]", _build_mcp_servers(ctx.tools)),
-            can_use_tool=_make_can_use_tool(ctx.broker, pending_events, terminate_flag),
+            can_use_tool=_make_can_use_tool(ctx.broker, pending_events, terminate_flag, round_cap),
             hooks={"PreCompact": [HookMatcher(hooks=[_make_precompact_hook(pending_events)])]},
             system_prompt=cast(Any, system_prompt),
             model=ctx.model_spec.model,
             cwd=ctx.session.cwd,
-            # FR-6.5 rounds->turns mapping: the CLI's `max_turns` counts
-            # assistant responses in the query loop (`ResultMessage.
-            # num_turns`), and a run that executes N tool rounds takes N+1
-            # assistant responses (each round's response plus the final
-            # one), so a cap of N tool rounds is `max_turns = N + 1`.
-            # None (uncapped) stays None -- the CLI applies no cap of its
-            # own.
-            max_turns=None if ctx.max_tool_rounds is None else ctx.max_tool_rounds + 1,
+            # FR-6.5: the cap itself is enforced exactly by
+            # `_CallerRoundCap` (the CLI runs a response's tools before its
+            # own `max_turns` check, so `max_turns` alone overran it by one
+            # round). `max_turns` stays as a BACKSTOP only, bounding a
+            # runaway if the permission path were ever bypassed. Its value
+            # is the responses a well-behaved capped run needs: N tool
+            # rounds take N + 1 responses (each round's response plus the
+            # final one); a schema turn adds one more (FR-1.3) -- the CLI
+            # counts its StructuredOutput call as a turn, and when the model
+            # first ends with plain text it appends a reminder and asks
+            # again. On a PLAIN turn it cannot fire before the exact cap (no
+            # non-caller tools exist). On a SCHEMA turn it CAN fire first --
+            # invalid StructuredOutput attempts and reminders also use CLI
+            # turns -- and `_drive_client` then completes the turn as a
+            # schema turn without a valid result (`end_turn`, no result),
+            # never as a false `max_tool_rounds`. None (uncapped) stays None.
+            max_turns=(
+                None
+                if ctx.max_tool_rounds is None
+                else ctx.max_tool_rounds + (2 if ctx.output_schema is not None else 1)
+            ),
             resume=ctx.session.native_session_id,
+            output_format=(
+                {"type": "json_schema", "schema": ctx.output_schema}
+                if ctx.output_schema is not None
+                else None
+            ),
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
-        if ctx.output_schema is not None:
-            # Raised before `TurnStarted`, matching `LangchainBackend.run`'s
-            # own capability-mismatch handling (module docstring).
-            raise Unsupported("structured output not yet implemented for claude backend")
         async for event in self._run_turn(ctx):
             yield event
 
@@ -691,11 +865,18 @@ class ClaudeBackend(Backend):
             )
         pending_events: list[Event] = []
         terminate_flag = [False]
-        client = ClaudeSDKClient(self._build_options(ctx, pending_events, terminate_flag))
+        # FR-6.5: whenever a cap is set, the adapter enforces it exactly
+        # (`_CallerRoundCap`); `max_turns` is only a backstop.
+        round_cap = (
+            _CallerRoundCap(ctx.max_tool_rounds) if ctx.max_tool_rounds is not None else None
+        )
+        client = ClaudeSDKClient(
+            self._build_options(ctx, pending_events, terminate_flag, round_cap)
+        )
         self._clients[session_id] = client
         try:
             async for event in self._drive_client(
-                client, ctx, effective_prompt, pending_events, terminate_flag
+                client, ctx, effective_prompt, pending_events, terminate_flag, round_cap
             ):
                 yield event
         except Exception as exc:
@@ -726,6 +907,7 @@ class ClaudeBackend(Backend):
         prompt: str,
         pending_events: list[Event],
         terminate_flag: list[bool],
+        round_cap: _CallerRoundCap | None = None,
     ) -> AsyncIterator[Event]:
         # FR-6.6 pre-turn retry: connect/spawn failures are the one class
         # provably free of duplicated tool side effects (nothing ran yet).
@@ -752,15 +934,42 @@ class ClaudeBackend(Backend):
                     )
                 )
                 await anyio.sleep(delay)
+        # The CLI's StructuredOutput pair (FR-1.3) is hidden from the stream;
+        # its ids carry from the call's message to the result's.
+        hidden_ids: set[str] = set()
+        # The last VISIBLE response's text (langchain `_final_text`
+        # semantics): an error result often carries no `result` text, and
+        # FR-1.3 keeps the turn's text on a completion. It resets only when a
+        # new model response yields a visible item (text or a caller tool) --
+        # a hidden StructuredOutput-only response (e.g. after the CLI's
+        # reminder) is not a reply the caller saw. The CLI streams one
+        # AssistantMessage per content block, all sharing the response's
+        # `message_id`; a block with neither `message_id` nor `uuid` cannot
+        # be placed, so it counts as the same response.
+        last_text: str | None = None
+        last_visible_response: str | None = None
         async for message in client.receive_response():
             for event in pending_events:
                 yield event
             pending_events.clear()
             if isinstance(message, AssistantMessage):
-                for item in assistant_message_items(message):
+                if round_cap is not None:
+                    round_cap.observe(message)
+                visible = _without_structured_output(assistant_message_items(message), hidden_ids)
+                response = message.message_id or message.uuid
+                if (
+                    response is not None
+                    and response != last_visible_response
+                    and any(item.kind in ("text", "tool_use") for item in visible)
+                ):
+                    last_text = None
+                    last_visible_response = response
+                for item in visible:
+                    if item.kind == "text":
+                        last_text = cast(str, item.content["text"])
                     yield ItemCompleted(message=item)
             elif isinstance(message, UserMessage):
-                for item in user_message_items(message):
+                for item in _without_structured_output(user_message_items(message), hidden_ids):
                     yield ItemCompleted(message=item)
             elif isinstance(message, ResultMessage):
                 self._native_ids[ctx.session.session_id] = message.session_id
@@ -781,23 +990,69 @@ class ClaudeBackend(Backend):
                             )
                         )
                         return
+                    if round_cap is not None and round_cap.hit:
+                        # FR-6.5: this abort was OUR cap denial -- an honest
+                        # `max_tool_rounds` partial, with no structured
+                        # result.
+                        yield TurnCompleted(
+                            result=TurnResult(
+                                turn_id=ctx.turn_id,
+                                status="completed",
+                                end_reason="max_tool_rounds",
+                                final_text=message.result
+                                if message.result is not None
+                                else last_text,
+                                usage=_usage_ints(message.usage),
+                                cost_usd=message.total_cost_usd,
+                            )
+                        )
+                        return
                     # `Backend.run`'s contract (ports.py): an interrupted
                     # turn ends with neither `TurnCompleted` nor
                     # `TurnFailed` -- the turn runner assigns `interrupted`
                     # itself once this generator ends with no terminal
                     # event.
                     return
-                if message.is_error and not is_max_turns_result(message):
+                if (
+                    message.is_error
+                    and not is_max_turns_result(message)
+                    and not is_structured_output_exhausted_result(message)
+                ):
                     # `is_max_turns_result` is excluded from the failure
                     # path: the CLI flags its own `max_turns` stop as an
                     # error, but that cap only exists because the caller
                     # set `ctx.max_tool_rounds` -- it completes honestly
                     # with `end_reason="max_tool_rounds"` instead (FR-6.5).
                     yield TurnFailed(turn_id=ctx.turn_id, error=_result_error(message))
-                else:
-                    yield TurnCompleted(
-                        result=turn_result_from_result_message(message, ctx.turn_id)
-                    )
+                    return
+                result = turn_result_from_result_message(message, ctx.turn_id)
+                backstop_on_schema_turn = (
+                    ctx.output_schema is not None
+                    and is_max_turns_result(message)
+                    and not (round_cap is not None and round_cap.hit)
+                )
+                if backstop_on_schema_turn:
+                    # FR-1.3 over FR-6.5: on a schema turn the exact caller
+                    # cap is `_CallerRoundCap` (a cap stop arrives as an
+                    # aborted result, handled above). A `max_turns` result
+                    # here is the BACKSTOP firing because invalid
+                    # StructuredOutput attempts or the CLI's reminder used
+                    # up CLI turns -- a schema turn without a valid result,
+                    # which completes as `end_turn`, text kept, not a false
+                    # `max_tool_rounds`. After OUR cap denial (`hit`) the cap
+                    # did end the turn, so `max_tool_rounds` stands.
+                    result.end_reason = "end_turn"
+                if result.final_text is None and (
+                    is_structured_output_exhausted_result(message) or backstop_on_schema_turn
+                ):
+                    result.final_text = last_text
+                if ctx.output_schema is not None and isinstance(message.structured_output, dict):
+                    # FR-1.3, additive: `final_text` stays the model's prose
+                    # (`ResultMessage.result`); the result is ADDED beside
+                    # it. No valid result leaves it None -- still a
+                    # completion, text kept (module docstring).
+                    result.structured_output = cast("dict[str, object]", message.structured_output)
+                yield TurnCompleted(result=result)
                 return
         for event in pending_events:
             yield event

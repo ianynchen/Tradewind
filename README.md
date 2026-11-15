@@ -154,7 +154,7 @@ child = await s.spawn("summarize the findings", tier="light")   # subagent: fres
 ```python
 # Collected:
 result = await session.run("Refactor the parser", tier="strong")
-# result: TurnResult(turn_id, status, end_reason, final_text, usage, cost_usd)
+# result: TurnResult(turn_id, status, end_reason, final_text, usage, cost_usd, structured_output)
 
 # Cap the number of tool-execution rounds for one call:
 result = await session.run("Investigate, max two probes", max_tool_rounds=2)
@@ -177,7 +177,12 @@ The frozen event taxonomy (`tradewind.domain.events`): `TurnStarted`, `TextDelta
 `ItemCompleted` (carries a `NormalizedMessage` — the unit the mirror stores), `PermissionRequested`
 (emitted on deny), `TurnCompleted`, `TurnFailed`. Per-call overrides accepted by
 `run`/`stream`: `tier`, `system_prompt`, `output_schema`, `max_tool_rounds`,
-`history_scope`.
+`history_scope`. With `output_schema`, the turn's text and tool events are exactly those of a
+plain turn, and the schema-shaped result is ADDED as `result.structured_output` (a dict, also
+persisted) — the same field on every backend that supports structured output (codex, claude,
+langchain). `result.final_text` keeps the model's own final text (on codex that final answer is
+itself the JSON). If the model gives no valid result, the turn still completes and
+`structured_output` is `None`.
 
 ### What context the turn sees — `history_scope`
 
@@ -294,7 +299,8 @@ never be mistaken for a clean finish:
 
 `max_tool_rounds` (non-negative int; `0` = one model response, no tool execution) is enforced
 only where an adapter can do so honestly — `supports_tool_round_cap` in the capability matrix.
-`langchain` caps its own loop exactly; `claude` maps it to the SDK's native `max_turns`.
+`langchain` caps its own loop exactly; `claude` counts caller-tool rounds itself and refuses the
+first tool call past the cap (the SDK's `max_turns` is kept only as a backstop).
 `codex`/`cursor` run their loops engine-side with no cap surface and raise `Unsupported` when
 one is requested — never a timer-faked cap.
 
@@ -457,13 +463,13 @@ emulates silently — an unsupported call raises `Unsupported`.
 | Capability | langchain | claude | codex | cursor (EXPERIMENTAL) |
 |---|---|---|---|---|
 | `supports_system_prompt` | yes | yes | yes | no (emulated above the port) |
-| `supports_structured_output` | no | no | yes | no |
+| `supports_structured_output` | yes (forced schema-tool call, +1 model call) | yes (native `output_format`) | yes | no |
 | `supports_interactive_permissions` | yes | yes | yes | no |
 | `supports_in_process_tools` | yes | yes | no (MCP shim) | yes |
 | `supports_native_resume` | no (mirror rebuild) | yes | yes | yes |
 | `supports_fork` | no (`tw.fork` covers it) | yes | yes | no |
 | `supports_transcript_read` | no | yes | yes | no |
-| `supports_tool_round_cap` | yes (own loop) | yes (native `max_turns`) | no | no |
+| `supports_tool_round_cap` | yes (own loop) | yes (exact, via the permission bridge) | no | no |
 
 **NATIVE→REPLAY degrade is not implemented** (ARCHITECTURE §7 P-7): a reaped or expired native
 session on `claude`/`codex`/`cursor` currently surfaces as `TurnFailed` rather than degrading

@@ -60,7 +60,7 @@ All three return the row plus deserialized `options_json`.
 **Mirror writer.** Consumes completed items from the Event Normalizer within a
 turn context: opens the turn row (`in_progress`), appends messages with
 monotonically assigned `seq` per session, finalizes the turn (status, usage,
-cost, final text). Writes are per-item transactions so a crashed turn leaves a
+cost, final text, and — on a schema turn — the structured result, FR-1.3). Writes are per-item transactions so a crashed turn leaves a
 readable partial transcript with the turn stuck `in_progress` — the Resume
 Planner sweeps those to `failed` on next contact. Deltas never reach the store
 (I-3).

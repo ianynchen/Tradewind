@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `claude`: `max_tool_rounds` now holds exactly (FR-6.5). The bundled CLI
+  runs a response's tools before it checks its own `max_turns`, so
+  `max_tool_rounds=0` still ran the first response's tools (and `N` let
+  round `N+1` run). The adapter now counts caller-tool rounds itself and
+  refuses the first call past the cap with an interrupt, and the turn
+  ends as `max_tool_rounds`. `max_turns` stays only as a backstop
+  (`N + 1`, or `N + 2` on a schema turn). On a plain turn the backstop
+  cannot fire before the exact cap. On a schema turn it can, because
+  invalid StructuredOutput attempts and the CLI's reminder also use CLI
+  turns; that ending is a schema turn without a valid result
+  (`end_turn`, `structured_output=None`, text kept), never
+  `max_tool_rounds`. Uncapped turns are unchanged.
+
+### Added
+
+- Structured output on the `claude` and `langchain` backends (FR-1.3):
+  `supports_structured_output` is now `True` on both, and `output_schema` no
+  longer raises `Unsupported` there (`cursor` still does). It is ADDITIVE on
+  every backend: a schema turn's text and tool events are exactly those of a
+  plain turn, and the result is added as the new
+  `TurnResult.structured_output` (a dict; `None` on a turn without a
+  schema). `final_text` keeps the model's own final text — prose on
+  `claude`/`langchain`, the JSON final answer on `codex`, which now also
+  sets `structured_output`.
+  - `claude` passes the schema as the SDK's native `output_format`. The
+    CLI's own `StructuredOutput` tool call is hidden from events and the
+    mirror (live and on reconcile), is auto-allowed without consulting the
+    broker, and does not use up a caller tool round; `max_tool_rounds`
+    still holds exactly for caller tools (the adapter stops the first call
+    past the cap and ends the turn as `max_tool_rounds`). A single model
+    response that holds both a StructuredOutput call and a caller call past
+    the cap therefore ends as `max_tool_rounds` with
+    `structured_output=None`.
+  - `langchain` makes ONE extra model call after the tool loop ends
+    (`end_turn`), with `tool_choice` forced to a single schema tool. The
+    call emits no content (its retry/compaction notices still appear) and
+    is not a tool round; the tool loop keeps its 25-call guard.
+  - A schema turn that ends normally without a valid result still
+    completes, keeping its text, with `structured_output=None` (on claude
+    this includes the CLI's `error_max_structured_output_retries`);
+    `max_tool_rounds`, `max_tokens` and `broker_terminated` endings keep
+    their `end_reason`, with no result.
+- `turns.structured_output_json` column (migration
+  `0003_tradewind_turn_structured_output`, applied automatically): the
+  result is persisted as JSON beside `final_text`.
+  `SessionStorePort.finalize_turn` takes a new optional
+  `structured_output` keyword, which the turn runner always passes; custom
+  store implementations must accept it.
+
 ## [0.11.2] - 2026-09-03
 
 ### Added

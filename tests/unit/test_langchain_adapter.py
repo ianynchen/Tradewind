@@ -22,7 +22,7 @@ from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.runnables import Runnable
 from pydantic import ConfigDict, Field
 
-from tradewind.adapters.langchain_backend import LangchainBackend
+from tradewind.adapters.langchain_backend import _STRUCTURED_OUTPUT_TOOL, LangchainBackend
 from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import TurnContext
 from tradewind.application.tool_host import ToolHost
@@ -330,10 +330,9 @@ async def test_interrupt_of_unknown_session_is_a_no_op() -> None:
 def test_capabilities_match_spec_table() -> None:
     caps = _backend(_ScriptedChatModel(responses=[AIMessage(content="x")])).capabilities()
     assert caps.supports_system_prompt is True
-    # Structured output is deferred (fix round 1, Important): tool-choice
-    # forcing is not implemented, so the flag must say so honestly rather
-    # than advertise unimplemented behavior.
-    assert caps.supports_structured_output is False
+    # Structured output: one forced schema-tool call once the loop ends
+    # (component spec "Structured output" decision row).
+    assert caps.supports_structured_output is True
     assert caps.supports_interactive_permissions is True
     assert caps.supports_in_process_tools is True
     assert caps.supports_native_resume is False
@@ -350,23 +349,6 @@ async def test_read_native_transcript_raises_unsupported() -> None:
     backend = _backend(_ScriptedChatModel(responses=[AIMessage(content="x")]))
     with pytest.raises(Unsupported):
         await backend.read_native_transcript(_session_row(), None)
-
-
-# --- output_schema is rejected up front, matching supports_structured_output=False ---
-
-
-async def test_run_with_output_schema_raises_unsupported_before_turn_started() -> None:
-    model = _ScriptedChatModel(responses=[AIMessage(content="x")])
-    ctx = _make_ctx()
-    ctx.output_schema = {"type": "object", "properties": {}}
-
-    events: list[object] = []
-    with pytest.raises(Unsupported):
-        async for event in _backend(model).run(ctx):
-            events.append(event)
-
-    # No TurnStarted (or anything else) was yielded before the raise.
-    assert events == []
 
 
 # --- max-iteration guard -> TurnFailed, not TurnCompleted ---
@@ -1001,3 +983,406 @@ async def test_terminate_ends_the_turn_after_the_batch_is_delivered() -> None:
 def test_capabilities_declare_deny_reason_support() -> None:
     caps = _backend(_ScriptedChatModel(responses=[AIMessage(content="x")])).capabilities()
     assert caps.supports_deny_reason is True
+
+
+# --- structured output (FR-1.3; component spec "Structured output":
+# force once at the end). Additive: the loop and its events are exactly a
+# plain turn's; ONE forced schema-tool call is added after an `end_turn`
+# ending, emits nothing, and its arguments become ONLY
+# `TurnResult.structured_output`. ---
+
+_SCHEMA: dict[str, object] = {
+    "type": "object",
+    "properties": {"answer": {"type": "integer"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+
+
+class _RecordingChatModel(_ScriptedChatModel):
+    """`_ScriptedChatModel` that also records every `bind_tools` call as
+    `(tool names, tool_choice)`."""
+
+    binds: list[tuple[list[str], object]] = Field(default_factory=list)
+    bound_schemas: list[list[dict[str, object]]] = Field(default_factory=list)
+
+    def bind_tools(
+        self, tools: Sequence[object], *, tool_choice: object = None, **_kwargs: object
+    ) -> Runnable[Any, AIMessage]:
+        dicts = [cast("dict[str, object]", t) for t in tools]
+        self.binds.append(([cast(str, t["name"]) for t in dicts], tool_choice))
+        self.bound_schemas.append(dicts)
+        return self
+
+
+def _forced(args: dict[str, object], **kwargs: Any) -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[
+            {"name": _STRUCTURED_OUTPUT_TOOL, "args": args, "id": "call_so", "type": "tool_call"}
+        ],
+        **kwargs,
+    )
+
+
+def _schema_ctx(**kwargs: Any) -> TurnContext:
+    ctx = _make_ctx(**kwargs)
+    ctx.output_schema = _SCHEMA
+    return ctx
+
+
+def _item_texts(events: list[object]) -> list[str]:
+    return [
+        cast(str, e.message.content["text"])
+        for e in events
+        if isinstance(e, ItemCompleted) and e.message.kind == "text"
+    ]
+
+
+async def test_schema_turn_keeps_the_natural_final_text_and_adds_the_forced_result() -> None:
+    model = _RecordingChatModel(
+        responses=[AIMessage(content="Here you go."), _forced({"answer": 42})]
+    )
+
+    events = [event async for event in _backend(model).run(_schema_ctx())]
+
+    # Exactly one extra model call, forced to the single schema tool built
+    # from the caller's schema.
+    assert len(model.calls) == 2
+    assert model.binds == [([_STRUCTURED_OUTPUT_TOOL], _STRUCTURED_OUTPUT_TOOL)]
+    assert model.bound_schemas[0][0]["input_schema"] == _SCHEMA
+    # The forced request never ends on an assistant message.
+    assert isinstance(model.calls[1][-1], HumanMessage)
+    # Additive: exactly a plain turn's events -- the forced call adds none
+    # (no JSON item, no forced tool_use, no delta); the result lives only
+    # in `structured_output`.
+    assert [type(e).__name__ for e in events] == [
+        "TurnStarted",
+        "TextDelta",
+        "ItemCompleted",
+        "TurnCompleted",
+    ]
+    assert _item_texts(events) == ["Here you go."]
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.end_reason == "end_turn"
+    assert result.final_text == "Here you go."
+    assert result.structured_output == {"answer": 42}
+
+
+async def test_no_schema_makes_no_forced_call_and_adds_nothing() -> None:
+    """No schema = today's behaviour exactly: one model call, no binding,
+    no extra item, no structured result."""
+    model = _RecordingChatModel(responses=[AIMessage(content="Done!"), _forced({"answer": 1})])
+
+    events = [event async for event in _backend(model).run(_make_ctx())]
+
+    assert len(model.calls) == 1
+    assert model.binds == []
+    assert [type(e).__name__ for e in events] == [
+        "TurnStarted",
+        "TextDelta",
+        "ItemCompleted",
+        "TurnCompleted",
+    ]
+    assert _item_texts(events) == ["Done!"]
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.final_text == "Done!"
+    assert result.structured_output is None
+
+
+async def test_forced_call_keeps_caller_tools_bound_and_is_not_a_tool_round() -> None:
+    """`max_tool_rounds=1`: one real round runs, the model ends its turn,
+    and the forced call still happens -- it is not a tool round. Caller
+    tools stay bound so a request holding tool_use/tool_result blocks
+    stays valid."""
+    calls: list[object] = []
+
+    async def handler(**kwargs: object) -> str:
+        calls.append(kwargs)
+        return "ok"
+
+    tool_host = ToolHost(
+        [Tool(name="t", description="d", input_schema={"type": "object"}, handler=handler)],
+        [],
+        lambda ref: ref,
+    )
+    model = _RecordingChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "t", "args": {}, "id": "call_1", "type": "tool_call"}],
+            ),
+            AIMessage(content="All done."),
+            _forced({"answer": 7}),
+        ]
+    )
+    ctx = _schema_ctx(tools=tool_host, broker=_AllowAllBroker())
+    ctx.max_tool_rounds = 1
+
+    events = [event async for event in _backend(model).run(ctx)]
+
+    assert len(calls) == 1
+    assert model.binds[-1] == (["t", _STRUCTURED_OUTPUT_TOOL], _STRUCTURED_OUTPUT_TOOL)
+    tool_kinds = [
+        e.message.kind
+        for e in events
+        if isinstance(e, ItemCompleted) and e.message.kind in ("tool_use", "tool_result")
+    ]
+    assert tool_kinds == ["tool_use", "tool_result"]  # the real round, mirrored as usual
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.end_reason == "end_turn"
+    assert result.final_text == "All done."
+    assert result.structured_output == {"answer": 7}
+
+
+async def test_max_tool_rounds_ending_makes_no_forced_call() -> None:
+    """The cap ended the turn: `max_tool_rounds` stands, no structured
+    result, no extra model call."""
+
+    async def handler(**_: object) -> str:
+        return "again"
+
+    tool_host = ToolHost(
+        [Tool(name="t", description="d", input_schema={"type": "object"}, handler=handler)],
+        [],
+        lambda ref: ref,
+    )
+    looping = AIMessage(
+        content="",
+        tool_calls=[{"name": "t", "args": {}, "id": "call_loop", "type": "tool_call"}],
+    )
+    model = _RecordingChatModel(responses=[looping])
+    ctx = _schema_ctx(tools=tool_host, broker=_AllowAllBroker())
+    ctx.max_tool_rounds = 1
+
+    events = [event async for event in _backend(model).run(ctx)]
+
+    assert len(model.calls) == 2  # round 1's call + the capped call, nothing forced
+    assert all(choice is None for _names, choice in model.binds)
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.end_reason == "max_tool_rounds"
+    assert result.structured_output is None
+
+
+async def test_forced_call_without_a_schema_tool_call_completes_without_a_result() -> None:
+    """Owner rule (FR-1.3): a schema turn that ends normally without a
+    valid result still COMPLETES -- text kept, `structured_output` None --
+    and whatever the forced call said instead is not emitted."""
+    model = _RecordingChatModel(
+        responses=[AIMessage(content="Here you go."), AIMessage(content="no tool for you")]
+    )
+
+    events = [event async for event in _backend(model).run(_schema_ctx())]
+
+    assert not any(isinstance(e, TurnFailed) for e in events)
+    assert _item_texts(events) == ["Here you go."]
+    assert not any(
+        type(e).__name__ == "TextDelta" and "no tool" in cast(Any, e).text for e in events
+    )
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.end_reason == "end_turn"
+    assert result.final_text == "Here you go."
+    assert result.structured_output is None
+
+
+async def test_truncated_forced_call_completes_as_max_tokens_without_a_result() -> None:
+    model = _RecordingChatModel(
+        responses=[
+            AIMessage(content="Here you go."),
+            _forced({"answer": 4}, response_metadata={"stop_reason": "max_tokens"}),
+        ]
+    )
+
+    events = [event async for event in _backend(model).run(_schema_ctx())]
+
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.end_reason == "max_tokens"
+    assert result.final_text == "Here you go."
+    assert result.structured_output is None
+
+
+class _TextThenBlockingChatModel(BaseChatModel):
+    """Answers the first call with plain text (the model ends its turn),
+    then blocks forever on the forced call so an interrupt lands there."""
+
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    started: anyio.Event
+    answered: list[bool] = Field(default_factory=list)
+
+    def bind_tools(
+        self, _tools: Sequence[object], *, _tool_choice: object = None, **_kwargs: object
+    ) -> Runnable[Any, AIMessage]:
+        return self
+
+    def _generate(self, messages: list[BaseMessage], **kwargs: object) -> ChatResult:
+        raise NotImplementedError("only the async path is exercised in this test")
+
+    async def _agenerate(self, _messages: list[BaseMessage], **_kwargs: object) -> ChatResult:
+        if not self.answered:
+            self.answered.append(True)
+            return ChatResult(generations=[ChatGeneration(message=AIMessage(content="Here."))])
+        self.started.set()
+        await anyio.sleep_forever()
+        raise AssertionError("unreachable: cancellation should unwind before this returns")
+
+    @property
+    def _llm_type(self) -> str:
+        return "text-then-blocking-fake"
+
+
+async def test_interrupt_during_the_forced_call_ends_cleanly_without_a_terminal_event() -> None:
+    started = anyio.Event()
+    backend = _backend(_TextThenBlockingChatModel(started=started))
+    ctx = _schema_ctx()
+
+    events: list[object] = []
+
+    async def consume() -> None:
+        async for event in backend.run(ctx):
+            events.append(event)
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(consume)
+        await started.wait()
+        await backend.interrupt(ctx.session.session_id)
+
+    assert not any(isinstance(e, (TurnCompleted, TurnFailed)) for e in events)
+    assert _item_texts(events) == ["Here."]  # the natural text was already mirrored
+
+
+async def test_next_turn_rebuild_after_a_schema_turn_is_a_plain_turns_rebuild() -> None:
+    """The mirror of a schema turn holds only plain-turn items, so the next
+    turn's rebuild replays the model's text -- no JSON, no orphan tool_use
+    without its tool_result."""
+    first = _RecordingChatModel(
+        responses=[AIMessage(content="Here you go."), _forced({"answer": 1})]
+    )
+    first_events = [event async for event in _backend(first).run(_schema_ctx(prompt="q1"))]
+    history = [StoredMessage(role="user", kind="text", content={"text": "q1"})] + [
+        StoredMessage(role=e.message.role, kind=e.message.kind, content=e.message.content)
+        for e in first_events
+        if isinstance(e, ItemCompleted)
+    ]
+    second = _RecordingChatModel(responses=[AIMessage(content="ok")])
+
+    [event async for event in _backend(second).run(_make_ctx(prompt="q2", history=history))]
+
+    assert second.calls[0] == [
+        HumanMessage(content="q1"),
+        AIMessage(content="Here you go."),
+        HumanMessage(content="q2"),
+    ]
+
+
+async def test_a_transient_error_on_the_forced_call_is_retried() -> None:
+    """The forced call is a model call like any other (FR-6.6): a transient
+    error is retried visibly, and the turn still gets its result."""
+    model = _FlakyChatModel(
+        responses=[AIMessage(content="pad")],
+        script=[
+            AIMessage(content="Here you go."),
+            _StatusError(503, "overloaded"),
+            _forced({"answer": 9}),
+        ],
+    )
+    ctx = _retry_ctx()
+    ctx.output_schema = _SCHEMA
+
+    events = [event async for event in _backend(model).run(ctx)]
+
+    notices = [
+        e.message.content
+        for e in events
+        if isinstance(e, ItemCompleted) and e.message.content.get("type") == "retry_scheduled"
+    ]
+    assert len(notices) == 1
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.final_text == "Here you go."
+    assert result.structured_output == {"answer": 9}
+
+
+async def test_broker_terminated_ending_makes_no_forced_call() -> None:
+    async def fine(**_: object) -> str:
+        return "ok"
+
+    tool_host = ToolHost(
+        [Tool(name="fine_tool", description="d", input_schema={"type": "object"}, handler=fine)],
+        [],
+        lambda ref: ref,
+    )
+    model = _RecordingChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "fatal_tool", "args": {}, "id": "c1", "type": "tool_call"}],
+            ),
+            _forced({"answer": 1}),
+        ]
+    )
+    ctx = _schema_ctx(tools=tool_host, broker=_RichBroker())
+
+    events = [event async for event in _backend(model).run(ctx)]
+
+    assert len(model.calls) == 1
+    assert all(choice is None for _names, choice in model.binds)
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.end_reason == "broker_terminated"
+    assert result.structured_output is None
+
+
+async def test_iteration_limit_is_unchanged_by_a_schema() -> None:
+    """The tool loop keeps its 25-call runaway guard on a schema turn; only
+    the forced call may use the one extra slot."""
+    looping = AIMessage(
+        content="",
+        tool_calls=[{"name": "t", "args": {}, "id": "call_loop", "type": "tool_call"}],
+    )
+
+    async def loop_handler(**_: object) -> str:
+        return "again"
+
+    tool_host = ToolHost(
+        [Tool(name="t", description="d", input_schema={"type": "object"}, handler=loop_handler)],
+        [],
+        lambda ref: ref,
+    )
+    model = _RecordingChatModel(responses=[looping])
+    ctx = _schema_ctx(tools=tool_host, broker=_AllowAllBroker())
+
+    events = [event async for event in _backend(model).run(ctx)]
+
+    assert len(model.calls) == 25
+    failed = [e for e in events if isinstance(e, TurnFailed)]
+    assert len(failed) == 1
+    assert "max iterations" in failed[0].error
+
+
+async def test_forced_call_may_use_the_slot_after_a_full_tool_loop() -> None:
+    """24 tool rounds, a plain end on call 25 (the loop's last allowed
+    call), then the forced call as call 26: the turn completes with its
+    result -- the extra slot exists for exactly this call."""
+
+    async def handler(**_: object) -> str:
+        return "ok"
+
+    tool_host = ToolHost(
+        [Tool(name="t", description="d", input_schema={"type": "object"}, handler=handler)],
+        [],
+        lambda ref: ref,
+    )
+    tool_round = AIMessage(
+        content="",
+        tool_calls=[{"name": "t", "args": {}, "id": "call_r", "type": "tool_call"}],
+    )
+    model = _RecordingChatModel(
+        responses=[*([tool_round] * 24), AIMessage(content="finally"), _forced({"answer": 3})]
+    )
+    ctx = _schema_ctx(tools=tool_host, broker=_AllowAllBroker())
+
+    events = [event async for event in _backend(model).run(ctx)]
+
+    assert len(model.calls) == 26
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.end_reason == "end_turn"
+    assert result.final_text == "finally"
+    assert result.structured_output == {"answer": 3}

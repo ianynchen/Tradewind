@@ -79,10 +79,10 @@ if not os.environ.get("TRADEWIND_RUN_CODEX_INTEGRATION"):
         allow_module_level=True,
     )
 
-# Cheapest model confirmed to exist on this machine's Codex model list
-# (`~/.codex/models_cache.json`) at task-14 time -- kept deliberately small
-# since every test here is a real, billed API call.
-_MODEL = "gpt-5.4-mini"
+# Owner-chosen model for live runs (2026-11-15): `gpt-5.4-mini`, the
+# task-14 choice, is no longer offered on the owner's ChatGPT login.
+# Every test here is a real, billed API call, so prompts stay tiny.
+_MODEL = "gpt-5.6-sol"
 
 
 def _profile() -> Profile:

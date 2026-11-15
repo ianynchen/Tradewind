@@ -469,6 +469,7 @@ class TurnRunner:
 
         terminal_status: TurnStatus | None = None
         final_text: str | None = None
+        structured_output: dict[str, object] | None = None
         watchdog_task: asyncio.Task[None] | None = None
         timed_out = [False]
         usage: dict[str, object] | None = None
@@ -703,6 +704,7 @@ class TurnRunner:
                         if isinstance(event, TurnCompleted):
                             terminal_status = event.result.status
                             final_text = event.result.final_text
+                            structured_output = event.result.structured_output
                             usage = cast("dict[str, object]", event.result.usage)
                             cost_usd = event.result.cost_usd
                         elif isinstance(event, TurnFailed):
@@ -834,6 +836,7 @@ class TurnRunner:
                         turn_id,
                         status=terminal_status,
                         final_text=final_text,
+                        structured_output=structured_output,
                         usage=usage,
                         cost_usd=cost_usd,
                         error=error,
