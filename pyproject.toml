@@ -17,6 +17,7 @@ dependencies = [
     "openai-codex==0.147.0",
     "cursor-sdk==1.0.30",
     "yoyo-migrations==9.0.0",
+    "jsonschema>=4.26,<5",
 ]
 
 [dependency-groups]
@@ -91,6 +92,16 @@ disallow_any_expr = false
 # with binnacle, which carries the identical override). Narrowly scoped to
 # the third-party module; `sqlite_store` itself stays fully typed.
 module = "yoyo.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# `jsonschema` (05-turn-governance §6, owner-approved runtime dependency)
+# ships no py.typed marker; its stubs are a separate package, which would be
+# a further unapproved dependency. Same resolution as `yoyo` above:
+# `tool_host` keeps jsonschema's types out of its own signatures (it exposes
+# a plain `Callable[[dict[str, object]], list[str]]`), so nothing Any-typed
+# leaks past that module.
+module = "jsonschema.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

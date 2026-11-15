@@ -695,12 +695,16 @@ class TurnRunner:
             # Broker questions pause every limit (05 §3.2).
             gate.on_approval_change = supervisor.approvals_changed
             tool_host_broker = gate.as_broker("shim") if backend.name == "codex" else None
+            output_schema = _effective_output_schema(snapshot, overrides)
             async with ToolHost(
                 options.tools,
                 options.mcp_servers,
                 self._resolve_ref,
                 socket_dir=self._config.tool_host.socket_dir,
                 broker=tool_host_broker,
+                # 05 §6: engines with no output-schema support get the
+                # result tool instead.
+                result_schema=output_schema if backend.uses_result_tool else None,
             ) as tool_host:
                 # The prompt is this turn's own input, not something a
                 # backend "completes" as an `ItemCompleted` event, so
@@ -779,7 +783,7 @@ class TurnRunner:
                     prompt=backend_prompt,
                     model_spec=model_spec,
                     system_prompt=effective_system_prompt,
-                    output_schema=_effective_output_schema(snapshot, overrides),
+                    output_schema=output_schema,
                     tools=tool_host,
                     broker=broker,
                     on_preflight=options.on_preflight,

@@ -25,6 +25,12 @@ not one of the layers named in the import-linter `layers` contract
 from it is unconstrained by that contract, and `tradewind.toolproxy` itself
 never imports `tradewind.application` (verified by `lint-imports`; the shim
 must stay leaf since it runs inside engine sandboxes), so no cycle results.
+
+`result_schema` (05-turn-governance §6) adds the result-tool seam for
+engines with no output-schema support: `RESULT_TOOL_NAME` is served through
+the same `schemas()`/`call()` path as every other tool (so the shim exposes
+it), validated with `jsonschema`, and recorded in `result_slot`. It is a
+structural pass-through: it never consults the broker.
 """
 
 from __future__ import annotations
@@ -37,12 +43,13 @@ import tempfile
 import uuid
 from collections.abc import Callable
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import TracebackType
-from typing import cast
+from typing import Final, cast
 
 import anyio
+import jsonschema
 from anyio.abc import SocketListener, SocketStream
 from anyio.streams.buffered import BufferedByteReceiveStream
 from mcp import ClientSession
@@ -51,8 +58,34 @@ from mcp.client.streamable_http import streamable_http_client
 from mcp.shared._httpx_utils import create_mcp_http_client
 from mcp_types import TextContent
 
+from tradewind.domain.errors import ConfigError
 from tradewind.domain.models import McpServerDef, PermissionBroker, Tool, normalize_decision
 from tradewind.toolproxy import protocol
+
+#: The result tool's name (05 §6). A caller tool of this name is refused.
+RESULT_TOOL_NAME: Final = "tradewind_submit_result"
+
+#: Calls of the result tool that count; a further call is answered
+#: `"No more attempts."` and not recorded (05 §6).
+MAX_RESULT_ATTEMPTS: Final = 3
+
+
+@dataclass
+class ResultSlot:
+    """What the result tool has received this turn (05 §6). `attempts` is
+    the number of counted calls (0..`MAX_RESULT_ATTEMPTS`, valid or not);
+    `last_valid` is the arguments of the last call that passed validation,
+    or `None`. Mutable on purpose: `ToolHost.call` updates it in place and
+    the turn reads it after the engine finishes. Not safe for concurrent
+    writers beyond the single event loop that runs `call()`."""
+
+    attempts: int = 0
+    last_valid: dict[str, object] | None = field(default=None)
+
+    def clear(self) -> None:
+        """Forget every attempt and the recorded result."""
+        self.attempts = 0
+        self.last_valid = None
 
 
 @dataclass
@@ -78,6 +111,31 @@ def _mcp_tool_name(server_name: str, tool_name: str) -> str:
     return f"mcp__{server_name}__{tool_name}"
 
 
+def _result_validator(
+    result_schema: dict[str, object], tools: dict[str, Tool]
+) -> Callable[[dict[str, object]], list[str]]:
+    """Check `result_schema` once and return a function giving the
+    validation error messages for one set of arguments (empty = valid)."""
+    if RESULT_TOOL_NAME in tools:
+        raise ConfigError(
+            f"tool name {RESULT_TOOL_NAME!r} is reserved for the result tool; "
+            "rename the caller tool"
+        )
+    validator_class = jsonschema.validators.validator_for(
+        result_schema, default=jsonschema.Draft202012Validator
+    )
+    try:
+        validator_class.check_schema(result_schema)
+    except jsonschema.SchemaError as exc:
+        raise ConfigError(f"output_schema is not a valid JSON Schema: {exc.message}") from exc
+    validator = validator_class(result_schema)
+
+    def error_messages(arguments: dict[str, object]) -> list[str]:
+        return [str(error.message) for error in validator.iter_errors(arguments)]
+
+    return error_messages
+
+
 class ToolHost:
     def __init__(
         self,
@@ -86,8 +144,19 @@ class ToolHost:
         resolve_ref: Callable[[str], str],
         socket_dir: Path | None = None,
         broker: PermissionBroker | None = None,
+        result_schema: dict[str, object] | None = None,
     ) -> None:
+        """`result_schema`, when set, serves `RESULT_TOOL_NAME` with that
+        schema verbatim as its input schema (05 §6). Raises `ConfigError`
+        if `result_schema` is not a valid JSON Schema for the draft it
+        declares (default Draft 2020-12), or if a caller tool is named
+        `RESULT_TOOL_NAME`."""
         self._tools = {tool.name: tool for tool in tools}
+        self.result_slot = ResultSlot()
+        self._result_schema = result_schema
+        self._result_validator = (
+            None if result_schema is None else _result_validator(result_schema, self._tools)
+        )
         self._mcp_servers = mcp_servers
         self._resolve_ref = resolve_ref
         # `broker` (task-14 brief, codex adapter): when set, `call()` itself
@@ -382,9 +451,38 @@ class ToolHost:
                     error = protocol.ErrorResponse(error="line too long")
                     await self._send_response_line(stream, error)
                     return
-                response = await self._handle_socket_line(line)
-                if not await self._send_response_line(stream, response):
+                response = await self._answer_unless_abandoned(stream, buffered, line)
+                if response is None or not await self._send_response_line(stream, response):
                     return
+
+    async def _answer_unless_abandoned(
+        self, stream: SocketStream, buffered: BufferedByteReceiveStream, line: bytes
+    ) -> protocol.Response | None:
+        """Answer one request line, or return `None` if the peer closes the
+        connection first. A closed peer means the engine gave up on the call
+        (05 "Port and interface changes"): the call is cancelled, so a
+        pending broker question is cancelled and a late "ask" answer can
+        never run the tool. Bytes that arrive while the call runs (a second,
+        pipelined request line) are fed back into `buffered`, so the
+        protocol is unchanged. Limitation: a peer that half-closes its write
+        side after sending (`send_eof`) is treated as gone; the shim never
+        does that."""
+        answers: list[protocol.Response] = []
+        async with anyio.create_task_group() as tg:
+
+            async def answer() -> None:
+                answers.append(await self._handle_socket_line(line))
+                tg.cancel_scope.cancel()
+
+            tg.start_soon(answer)
+            while True:
+                try:
+                    data = await stream.receive()
+                except (anyio.EndOfStream, anyio.BrokenResourceError, anyio.ClosedResourceError):
+                    tg.cancel_scope.cancel()
+                    break
+                buffered.feed_data(data)
+        return answers[0] if answers else None
 
     async def _send_response_line(self, stream: SocketStream, response: protocol.Response) -> bool:
         """Write one NDJSON response line; returns whether it was actually
@@ -430,9 +528,24 @@ class ToolHost:
 
     def schemas(self) -> list[dict[str, object]]:
         local = [_local_schema(tool) for tool in self._tools.values()]
-        return local + list(self._mcp_schemas.values())
+        result: list[dict[str, object]] = (
+            []
+            if self._result_schema is None
+            else [
+                {
+                    "name": RESULT_TOOL_NAME,
+                    "description": "Submit the final result of this task. "
+                    "The arguments must match the input schema.",
+                    "input_schema": self._result_schema,
+                }
+            ]
+        )
+        return local + list(self._mcp_schemas.values()) + result
 
     async def call(self, name: str, arguments: dict[str, object]) -> ToolOutcome:
+        if name == RESULT_TOOL_NAME and self._result_validator is not None:
+            # Structural pass-through (05 §2.3): never asks the broker.
+            return self._submit_result(self._result_validator, arguments)
         if name not in self._tools and name not in self._mcp_targets:
             return ToolOutcome(content=f"unknown tool: {name!r}", is_error=True)
         if self._broker is not None:
@@ -447,6 +560,21 @@ class ToolHost:
         if name in self._tools:
             return await self._call_local(self._tools[name], arguments)
         return await self._call_mcp(name, arguments)
+
+    def _submit_result(
+        self,
+        error_messages: Callable[[dict[str, object]], list[str]],
+        arguments: dict[str, object],
+    ) -> ToolOutcome:
+        slot = self.result_slot
+        if slot.attempts >= MAX_RESULT_ATTEMPTS:
+            return ToolOutcome(content="No more attempts.", is_error=True)
+        slot.attempts += 1
+        errors = error_messages(arguments)
+        if errors:
+            return ToolOutcome(content="\n".join(errors), is_error=True)
+        slot.last_valid = dict(arguments)
+        return ToolOutcome(content="Result recorded.", is_error=False)
 
     async def _call_local(self, tool: Tool, arguments: dict[str, object]) -> ToolOutcome:
         try:
