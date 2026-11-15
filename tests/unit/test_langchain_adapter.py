@@ -988,7 +988,8 @@ def test_capabilities_declare_deny_reason_support() -> None:
 # --- structured output (FR-1.3; component spec "Structured output":
 # force once at the end). Additive: the loop and its events are exactly a
 # plain turn's; ONE forced schema-tool call is added after an `end_turn`
-# ending, and its arguments become `TurnResult.structured_output`. ---
+# ending, emits nothing, and its arguments become ONLY
+# `TurnResult.structured_output`. ---
 
 _SCHEMA: dict[str, object] = {
     "type": "object",
@@ -1052,11 +1053,16 @@ async def test_schema_turn_keeps_the_natural_final_text_and_adds_the_forced_resu
     assert model.bound_schemas[0][0]["input_schema"] == _SCHEMA
     # The forced request never ends on an assistant message.
     assert isinstance(model.calls[1][-1], HumanMessage)
-    # Additive: the model's own final text is kept, then the result added.
-    assert _item_texts(events) == ["Here you go.", '{"answer": 42}']
-    assert not any(
-        isinstance(e, ItemCompleted) and e.message.kind == "tool_use" for e in events
-    )  # the forced tool_use has no tool_result; mirroring it would break a rebuild
+    # Additive: exactly a plain turn's events -- the forced call adds none
+    # (no JSON item, no forced tool_use, no delta); the result lives only
+    # in `structured_output`.
+    assert [type(e).__name__ for e in events] == [
+        "TurnStarted",
+        "TextDelta",
+        "ItemCompleted",
+        "TurnCompleted",
+    ]
+    assert _item_texts(events) == ["Here you go."]
     result = cast(TurnCompleted, events[-1]).result
     assert result.end_reason == "end_turn"
     assert result.final_text == "Here you go."
@@ -1158,18 +1164,25 @@ async def test_max_tool_rounds_ending_makes_no_forced_call() -> None:
     assert result.structured_output is None
 
 
-async def test_forced_call_without_a_schema_tool_call_fails_the_turn() -> None:
+async def test_forced_call_without_a_schema_tool_call_completes_without_a_result() -> None:
+    """Owner rule (FR-1.3): a schema turn that ends normally without a
+    valid result still COMPLETES -- text kept, `structured_output` None --
+    and whatever the forced call said instead is not emitted."""
     model = _RecordingChatModel(
         responses=[AIMessage(content="Here you go."), AIMessage(content="no tool for you")]
     )
 
     events = [event async for event in _backend(model).run(_schema_ctx())]
 
-    assert not any(isinstance(e, TurnCompleted) for e in events)
-    failed = [e for e in events if isinstance(e, TurnFailed)]
-    assert len(failed) == 1
-    assert _STRUCTURED_OUTPUT_TOOL in failed[0].error
-    assert "Here you go." in _item_texts(events)  # the natural text was still kept
+    assert not any(isinstance(e, TurnFailed) for e in events)
+    assert _item_texts(events) == ["Here you go."]
+    assert not any(
+        type(e).__name__ == "TextDelta" and "no tool" in cast(Any, e).text for e in events
+    )
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.end_reason == "end_turn"
+    assert result.final_text == "Here you go."
+    assert result.structured_output is None
 
 
 async def test_truncated_forced_call_completes_as_max_tokens_without_a_result() -> None:
@@ -1235,3 +1248,110 @@ async def test_interrupt_during_the_forced_call_ends_cleanly_without_a_terminal_
 
     assert not any(isinstance(e, (TurnCompleted, TurnFailed)) for e in events)
     assert _item_texts(events) == ["Here."]  # the natural text was already mirrored
+
+
+async def test_next_turn_rebuild_after_a_schema_turn_is_a_plain_turns_rebuild() -> None:
+    """The mirror of a schema turn holds only plain-turn items, so the next
+    turn's rebuild replays the model's text -- no JSON, no orphan tool_use
+    without its tool_result."""
+    first = _RecordingChatModel(
+        responses=[AIMessage(content="Here you go."), _forced({"answer": 1})]
+    )
+    first_events = [event async for event in _backend(first).run(_schema_ctx(prompt="q1"))]
+    history = [StoredMessage(role="user", kind="text", content={"text": "q1"})] + [
+        StoredMessage(role=e.message.role, kind=e.message.kind, content=e.message.content)
+        for e in first_events
+        if isinstance(e, ItemCompleted)
+    ]
+    second = _RecordingChatModel(responses=[AIMessage(content="ok")])
+
+    [event async for event in _backend(second).run(_make_ctx(prompt="q2", history=history))]
+
+    assert second.calls[0] == [
+        HumanMessage(content="q1"),
+        AIMessage(content="Here you go."),
+        HumanMessage(content="q2"),
+    ]
+
+
+async def test_a_transient_error_on_the_forced_call_is_retried() -> None:
+    """The forced call is a model call like any other (FR-6.6): a transient
+    error is retried visibly, and the turn still gets its result."""
+    model = _FlakyChatModel(
+        responses=[AIMessage(content="pad")],
+        script=[
+            AIMessage(content="Here you go."),
+            _StatusError(503, "overloaded"),
+            _forced({"answer": 9}),
+        ],
+    )
+    ctx = _retry_ctx()
+    ctx.output_schema = _SCHEMA
+
+    events = [event async for event in _backend(model).run(ctx)]
+
+    notices = [
+        e.message.content
+        for e in events
+        if isinstance(e, ItemCompleted) and e.message.content.get("type") == "retry_scheduled"
+    ]
+    assert len(notices) == 1
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.final_text == "Here you go."
+    assert result.structured_output == {"answer": 9}
+
+
+async def test_broker_terminated_ending_makes_no_forced_call() -> None:
+    async def fine(**_: object) -> str:
+        return "ok"
+
+    tool_host = ToolHost(
+        [Tool(name="fine_tool", description="d", input_schema={"type": "object"}, handler=fine)],
+        [],
+        lambda ref: ref,
+    )
+    model = _RecordingChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "fatal_tool", "args": {}, "id": "c1", "type": "tool_call"}],
+            ),
+            _forced({"answer": 1}),
+        ]
+    )
+    ctx = _schema_ctx(tools=tool_host, broker=_RichBroker())
+
+    events = [event async for event in _backend(model).run(ctx)]
+
+    assert len(model.calls) == 1
+    assert all(choice is None for _names, choice in model.binds)
+    result = cast(TurnCompleted, events[-1]).result
+    assert result.end_reason == "broker_terminated"
+    assert result.structured_output is None
+
+
+async def test_iteration_limit_is_unchanged_by_a_schema() -> None:
+    """The tool loop keeps its 25-call runaway guard on a schema turn; only
+    the forced call may use the one extra slot."""
+    looping = AIMessage(
+        content="",
+        tool_calls=[{"name": "t", "args": {}, "id": "call_loop", "type": "tool_call"}],
+    )
+
+    async def loop_handler(**_: object) -> str:
+        return "again"
+
+    tool_host = ToolHost(
+        [Tool(name="t", description="d", input_schema={"type": "object"}, handler=loop_handler)],
+        [],
+        lambda ref: ref,
+    )
+    model = _RecordingChatModel(responses=[looping])
+    ctx = _schema_ctx(tools=tool_host, broker=_AllowAllBroker())
+
+    events = [event async for event in _backend(model).run(ctx)]
+
+    assert len(model.calls) == 25
+    failed = [e for e in events if isinstance(e, TurnFailed)]
+    assert len(failed) == 1
+    assert "max iterations" in failed[0].error

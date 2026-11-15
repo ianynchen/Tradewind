@@ -195,7 +195,7 @@ CREATE TABLE turns (
   cost_usd     REAL,
   started_at   TEXT, completed_at TEXT,
   error_json   TEXT,
-  structured_output TEXT             -- FR-1.3: schema turn's result (JSON); NULL otherwise (migration 0003)
+  structured_output_json TEXT        -- FR-1.3: schema turn's result (JSON); NULL otherwise (migration 0003)
 );
 
 CREATE TABLE messages (

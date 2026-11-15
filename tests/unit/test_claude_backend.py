@@ -562,12 +562,35 @@ async def test_structured_output_is_added_beside_the_prose_final_text(
     """FR-1.3, additive: the model's own text still streams and mirrors as
     in a plain turn, `final_text` stays its prose, and the schema result is
     ADDED as `structured_output`."""
-    from claude_agent_sdk import AssistantMessage, TextBlock
+    from claude_agent_sdk import (
+        AssistantMessage,
+        TextBlock,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
 
+    # What the CLI streams for a schema turn: the model's text, then its
+    # call to the CLI's own `StructuredOutput` tool and that tool's result.
     _install_fake_sdk_client(
         monkeypatch,
         [
-            AssistantMessage(content=[TextBlock(text="Here you go.")], model="claude-sonnet-4-5"),
+            AssistantMessage(
+                content=[
+                    TextBlock(text="Here you go."),
+                    ToolUseBlock(id="toolu_so", name="StructuredOutput", input={"answer": 42}),
+                ],
+                model="claude-sonnet-4-5",
+            ),
+            UserMessage(
+                content=[
+                    ToolResultBlock(
+                        tool_use_id="toolu_so",
+                        content="Structured output provided successfully",
+                        is_error=None,
+                    )
+                ]
+            ),
             _success_result(result="Here you go.", structured_output={"answer": 42}),
         ],
     )
@@ -575,12 +598,13 @@ async def test_structured_output_is_added_beside_the_prose_final_text(
 
     events = [event async for event in backend.run(_make_ctx(output_schema=_SCHEMA))]
 
-    texts = [
-        e.message.content["text"]
+    # Exactly a plain turn's items: the CLI's StructuredOutput call and its
+    # result are engine plumbing, never caller-visible tool events.
+    assert [
+        (e.message.kind, e.message.content.get("text"))
         for e in events
-        if isinstance(e, ItemCompleted) and e.message.kind == "text"
-    ]
-    assert texts == ["Here you go."]
+        if isinstance(e, ItemCompleted)
+    ] == [("text", "Here you go.")]
     completed = [e for e in events if isinstance(e, TurnCompleted)]
     assert len(completed) == 1
     assert completed[0].result.end_reason == "end_turn"
@@ -588,35 +612,42 @@ async def test_structured_output_is_added_beside_the_prose_final_text(
     assert completed[0].result.structured_output == {"answer": 42}
 
 
-async def test_clean_finish_without_structured_output_fails_the_turn(
+async def test_clean_finish_without_structured_output_completes_without_a_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The CLI silently disables structured output when it rejects the
-    schema at init, and then ends the turn as an ordinary success. A caller
-    who asked for a schema must not get a "completed" turn with prose where
-    the JSON should be."""
-    _install_fake_sdk_client(monkeypatch, [_success_result(structured_output=None)])
+    """Owner rule (FR-1.3): a schema turn that ends normally without a
+    valid result still COMPLETES -- the text is kept, `structured_output`
+    is None. (The CLI silently disables structured output when it rejects
+    a schema at init, and then ends as an ordinary success.)"""
+    _install_fake_sdk_client(
+        monkeypatch, [_success_result(result="prose only", structured_output=None)]
+    )
     backend = ClaudeBackend(_profile(), NativeStoreConfig())
 
     events = [event async for event in backend.run(_make_ctx(output_schema=_SCHEMA))]
 
-    assert not any(isinstance(e, TurnCompleted) for e in events)
-    failed = [e for e in events if isinstance(e, TurnFailed)]
-    assert len(failed) == 1
-    assert "structured output" in failed[0].error
+    assert not any(isinstance(e, TurnFailed) for e in events)
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert len(completed) == 1
+    assert completed[0].result.end_reason == "end_turn"
+    assert completed[0].result.final_text == "prose only"
+    assert completed[0].result.structured_output is None
 
 
-async def test_structured_output_retry_exhaustion_fails_the_turn(
+async def test_structured_output_retry_exhaustion_completes_without_a_result(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The CLI's own error result when no attempt produced schema-valid output.
+    """The CLI's own `error_max_structured_output_retries` error result (no
+    attempt produced schema-valid output) is the same situation as above:
+    the turn ended without a valid result, so it completes with None and
+    keeps any text -- not a TurnFailed."""
     _install_fake_sdk_client(
         monkeypatch,
         [
             _success_result(
                 subtype="error_max_structured_output_retries",
                 is_error=True,
-                result=None,
+                result="partial prose",
                 terminal_reason="structured_output_retry_exhausted",
                 errors=["Output does not match required schema"],
             )
@@ -626,10 +657,85 @@ async def test_structured_output_retry_exhaustion_fails_the_turn(
 
     events = [event async for event in backend.run(_make_ctx(output_schema=_SCHEMA))]
 
-    assert not any(isinstance(e, TurnCompleted) for e in events)
-    failed = [e for e in events if isinstance(e, TurnFailed)]
-    assert len(failed) == 1
-    assert "does not match required schema" in failed[0].error
+    assert not any(isinstance(e, TurnFailed) for e in events)
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert len(completed) == 1
+    assert completed[0].result.end_reason == "end_turn"
+    assert completed[0].result.final_text == "partial prose"
+    assert completed[0].result.structured_output is None
+
+
+async def test_structured_output_tool_is_auto_allowed_without_consulting_the_broker() -> None:
+    """The CLI's own `StructuredOutput` tool is plumbing, not a caller tool:
+    the broker must never see it and no PermissionRequested may fire."""
+    from claude_agent_sdk import PermissionResultAllow
+
+    from tradewind.adapters.claude_backend import _make_can_use_tool
+
+    pending: list[object] = []
+    flag = [False]
+    can_use_tool = _make_can_use_tool(cast(Any, _NoBroker()), cast(Any, pending), flag)
+
+    result = await can_use_tool("StructuredOutput", {"answer": 1}, cast(Any, None))
+
+    assert isinstance(result, PermissionResultAllow)
+    assert pending == []
+    assert flag == [False]
+
+
+async def test_schema_turn_cap_leaves_room_for_the_structured_output_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`max_tool_rounds=N` must allow N caller-tool rounds on a schema turn
+    exactly as on a plain one. The CLI counts its StructuredOutput call as a
+    turn, and when the model first ends with plain text it adds a reminder
+    and asks once more -- so a schema turn needs `N + 2`, not `N + 1`."""
+    captured = _install_fake_sdk_client(
+        monkeypatch, [_success_result(structured_output={"answer": 1})]
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    [event async for event in backend.run(_make_ctx(output_schema=_SCHEMA, max_tool_rounds=2))]
+    [event async for event in backend.run(_make_ctx(output_schema=_SCHEMA))]
+
+    assert cast(Any, captured[0]).max_turns == 4
+    assert cast(Any, captured[1]).max_turns is None  # uncapped stays uncapped
+
+
+def test_native_transcript_drops_the_structured_output_pair() -> None:
+    """Reconcile must not backfill what the live stream hid: the CLI's
+    StructuredOutput tool_use/tool_result pair never enters the mirror."""
+    from claude_agent_sdk import SessionMessage
+
+    from tradewind.adapters.claude_backend import native_transcript_items
+
+    def entry(entry_type: str, uuid: str, content: object) -> SessionMessage:
+        return SessionMessage(
+            type=cast(Any, entry_type),
+            uuid=uuid,
+            session_id="sess-1",
+            message={"role": entry_type, "content": content},
+        )
+
+    entries = [
+        entry(
+            "assistant",
+            "a-1",
+            [
+                {"type": "text", "text": "Here you go."},
+                {"type": "tool_use", "id": "toolu_so", "name": "StructuredOutput", "input": {}},
+            ],
+        ),
+        entry(
+            "user",
+            "u-1",
+            [{"type": "tool_result", "tool_use_id": "toolu_so", "content": "ok"}],
+        ),
+    ]
+
+    items = native_transcript_items(entries, after_native_id=None)
+
+    assert [(i.kind, i.content.get("text")) for i in items] == [("text", "Here you go.")]
 
 
 async def test_max_tool_rounds_with_output_schema_stays_an_honest_partial(

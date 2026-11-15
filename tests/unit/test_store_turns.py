@@ -146,7 +146,7 @@ def test_finalize_turn_persists_structured_output_as_json(tmp_path: Path) -> Non
     conn = sqlite3.connect(str(tmp_path / "sessions.db"))
     try:
         row = conn.execute(
-            "SELECT final_text, structured_output FROM turns WHERE turn_id = ?", ("turn-1",)
+            "SELECT final_text, structured_output_json FROM turns WHERE turn_id = ?", ("turn-1",)
         ).fetchone()
     finally:
         conn.close()
@@ -165,7 +165,7 @@ def test_finalize_turn_without_structured_output_stores_null(tmp_path: Path) -> 
     conn = sqlite3.connect(str(tmp_path / "sessions.db"))
     try:
         row = conn.execute(
-            "SELECT structured_output FROM turns WHERE turn_id = ?", ("turn-1",)
+            "SELECT structured_output_json FROM turns WHERE turn_id = ?", ("turn-1",)
         ).fetchone()
     finally:
         conn.close()

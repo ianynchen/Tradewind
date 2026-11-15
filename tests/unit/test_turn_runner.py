@@ -2106,7 +2106,7 @@ async def test_structured_output_is_persisted_and_returned_beside_final_text(
     assert result.structured_output == {"answer": 42}
     conn = cast(Any, tw._store)._conn
     row = conn.execute(
-        "SELECT final_text, structured_output FROM turns WHERE session_id = ?", (_VALID_ID,)
+        "SELECT final_text, structured_output_json FROM turns WHERE session_id = ?", (_VALID_ID,)
     ).fetchone()
     assert row == ("Here is the answer.", '{"answer": 42}')
 
@@ -2124,6 +2124,6 @@ async def test_plain_turn_persists_no_structured_output(tmp_path: Path) -> None:
     assert result.structured_output is None
     conn = cast(Any, tw._store)._conn
     row = conn.execute(
-        "SELECT final_text, structured_output FROM turns WHERE session_id = ?", (_VALID_ID,)
+        "SELECT final_text, structured_output_json FROM turns WHERE session_id = ?", (_VALID_ID,)
     ).fetchone()
     assert row == ("hi", None)

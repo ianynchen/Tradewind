@@ -181,7 +181,8 @@ The frozen event taxonomy (`tradewind.domain.events`): `TurnStarted`, `TextDelta
 plain turn, and the schema-shaped result is ADDED as `result.structured_output` (a dict, also
 persisted) — the same field on every backend that supports structured output (codex, claude,
 langchain). `result.final_text` keeps the model's own final text (on codex that final answer is
-itself the JSON).
+itself the JSON). If the model gives no valid result, the turn still completes and
+`structured_output` is `None`.
 
 ### What context the turn sees — `history_scope`
 

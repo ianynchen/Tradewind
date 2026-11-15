@@ -18,15 +18,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   schema). `final_text` keeps the model's own final text — prose on
   `claude`/`langchain`, the JSON final answer on `codex`, which now also
   sets `structured_output`.
-  - `claude` passes the schema as the SDK's native `output_format`.
+  - `claude` passes the schema as the SDK's native `output_format`. The
+    CLI's own `StructuredOutput` tool call is hidden from events and the
+    mirror (live and on reconcile), is auto-allowed without consulting the
+    broker, and does not use up a caller tool round.
   - `langchain` makes ONE extra model call after the tool loop ends
-    (`end_turn`), with `tool_choice` forced to a single schema tool; the
-    call is not a tool round. The result is mirrored as one assistant
-    `kind="text"` item carrying its JSON text.
-  - A clean finish without a structured result is a `TurnFailed` on all
-    three backends; `max_tool_rounds`, `max_tokens` and
-    `broker_terminated` endings keep their `end_reason`, with no result.
-- `turns.structured_output` column (migration
+    (`end_turn`), with `tool_choice` forced to a single schema tool. The
+    call emits nothing and is not a tool round; the tool loop keeps its
+    25-call guard.
+  - A schema turn that ends normally without a valid result still
+    completes, keeping its text, with `structured_output=None` (on claude
+    this includes the CLI's `error_max_structured_output_retries`);
+    `max_tool_rounds`, `max_tokens` and `broker_terminated` endings keep
+    their `end_reason`, with no result.
+- `turns.structured_output_json` column (migration
   `0003_tradewind_turn_structured_output`, applied automatically): the
   result is persisted as JSON beside `final_text`.
   `SessionStorePort.finalize_turn` takes a new optional

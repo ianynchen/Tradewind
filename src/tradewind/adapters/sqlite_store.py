@@ -419,7 +419,7 @@ class SqliteSessionStore(SessionStorePort):
         with self._lock:
             cur = self._conn.execute(
                 "UPDATE turns SET status = ?, final_text = ?, usage_json = ?, cost_usd = ?, "
-                "completed_at = ?, error_json = ?, structured_output = ? WHERE turn_id = ?",
+                "completed_at = ?, error_json = ?, structured_output_json = ? WHERE turn_id = ?",
                 (
                     status,
                     final_text,

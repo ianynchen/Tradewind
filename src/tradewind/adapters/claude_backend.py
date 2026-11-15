@@ -66,16 +66,17 @@ rendered by the SDK as the CLI's `--json-schema`). The CLI adds its own
 reports the result as `ResultMessage.structured_output`; this adapter ADDS
 it as `TurnResult.structured_output` (the field every structured-output
 backend sets), while `final_text` stays the model's prose
-(`ResultMessage.result`) and every assistant message streams and mirrors
-exactly as in a plain turn. The mirror keeps what the native transcript holds
-(the `StructuredOutput` `tool_use`/`tool_result` pair), so reconcile still
-compares like with like. Failure paths: the CLI's own
-`error_max_structured_output_retries` error result fails the turn like any
-error result; a clean finish with NO `structured_output` (the CLI silently
-disables structured output when it rejects a schema at init) also fails the
-turn rather than completing without the result the caller asked for; an honest
-partial (`max_tool_rounds`, `max_tokens`) keeps its `end_reason` and carries
-no structured result.
+(`ResultMessage.result`). Additive means the turn's events and mirror are
+exactly a plain turn's: the CLI's `StructuredOutput` `tool_use`/`tool_result`
+pair is engine plumbing, hidden from the live stream AND from
+`native_transcript_items` (so reconcile never backfills it); the tool is
+auto-allowed without consulting the broker; and it does not cost the caller
+a tool round (`_build_options`'s `max_turns`). A schema turn that ends
+without a valid result -- a clean finish with no `structured_output` (the
+CLI silently disables structured output when it rejects a schema at init),
+or the CLI's own `error_max_structured_output_retries` -- still COMPLETES,
+keeping its text, with `structured_output=None`; an honest partial
+(`max_tool_rounds`, `max_tokens`) keeps its `end_reason`.
 
 `ModelSpec.effort` is not wired to `ClaudeAgentOptions.effort`:
 the task-10 brief's options list does not name it, and GUIDELINES §1.1
@@ -164,6 +165,30 @@ _ABORTED_TERMINAL_REASONS = frozenset({"aborted_streaming", "aborted_tools"})
 # `ctx.broker`/`ToolHost.call()` so both see the same bare tool names the
 # caller declared.
 _MCP_SERVER_NAME = "tradewind"
+
+# The CLI's own structured-output tool (added by `--json-schema`). Built-in
+# tools are disabled (`tools=[]`) and every caller tool arrives prefixed
+# `mcp__tradewind__`, so this bare name can only ever be that tool.
+_STRUCTURED_OUTPUT_TOOL = "StructuredOutput"
+
+
+def _without_structured_output(
+    items: list[NormalizedMessage], hidden_ids: set[str]
+) -> list[NormalizedMessage]:
+    """Drop the CLI's `StructuredOutput` `tool_use` items (recording their
+    ids in `hidden_ids`) and the `tool_result` items answering them: engine
+    plumbing for structured output, never a caller-visible tool event
+    (FR-1.3, module docstring). `hidden_ids` spans messages -- the result
+    arrives in a later message than the call."""
+    kept: list[NormalizedMessage] = []
+    for item in items:
+        if item.kind == "tool_use" and item.content.get("name") == _STRUCTURED_OUTPUT_TOOL:
+            hidden_ids.add(cast(str, item.content.get("id")))
+            continue
+        if item.kind == "tool_result" and item.content.get("tool_use_id") in hidden_ids:
+            continue
+        kept.append(item)
+    return kept
 
 
 def _strip_server_prefix(tool_name: str) -> str:
@@ -289,6 +314,17 @@ def is_max_turns_result(result: ResultMessage) -> bool:
     return result.terminal_reason == "max_turns" or result.subtype == "error_max_turns"
 
 
+def is_structured_output_exhausted_result(result: ResultMessage) -> bool:
+    """Whether `result` is the CLI's own "no attempt produced schema-valid
+    structured output" error result. The CLI flags it as an error, but the
+    turn simply ended without a valid result -- FR-1.3 completes it with
+    `structured_output=None`, keeping its text, rather than failing it."""
+    return (
+        result.subtype == "error_max_structured_output_retries"
+        or result.terminal_reason == "structured_output_retry_exhausted"
+    )
+
+
 def _end_reason(result: ResultMessage) -> EndReason:
     if is_max_turns_result(result):
         return "max_tool_rounds"
@@ -389,6 +425,7 @@ def native_transcript_items(
         if index is not None:
             entries = entries[index + 1 :]
     items: list[NormalizedMessage] = []
+    hidden_ids: set[str] = set()
     for entry in entries:
         message = entry.message if isinstance(entry.message, dict) else {}
         content = message.get("content")
@@ -409,7 +446,9 @@ def native_transcript_items(
         # independently testable.
         for item in entry_items:
             item.native_id = entry.uuid
-        items.extend(entry_items)
+        # The live stream hides the CLI's StructuredOutput pair, so the
+        # transcript read must too -- else reconcile would backfill it.
+        items.extend(_without_structured_output(entry_items, hidden_ids))
     return items
 
 
@@ -508,6 +547,10 @@ def _make_can_use_tool(
     async def can_use_tool(
         tool_name: str, tool_input: dict[str, Any], _context: ToolPermissionContext
     ) -> PermissionResult:
+        if tool_name == _STRUCTURED_OUTPUT_TOOL:
+            # FR-1.3: the CLI's own structured-output tool is plumbing, not
+            # a caller tool -- the broker never sees it.
+            return PermissionResultAllow()
         bare_name = _strip_server_prefix(tool_name)
         input_dict = cast("dict[str, object]", tool_input)
         decision = await broker.decide(bare_name, input_dict)
@@ -670,8 +713,15 @@ class ClaudeBackend(Backend):
             # assistant responses (each round's response plus the final
             # one), so a cap of N tool rounds is `max_turns = N + 1`.
             # None (uncapped) stays None -- the CLI applies no cap of its
-            # own.
-            max_turns=None if ctx.max_tool_rounds is None else ctx.max_tool_rounds + 1,
+            # own. A schema turn adds ONE more (FR-1.3): the CLI counts its
+            # StructuredOutput call as a turn, and when the model first ends
+            # with plain text it appends a reminder and asks again -- so N
+            # caller rounds need at most N + 2 responses there.
+            max_turns=(
+                None
+                if ctx.max_tool_rounds is None
+                else ctx.max_tool_rounds + (2 if ctx.output_schema is not None else 1)
+            ),
             resume=ctx.session.native_session_id,
             output_format=(
                 {"type": "json_schema", "schema": ctx.output_schema}
@@ -765,15 +815,20 @@ class ClaudeBackend(Backend):
                     )
                 )
                 await anyio.sleep(delay)
+        # The CLI's StructuredOutput pair (FR-1.3) is hidden from the stream;
+        # its ids carry from the call's message to the result's.
+        hidden_ids: set[str] = set()
         async for message in client.receive_response():
             for event in pending_events:
                 yield event
             pending_events.clear()
             if isinstance(message, AssistantMessage):
-                for item in assistant_message_items(message):
+                for item in _without_structured_output(
+                    assistant_message_items(message), hidden_ids
+                ):
                     yield ItemCompleted(message=item)
             elif isinstance(message, UserMessage):
-                for item in user_message_items(message):
+                for item in _without_structured_output(user_message_items(message), hidden_ids):
                     yield ItemCompleted(message=item)
             elif isinstance(message, ResultMessage):
                 self._native_ids[ctx.session.session_id] = message.session_id
@@ -800,7 +855,11 @@ class ClaudeBackend(Backend):
                     # itself once this generator ends with no terminal
                     # event.
                     return
-                if message.is_error and not is_max_turns_result(message):
+                if (
+                    message.is_error
+                    and not is_max_turns_result(message)
+                    and not is_structured_output_exhausted_result(message)
+                ):
                     # `is_max_turns_result` is excluded from the failure
                     # path: the CLI flags its own `max_turns` stop as an
                     # error, but that cap only exists because the caller
@@ -809,23 +868,12 @@ class ClaudeBackend(Backend):
                     yield TurnFailed(turn_id=ctx.turn_id, error=_result_error(message))
                     return
                 result = turn_result_from_result_message(message, ctx.turn_id)
-                if ctx.output_schema is not None:
-                    if isinstance(message.structured_output, dict):
-                        # FR-1.3, additive: `final_text` stays the model's
-                        # prose (`ResultMessage.result`); the result is
-                        # ADDED beside it.
-                        result.structured_output = cast(
-                            "dict[str, object]", message.structured_output
-                        )
-                    elif result.end_reason == "end_turn":
-                        yield TurnFailed(
-                            turn_id=ctx.turn_id,
-                            error=(
-                                "claude turn ended without structured output although "
-                                "output_schema was set (the CLI may have rejected the schema)"
-                            ),
-                        )
-                        return
+                if ctx.output_schema is not None and isinstance(message.structured_output, dict):
+                    # FR-1.3, additive: `final_text` stays the model's prose
+                    # (`ResultMessage.result`); the result is ADDED beside
+                    # it. No valid result leaves it None -- still a
+                    # completion, text kept (module docstring).
+                    result.structured_output = cast("dict[str, object]", message.structured_output)
                 yield TurnCompleted(result=result)
                 return
         for event in pending_events:

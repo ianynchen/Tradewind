@@ -543,8 +543,8 @@ def _final_text_from_items(agent_messages: list[AgentMessageThreadItem]) -> str 
 def _structured_output_from_text(text: str | None) -> dict[str, object] | None:
     """FR-1.3: a schema turn's structured result, parsed from the engine's
     final answer (which, under `output_schema`, IS the JSON text), or None
-    when that answer is absent or not a JSON object -- the caller then
-    fails the turn rather than complete it without a result."""
+    when that answer is absent or not a JSON object -- the turn then still
+    completes, with no result."""
     if text is None:
         return None
     try:
@@ -1357,17 +1357,9 @@ class CodexBackend(Backend):
                     structured_output: dict[str, object] | None = None
                     if has_output_schema:
                         # FR-1.3: `final_text` stays the engine's final
-                        # answer as before; the parsed result is ADDED.
+                        # answer as before; the parsed result is ADDED. No
+                        # valid result leaves it None -- still a completion.
                         structured_output = _structured_output_from_text(final_text)
-                        if structured_output is None:
-                            yield TurnFailed(
-                                turn_id=turn_id,
-                                error=(
-                                    "codex turn ended without structured output although "
-                                    "output_schema was set (final answer is not a JSON object)"
-                                ),
-                            )
-                            return
                     yield TurnCompleted(
                         result=TurnResult(
                             turn_id=turn_id,

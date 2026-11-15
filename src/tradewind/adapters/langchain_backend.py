@@ -34,20 +34,18 @@ Structured output (FR-1.3; component spec "Structured output" decision
 row, "force once at the end"): the tool loop runs exactly as without a
 schema. When the model ends its turn without tool calls (`end_turn`), ONE
 more model call is made with `tool_choice` forced to a single schema tool
-built from `ctx.output_schema`; its arguments become
-`TurnResult.structured_output`, ADDED beside `final_text` (which keeps the
-model's natural final text). The result is mirrored as one assistant
-`kind="text"` item carrying its JSON text, not as the forced `tool_use`: that
-call has no `tool_result`, and a later turn's rebuild would replay the
-broken pair (and, with no tools bound, a `tool_use` block the request
-cannot define).
+built from `ctx.output_schema`; its arguments become ONLY
+`TurnResult.structured_output`. That call emits nothing -- no delta, no
+item, no mirrored `tool_use` -- so a schema turn's events and mirror are
+exactly a plain turn's, and `final_text` keeps the model's natural final
+text. A forced call that does not call the schema tool leaves the result
+None; the turn still completes.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 from collections.abc import AsyncIterator, Callable
 from typing import ClassVar, cast
 
@@ -575,14 +573,27 @@ class LangchainBackend(Backend):
             model = bound_model
 
             overflow_recovered = False
-            # The forced call is one model call beyond the tool loop's own
-            # runaway budget, never a tool round.
-            for _ in range(_MAX_ITERATIONS + (1 if ctx.output_schema is not None else 0)):
+            # The tool loop keeps its `_MAX_ITERATIONS` runaway guard; only
+            # the forced call (FR-1.3) may use the one extra slot -- it is
+            # never a tool round.
+            for iteration in range(_MAX_ITERATIONS + 1):
+                if iteration == _MAX_ITERATIONS and not forced_call:
+                    yield TurnFailed(
+                        turn_id=ctx.turn_id,
+                        error=(
+                            f"max iterations ({_MAX_ITERATIONS}) reached without a final response"
+                        ),
+                    )
+                    return
                 retries_used = 0
                 while True:
                     try:
                         gathered: AIMessageChunk | None = None
                         async for chunk in model.astream([*base_messages, *turn_suffix]):
+                            if forced_call:
+                                # The forced call emits nothing (FR-1.3).
+                                gathered = chunk if gathered is None else gathered + chunk
+                                continue
                             for block in chunk.content_blocks:
                                 delta = _delta_event(block)
                                 if delta is not None:
@@ -651,36 +662,15 @@ class LangchainBackend(Backend):
                 _accumulate_usage(usage_totals, gathered.usage_metadata)
 
                 if forced_call:
-                    # Everything the forced response holds is kept, except
-                    # its schema `tool_use` (no `tool_result` follows it --
-                    # module docstring); the result itself is added below.
-                    for item in _completed_items(gathered):
-                        if item.kind != "tool_use" or item.content["name"] != (
-                            _STRUCTURED_OUTPUT_TOOL
-                        ):
-                            yield ItemCompleted(message=item)
+                    # The forced call ends the turn and emits nothing; its
+                    # arguments are the result, or None when the model did
+                    # not call the schema tool (still a completion).
                     if _stop_reason(gathered) == "max_tokens":
                         # Truncated arguments are no result: an honest
                         # `max_tokens` partial, `final_text` unchanged.
                         end_reason = "max_tokens"
                         break
                     structured_output = _forced_result(gathered)
-                    if structured_output is None:
-                        yield TurnFailed(
-                            turn_id=ctx.turn_id,
-                            error=(
-                                "structured output: the forced final call returned no "
-                                f"{_STRUCTURED_OUTPUT_TOOL} tool call"
-                            ),
-                        )
-                        return
-                    yield ItemCompleted(
-                        message=NormalizedMessage(
-                            role="assistant",
-                            kind="text",
-                            content={"text": json.dumps(structured_output)},
-                        )
-                    )
                     break
 
                 turn_suffix.append(gathered)
@@ -778,12 +768,6 @@ class LangchainBackend(Backend):
                     final_text = _final_text(gathered)
                     end_reason = "broker_terminated"
                     break
-            else:
-                yield TurnFailed(
-                    turn_id=ctx.turn_id,
-                    error=f"max iterations ({_MAX_ITERATIONS}) reached without a final response",
-                )
-                return
 
             yield TurnCompleted(
                 result=TurnResult(

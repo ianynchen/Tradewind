@@ -831,9 +831,12 @@ async def test_plain_turn_has_no_structured_output_even_when_text_looks_like_jso
     assert completed[0].result.structured_output is None
 
 
-async def test_schema_turn_whose_final_answer_is_not_a_json_object_fails() -> None:
-    """A clean finish without a structured result is a failure (FR-1.3),
-    never a completion the caller would have to re-validate."""
+async def test_schema_turn_whose_final_answer_is_not_a_json_object_completes_without_a_result() -> (
+    None
+):
+    """Owner rule (FR-1.3): a schema turn that ends normally without a
+    valid result still COMPLETES -- the text is kept, `structured_output`
+    is None."""
     from tradewind.domain.events import TurnCompleted, TurnFailed
 
     backend = CodexBackend(_profile(), NativeStoreConfig())
@@ -848,7 +851,9 @@ async def test_schema_turn_whose_final_answer_is_not_a_json_object_fails() -> No
         )
     ]
 
-    assert not any(isinstance(e, TurnCompleted) for e in events)
-    failed = [e for e in events if isinstance(e, TurnFailed)]
-    assert len(failed) == 1
-    assert "structured output" in failed[0].error
+    assert not any(isinstance(e, TurnFailed) for e in events)
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert len(completed) == 1
+    assert completed[0].result.end_reason == "end_turn"
+    assert completed[0].result.final_text == "sorry, no JSON today"
+    assert completed[0].result.structured_output is None
