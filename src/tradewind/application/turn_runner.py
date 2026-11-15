@@ -298,6 +298,30 @@ def _effective_seconds(
 # FR-6.6 wall-clock deadline, kept unchanged for it.
 _UNSUPERVISED_HARD_CAP_S = 600.0
 
+# How long the turn waits for the interrupt a fired limit sent (05 §3.4:
+# the 15 s grace for an engine interrupt). A limit often fires because the
+# engine hangs, and its interrupt() can hang too; past the grace the turn
+# ends anyway. Module-level so tests can shorten it.
+_INTERRUPT_GRACE_S = 15.0
+
+
+async def _await_interrupt(interrupt_task: asyncio.Future[None], session_id: str) -> None:
+    """Wait up to `_INTERRUPT_GRACE_S` for a fired limit's interrupt.
+
+    Failure modes:
+        Whatever `interrupt()` raised, re-raised here. Past the grace the
+        task is cancelled, a WARNING is logged and this returns normally.
+    """
+    done, _ = await asyncio.wait({interrupt_task}, timeout=_INTERRUPT_GRACE_S)
+    if not done:
+        _logger.warning(
+            "interrupt after a fired limit did not finish within the grace; turn ends anyway",
+            extra={"session_id": session_id, "grace_s": _INTERRUPT_GRACE_S},
+        )
+        interrupt_task.cancel()
+        return
+    interrupt_task.result()
+
 
 def _effective_limits(
     model_silence_s: float,
@@ -802,7 +826,7 @@ class TurnRunner:
                     with contextlib.suppress(asyncio.CancelledError):
                         await supervisor_task
                     if interrupt_task is not None:
-                        await interrupt_task
+                        await _await_interrupt(interrupt_task, session_id)
 
                 # `aclosing` (not a bare `async for`) so that if THIS
                 # generator (`execute()`) is itself abandoned/aclosed mid-turn
@@ -955,14 +979,14 @@ class TurnRunner:
                 with contextlib.suppress(asyncio.CancelledError), anyio.CancelScope(shield=True):
                     await supervisor_task
             if interrupt_task is not None and not interrupt_task.done():
-                # An abnormal end (a raising backend, an abandoned stream)
-                # while a limit's interrupt still runs: let it finish
-                # before the turn is finalized. Its error is logged, not
-                # raised, so it does not replace the error already in
-                # flight.
+                # An abnormal end (a raising backend, an abandoned stream, a
+                # caller cancel) while a limit's interrupt still runs: let
+                # it finish, within the grace, before the turn is
+                # finalized. Its error is logged, not raised, so it does
+                # not replace the error already in flight.
                 with anyio.CancelScope(shield=True):
                     try:
-                        await interrupt_task
+                        await _await_interrupt(interrupt_task, session_id)
                     except Exception:
                         _logger.exception(
                             "interrupt after a fired limit raised", extra={"turn_id": turn_id}

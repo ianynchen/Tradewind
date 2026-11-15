@@ -2242,6 +2242,71 @@ async def test_error_from_a_slow_interrupt_surfaces_in_the_turn(tmp_path: Path) 
     assert seen == [True]
 
 
+class _HungInterruptBackend(_ScriptedBackend):
+    """A hung engine: once a fired limit's `interrupt()` starts, it never
+    returns. With `ends_stream`, the stream itself then ends with no
+    terminal; otherwise the stream hangs too."""
+
+    def __init__(
+        self, profile: Profile, native_config: NativeStoreConfig, *, ends_stream: bool
+    ) -> None:
+        super().__init__(profile, native_config, [])
+        self._ends_stream = ends_stream
+        self.interrupt_started = asyncio.Event()
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        yield TurnStarted(turn_id=ctx.turn_id)
+        await self.interrupt_started.wait()
+        if not self._ends_stream:
+            await asyncio.Event().wait()
+
+    async def interrupt(self, session_id: str) -> None:  # noqa: ARG002 -- Backend interface
+        self.interrupt_started.set()
+        await asyncio.Event().wait()
+
+
+async def test_hung_interrupt_cannot_keep_the_turn_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_turn_runner, "_INTERRUPT_GRACE_S", 0.05)
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _HungInterruptBackend(profile, NativeStoreConfig(), ends_stream=True)
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    with anyio.fail_after(5):
+        result = await session.run("hi", request_timeout_s=0.01)
+
+    assert (result.status, result.end_reason) == ("interrupted", "timeout")
+    assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == ["interrupted"]
+    assert _VALID_ID not in tw._turn_runner._busy
+
+
+async def test_hung_interrupt_cannot_block_a_caller_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_turn_runner, "_INTERRUPT_GRACE_S", 0.05)
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _HungInterruptBackend(profile, NativeStoreConfig(), ends_stream=False)
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    turn = asyncio.ensure_future(session.run("hi", request_timeout_s=0.01))
+    await fake.interrupt_started.wait()
+    turn.cancel()
+
+    with anyio.fail_after(5):
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+    # Finalized (not left in_progress) and the session is free again.
+    statuses = await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID)
+    assert statuses != ["in_progress"]
+    assert len(statuses) == 1
+    assert _VALID_ID not in tw._turn_runner._busy
+
+
 @pytest.mark.parametrize("supervised", [True, False])
 @pytest.mark.parametrize("terminal_after_interrupt", [True, False])
 async def test_timeout_notice_before_terminal_on_every_backend(
