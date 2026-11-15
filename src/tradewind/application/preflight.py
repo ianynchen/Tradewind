@@ -16,6 +16,7 @@ from dataclasses import dataclass
 
 from tradewind.application.ports import TurnContext
 from tradewind.domain.errors import ConfigError
+from tradewind.domain.models import OnPreflight
 
 _logger = logging.getLogger(__name__)
 
@@ -52,21 +53,19 @@ class Stop:
 
 
 Check = Callable[[TurnContext], Awaitable[Ok | Ask | Stop]]
-OnPreflight = Callable[[str, dict[str, object], list[str]], Awaitable[str]]
 
 
 async def run_checks(
     ctx: TurnContext,
     checks: Sequence[tuple[str, Check]],
-    ask: OnPreflight | None,
 ) -> None:
     """Run `checks` in order and store each `Ask` answer in
     `ctx.preflight[check_id]`.
 
     Args:
-        ctx: the turn; only `ctx.preflight` is written.
+        ctx: the turn; `ctx.on_preflight` (the caller's callback, or None)
+            is asked and only `ctx.preflight` is written.
         checks: `(check_id, check)` pairs, run one at a time in order.
-        ask: the caller's `on_preflight` callback, or None.
 
     Failure modes:
         ConfigError: a check returned `Stop`; later checks do not run.
@@ -79,7 +78,7 @@ async def run_checks(
         if isinstance(result, Stop):
             raise ConfigError(result.reason)
         if isinstance(result, Ask):
-            ctx.preflight[check_id] = await _answer(check_id, result, ask)
+            ctx.preflight[check_id] = await _answer(check_id, result, ctx.on_preflight)
 
 
 async def _answer(check_id: str, question: Ask, ask: OnPreflight | None) -> str:

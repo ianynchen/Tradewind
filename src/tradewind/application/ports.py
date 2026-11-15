@@ -16,6 +16,7 @@ from tradewind.domain.models import (
     Capabilities,
     ModelSpec,
     NormalizedMessage,
+    OnPreflight,
     PermissionBroker,
     Profile,
     SessionRow,
@@ -363,6 +364,9 @@ class TurnContext:
     work: WorkSupervisor | None = None
     timeout_reason: dict[str, object] | None = None
     preflight: dict[str, str] = field(default_factory=dict)
+    # The caller's live `SessionOptions.on_preflight` (05 §4), which
+    # `run_checks` asks; None means every question gets its default.
+    on_preflight: OnPreflight | None = None
 
 
 class Backend(ABC):

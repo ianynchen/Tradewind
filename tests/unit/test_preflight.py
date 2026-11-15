@@ -10,17 +10,17 @@ import pytest
 from tradewind.application.ports import TurnContext
 from tradewind.application.preflight import Ask, Check, Ok, Stop, run_checks
 from tradewind.domain.errors import ConfigError
-from tradewind.domain.models import SessionOptions
+from tradewind.domain.models import OnPreflight, SessionOptions
 
 
-def _ctx() -> TurnContext:
-    """`run_checks` reads and writes only `ctx.preflight`."""
+def _ctx(on_preflight: OnPreflight | None = None) -> TurnContext:
+    """`run_checks` reads only `ctx.on_preflight` and writes only
+    `ctx.preflight`."""
 
     class _Ctx:
-        preflight: dict[str, str]
-
         def __init__(self) -> None:
-            self.preflight = {}
+            self.preflight: dict[str, str] = {}
+            self.on_preflight = on_preflight
 
     return cast(TurnContext, _Ctx())
 
@@ -43,7 +43,7 @@ async def _ok(_ctx: TurnContext) -> Ok | Ask | Stop:
 
 async def test_ask_without_callback_uses_default() -> None:
     ctx = _ctx()
-    await run_checks(ctx, [("ok", _ok), ("stale", _ask())], None)
+    await run_checks(ctx, [("ok", _ok), ("stale", _ask())])
     assert ctx.preflight == {"stale": "keep"}
 
 
@@ -54,8 +54,8 @@ async def test_ask_answer_from_callback_is_stored() -> None:
         seen.append((question, details, choices))
         return "delete"
 
-    ctx = _ctx()
-    await run_checks(ctx, [("stale", _ask())], ask)
+    ctx = _ctx(ask)
+    await run_checks(ctx, [("stale", _ask())])
     assert ctx.preflight == {"stale": "delete"}
     assert seen == [("Delete stale files?", {"count": 2}, ["keep", "delete"])]
 
@@ -64,8 +64,8 @@ async def test_callback_error_uses_default() -> None:
     async def ask(_q: str, _d: dict[str, object], _c: list[str]) -> str:
         raise RuntimeError("boom")
 
-    ctx = _ctx()
-    await run_checks(ctx, [("stale", _ask())], ask)
+    ctx = _ctx(ask)
+    await run_checks(ctx, [("stale", _ask())])
     assert ctx.preflight == {"stale": "keep"}
 
 
@@ -73,8 +73,8 @@ async def test_answer_not_in_choices_uses_default() -> None:
     async def ask(_q: str, _d: dict[str, object], _c: list[str]) -> str:
         return "shred"
 
-    ctx = _ctx()
-    await run_checks(ctx, [("stale", _ask())], ask)
+    ctx = _ctx(ask)
+    await run_checks(ctx, [("stale", _ask())])
     assert ctx.preflight == {"stale": "keep"}
 
 
@@ -89,7 +89,7 @@ async def test_stop_raises_config_error() -> None:
         return Ok()
 
     with pytest.raises(ConfigError, match="workspace is locked"):
-        await run_checks(_ctx(), [("lock", stop), ("later", later)], None)
+        await run_checks(_ctx(), [("lock", stop), ("later", later)])
     assert ran == []
 
 

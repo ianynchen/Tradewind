@@ -782,6 +782,7 @@ class TurnRunner:
                     output_schema=_effective_output_schema(snapshot, overrides),
                     tools=tool_host,
                     broker=broker,
+                    on_preflight=options.on_preflight,
                     load_history=load_history,
                     load_replay_history=load_replay_history,
                     force_replay=forced_replay,

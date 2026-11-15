@@ -256,6 +256,11 @@ class PermissionBroker(Protocol):
         ...
 
 
+# The caller's answer to a preflight question (05-turn-governance §4):
+# `(question, details, choices) -> one of choices`.
+OnPreflight = Callable[[str, dict[str, object], list[str]], Awaitable[str]]
+
+
 _REDACTED_SECRET = "ref:missing"
 
 
@@ -297,7 +302,7 @@ class SessionOptions(BaseModel):
     tier: TierName | None = None
     output_schema: dict[str, Any] | None = None
     permission_broker: PermissionBroker | None = None
-    on_preflight: Callable[[str, dict[str, object], list[str]], Awaitable[str]] | None = None
+    on_preflight: OnPreflight | None = None
     cwd: Path | None = None
     permission_mode: Mode | None = None
     policy_rules: list[Rule] = []

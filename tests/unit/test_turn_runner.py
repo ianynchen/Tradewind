@@ -51,6 +51,7 @@ from tradewind.application.config import (
 )
 from tradewind.application.policy_gate import PolicyGate
 from tradewind.application.ports import Backend, TurnContext
+from tradewind.application.preflight import Ask, Ok, Stop, run_checks
 from tradewind.application.supervisor import WorkSupervisor
 from tradewind.application.turn_runner import (
     _emulate_system_prompt,
@@ -2841,3 +2842,45 @@ async def test_prepare_turn_time_not_counted_by_supervisor(tmp_path: Path) -> No
     assert not any(_is_timeout_notice(e) for e in events)
     assert isinstance(events[-1], TurnCompleted)
     assert events[-1].result.status == "completed"
+
+
+class _AskingBackend(_PreparingBackend):
+    """Runs one preflight `Ask` in `prepare_turn` and records `ctx`."""
+
+    def __init__(self, profile: Profile, native_config: NativeStoreConfig) -> None:
+        super().__init__(profile, native_config)
+        self.contexts: list[TurnContext] = []
+
+    async def prepare_turn(self, ctx: TurnContext) -> None:
+        self.contexts.append(ctx)
+
+        async def stale(_ctx: TurnContext) -> Ok | Ask | Stop:
+            return Ask(
+                question="Delete stale files?",
+                details={},
+                choices=["keep", "delete"],
+                default_choice="keep",
+            )
+
+        await run_checks(ctx, [("stale", stale)])
+
+
+async def test_prepare_turn_receives_the_callers_on_preflight(tmp_path: Path) -> None:
+    asked: list[str] = []
+
+    async def on_preflight(question: str, _d: dict[str, object], _c: list[str]) -> str:
+        asked.append(question)
+        return "delete"
+
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _AskingBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions(on_preflight=on_preflight))
+
+    result = await session.run("hi")
+
+    assert result.status == "completed"
+    assert fake.contexts[0].on_preflight is on_preflight
+    assert asked == ["Delete stale files?"]
+    assert fake.contexts[0].preflight == {"stale": "delete"}
