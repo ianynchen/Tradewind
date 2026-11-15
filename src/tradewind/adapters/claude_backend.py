@@ -138,6 +138,7 @@ from tradewind.application.ports import Backend, TurnContext
 from tradewind.application.supervisor import WorkSupervisor
 from tradewind.application.tool_host import ToolHost
 from tradewind.domain.compaction import compose_replay_prompt
+from tradewind.domain.errors import Unsupported
 from tradewind.domain.events import (
     Event,
     ItemCompleted,
@@ -886,6 +887,11 @@ class ClaudeBackend(Backend):
             # 05 §3/§7: tool, task and stream signals reach `ctx.work`, so
             # the inactivity limits apply and there is no default hard cap.
             supports_work_supervisor=True,
+            # The SDK's auto mode bypasses `can_use_tool` (RUNBOOK, task-8
+            # finding), so `run()` refuses engine_auto; caller tools go
+            # through `can_use_tool` and the gate.
+            supports_engine_auto=False,
+            supports_action_policy=True,
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -964,9 +970,9 @@ class ClaudeBackend(Backend):
             else None
         )
         policy = ctx.policy if ctx.policy is not None else _direct_policy(ctx, pending_events)
-        # `permission_mode` is never set, also under engine_auto: the SDK's
-        # `auto` mode lets a model classifier approve tool calls without
-        # `can_use_tool` (`ClaudeAgentOptions.can_use_tool` docstring: not
+        # `permission_mode` is never set (and `run()` refuses engine_auto):
+        # the SDK's `auto` mode lets a model classifier approve tool calls
+        # without `can_use_tool` (`ClaudeAgentOptions.can_use_tool` docstring: not
         # invoked for calls "already permitted by ... permission_mode";
         # `ClaudeSDKClient.set_permission_mode`: "'auto': A model classifier
         # approves or denies each tool call"), which would bypass the gate
@@ -1014,6 +1020,12 @@ class ClaudeBackend(Backend):
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        if ctx.session.options_snapshot.get("permission_mode") == "engine_auto":
+            # Raised before `TurnStarted` (`supports_engine_auto=False`).
+            raise Unsupported(
+                'permission_mode="engine_auto" is not supported on the claude backend: '
+                "the SDK's auto mode approves tool calls without can_use_tool"
+            )
         async for event in self._run_turn(ctx):
             yield event
 

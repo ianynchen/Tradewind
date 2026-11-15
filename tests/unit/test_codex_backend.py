@@ -435,6 +435,9 @@ def test_capabilities_match_the_brief() -> None:
     assert caps.supports_tool_round_cap is False
     # 05 §3/§7: item, delta and turn signals reach `ctx.work`.
     assert caps.supports_work_supervisor is True
+    # 05 §2.5: Codex's own auto-reviewer; approval requests reach the gate.
+    assert caps.supports_engine_auto is True
+    assert caps.supports_action_policy is True
 
 
 # --- probe_native: cheap id-truthiness check ---------------------------

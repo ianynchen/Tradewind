@@ -21,6 +21,7 @@ from tradewind.adapters.claude_backend import ClaudeBackend
 from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import TurnContext
 from tradewind.application.tool_host import ToolHost
+from tradewind.domain.errors import Unsupported
 from tradewind.domain.events import ItemCompleted, PermissionRequested, TurnCompleted, TurnFailed
 from tradewind.domain.models import (
     ModelSpec,
@@ -1723,18 +1724,36 @@ async def test_plain_turn_events_identical_with_partial_messages(
     assert work.open_items() == []
 
 
-async def test_engine_auto_keeps_the_sdk_default_permission_mode(
+async def test_engine_auto_raises_unsupported_before_turn_started(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Task-8 finding (RUNBOOK): the SDK's `auto` mode lets a model
     classifier approve tool calls without `can_use_tool` (types.py
     `can_use_tool` docstring; client.py `set_permission_mode`), which would
-    bypass the policy gate. So engine_auto never sets an SDK mode on
-    Claude: built-ins stay off, every caller tool still reaches
-    `can_use_tool`, and only the gate's mode default changes."""
+    bypass the policy gate. So Claude declares `supports_engine_auto=False`
+    and refuses engine_auto instead of ignoring it."""
     captured = _install_fake_sdk_client(monkeypatch, [_success_result()])
     ctx = _make_ctx(output_schema=None)
     ctx.session.options_snapshot["permission_mode"] = "engine_auto"
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events: list[object] = []
+    with pytest.raises(Unsupported, match="engine_auto"):
+        async for event in backend.run(ctx):
+            events.append(event)
+
+    assert events == []
+    assert captured == []
+
+
+async def test_broker_mode_keeps_the_sdk_default_permission_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The adapter never sets an SDK permission mode: built-ins stay off
+    and every caller tool reaches `can_use_tool`."""
+    captured = _install_fake_sdk_client(monkeypatch, [_success_result()])
+    ctx = _make_ctx(output_schema=None)
+    ctx.session.options_snapshot["permission_mode"] = "broker"
     backend = ClaudeBackend(_profile(), NativeStoreConfig())
 
     [event async for event in backend.run(ctx)]
@@ -1743,7 +1762,14 @@ async def test_engine_auto_keeps_the_sdk_default_permission_mode(
     assert options.permission_mode is None
     assert options.tools == []
     assert options.can_use_tool is not None
-    assert backend.capabilities().supports_work_supervisor is True
+
+
+def test_capabilities_declare_governance_support() -> None:
+    caps = ClaudeBackend(_profile(), NativeStoreConfig()).capabilities()
+
+    assert caps.supports_engine_auto is False
+    assert caps.supports_work_supervisor is True
+    assert caps.supports_action_policy is True
 
 
 async def test_slash_prompt_reaches_the_engine_as_a_message(

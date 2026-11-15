@@ -1369,6 +1369,10 @@ class CodexBackend(Backend):
             # 05 §3/§7: item, delta and turn signals reach `ctx.work`, so the
             # inactivity limits apply and there is no default hard cap.
             supports_work_supervisor=True,
+            # 05 §2.5: Codex's own auto-reviewer; approval requests that
+            # still reach the client, and the shim, go through the gate.
+            supports_engine_auto=True,
+            supports_action_policy=True,
         )
 
     async def probe_native(self, session: SessionRow) -> bool:

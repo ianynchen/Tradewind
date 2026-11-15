@@ -505,6 +505,10 @@ class LangchainBackend(Backend):
             # 05 §3/§7: stream chunks, tool execution and the final response
             # reach `ctx.work`.
             supports_work_supervisor=True,
+            # 05 §2.5: no engine of its own (`_reject_engine_auto`); its own
+            # loop gates every call.
+            supports_engine_auto=False,
+            supports_action_policy=True,
         )
 
     async def probe_native(

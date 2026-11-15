@@ -338,6 +338,10 @@ def test_capabilities_match_spec_table() -> None:
     assert caps.supports_native_resume is False
     assert caps.supports_fork is False
     assert caps.supports_transcript_read is False
+    # 05 §2.5: no engine of its own to auto-approve; its loop is the gate.
+    assert caps.supports_engine_auto is False
+    assert caps.supports_work_supervisor is True
+    assert caps.supports_action_policy is True
 
 
 async def test_probe_native_always_false() -> None:

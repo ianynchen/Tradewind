@@ -475,6 +475,11 @@ class CursorBackend(Backend):
             # FR-4.4: no interception at all (see supports_interactive_
             # permissions above) -- nothing to carry a reason on.
             supports_deny_reason=False,
+            # 05 §2.7: no interception and no work signals; `run()` raises
+            # `Unsupported` when `policy_rules` or `permission_mode` is set.
+            supports_engine_auto=False,
+            supports_work_supervisor=False,
+            supports_action_policy=False,
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -521,6 +526,14 @@ class CursorBackend(Backend):
             # Same capability-mismatch handling (`supports_tool_round_cap`
             # is False -- see `capabilities()`).
             raise Unsupported("max_tool_rounds is not enforceable on the cursor backend")
+        snapshot = ctx.session.options_snapshot
+        if snapshot.get("permission_mode") is not None or snapshot.get("policy_rules"):
+            # Same capability-mismatch handling (`supports_action_policy` is
+            # False, 05 §2.7).
+            raise Unsupported(
+                "policy_rules and permission_mode are not supported on the cursor backend: "
+                "it cannot intercept tool calls"
+            )
         async for event in self._run_turn(ctx):
             yield event
 

@@ -103,6 +103,39 @@ def test_capabilities_match_the_brief() -> None:
     # round/turn cap (`AgentOptions` has none) -- the flag must say so
     # honestly rather than advertise a cap this adapter could only fake.
     assert caps.supports_tool_round_cap is False
+    # 05 §2.7: Cursor cannot intercept tool calls or report work.
+    assert caps.supports_engine_auto is False
+    assert caps.supports_work_supervisor is False
+    assert caps.supports_action_policy is False
+
+
+# --- run(): action-policy capability guard (05 §2.7) ---------------------
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        {"permission_mode": "broker", "policy_rules": []},
+        {"permission_mode": "engine_auto", "policy_rules": []},
+        {
+            "permission_mode": None,
+            "policy_rules": [{"id": "r", "kind": "shell", "where": {}, "outcome": "deny"}],
+        },
+    ],
+)
+async def test_run_with_policy_settings_raises_unsupported_before_turn_started(
+    snapshot: dict[str, object],
+) -> None:
+    backend = CursorBackend(_profile(), NativeStoreConfig())
+    ctx = _make_ctx(output_schema=None)
+    ctx.session.options_snapshot = snapshot
+
+    events: list[object] = []
+    with pytest.raises(Unsupported, match="cannot intercept"):
+        async for event in backend.run(ctx):
+            events.append(event)
+
+    assert events == []
 
 
 # --- run(): output_schema capability guard (mirrors supports_structured_

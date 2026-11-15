@@ -101,6 +101,16 @@ class Capabilities(BaseModel):
     # `ctx.work` (05-turn-governance §3). False (the default, and Cursor)
     # means no silence limits apply and the hard cap defaults to 600 s.
     supports_work_supervisor: bool = False
+    # Whether `permission_mode="engine_auto"` (05 §2.5) is honest here: the
+    # engine has its own auto review and approval requests that still reach
+    # the client go through the policy gate. False raises `Unsupported`
+    # (LangChain has no engine; Claude's SDK auto mode bypasses
+    # `can_use_tool` -- RUNBOOK; Cursor cannot intercept).
+    supports_engine_auto: bool = False
+    # Whether the adapter puts the engine's actions through `ctx.policy`
+    # (05 §2). False (Cursor, 05 §2.7) raises `Unsupported` when
+    # `policy_rules` or `permission_mode` is set.
+    supports_action_policy: bool = False
 
 
 class ModelCostTier(BaseModel):
