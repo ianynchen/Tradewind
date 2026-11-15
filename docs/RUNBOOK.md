@@ -179,6 +179,33 @@ caller-facing summary.
   through reconcile at the next turn (the native session id is unchanged within one client
   connection).
 
+### Codex turn governance findings (openai-codex / app-server 0.147.0; task 9)
+
+- **engine_auto = Codex's auto-reviewer.** `permission_mode="engine_auto"` starts or resumes
+  the thread with `approvals_reviewer=ApprovalsReviewer.auto_review`
+  (`openai_codex/generated/v2_all.py:235-238`; it is the value the SDK's own
+  `ApprovalMode.auto_review` maps to, `openai_codex/_approval_mode.py:30-34`) with the
+  `workspace-write` sandbox, also when no broker is set. Approval requests that still reach
+  the client go through the gate. Without engine_auto nothing changed: `user` reviewer, and
+  `read-only` when no broker is configured.
+- **Write narrow `shell` / `file_write` rules.** Observe sees only a completed command or file
+  change that had no approval request. A broad caller rule such as `shell → ask` therefore
+  stops a turn after any sandboxed command Codex ran without asking (e.g. `ls`).
+- **A file-change approval request carries no changes.** `FileChangeRequestApprovalParams`
+  has only ids, `reason` and `grant_root` (app-server-protocol `v2/item.rs:1521-1535`); core
+  emits the item's `item/started` (with its changes) before it asks
+  (`core/src/tools/handlers/apply_patch.rs:553`). The adapter takes the changes from that
+  start (`ApprovalLedger`, a bounded 2 s wait). The broker still gets today's
+  `{"changes": params.get("changes")}`, which is `None` on 0.147.0; the real changes are in
+  the `tradewind` action.
+- **`/` prompts are not expanded** by the app-server: `turn/start` maps text input straight
+  to core input (`app-server/src/request_processors/turn_processor.rs:512-516`,
+  app-server-protocol `v2/turn.rs:328-336`); slash commands are a TUI feature. The prompt is
+  sent unchanged.
+- **No process report on Codex.** The `codex app-server` process is held only in the private
+  `CodexClient._proc` (`openai_codex/client.py:222,259`), so the adapter does not report
+  descendants (05 §3.4) until the SDK exposes the PID.
+
 ### Env gates for integration/live runs
 
 | Variable | Gates | Notes |

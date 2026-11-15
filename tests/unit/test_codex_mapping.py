@@ -583,3 +583,101 @@ def test_mcp_server_config_overrides_rejects_non_stdio_transport() -> None:
 
     with pytest.raises(ConfigError):
         mcp_server_config_overrides(server)
+
+
+# --- turn governance: action mapping (05-turn-governance §1, §7 Codex row)
+
+
+def test_shell_action_keeps_the_command_as_its_critical_field() -> None:
+    from tradewind.adapters.codex_backend import shell_action
+
+    action = shell_action({"command": "git status", "cwd": "/w", "itemId": "exec-1"})
+
+    assert action.kind == "shell"
+    assert action.fields["command"] == "git status"
+    assert action.fields["cwd"] == "/w"
+    assert action.backend == "codex"
+    assert action.native_name == "shell"
+    assert action.missing_critical_field is False
+
+
+def test_shell_action_without_a_command_is_missing_its_critical_field() -> None:
+    """Owner M8: a known kind without its critical field is denied by the
+    floor -- the adapter only marks it."""
+    from tradewind.adapters.codex_backend import shell_action
+
+    assert shell_action({"cwd": "/w"}).missing_critical_field is True
+
+
+def test_file_write_action_lists_each_change_with_its_workspace_flag() -> None:
+    from tradewind.adapters.codex_backend import file_write_action
+
+    changes = [
+        FileUpdateChange(
+            path="a.py", kind=PatchChangeKind(AddPatchChangeKind(type="add")), diff=""
+        ),
+        FileUpdateChange(
+            path="/w/src/b.py", kind=PatchChangeKind(AddPatchChangeKind(type="add")), diff=""
+        ),
+        FileUpdateChange(
+            path="/etc/hosts", kind=PatchChangeKind(AddPatchChangeKind(type="add")), diff=""
+        ),
+    ]
+
+    action = file_write_action(changes, workspace="/w", native_args={"changes": None})
+
+    assert action.kind == "file_write"
+    assert action.native_name == "apply_patch"
+    assert action.fields["changes"] == [
+        {"path": "a.py", "change": "add", "in_workspace": True},
+        {"path": "/w/src/b.py", "change": "add", "in_workspace": True},
+        {"path": "/etc/hosts", "change": "add", "in_workspace": False},
+    ]
+    assert action.missing_critical_field is False
+
+
+def test_file_write_action_with_unknown_changes_is_missing_its_critical_field() -> None:
+    from tradewind.adapters.codex_backend import file_write_action
+
+    action = file_write_action(None, workspace="/w", native_args={"changes": None})
+
+    assert action.missing_critical_field is True
+
+
+def test_observed_action_covers_only_commands_and_file_changes() -> None:
+    """05 §7: observe sees completed command and file-change items only."""
+    from tradewind.adapters.codex_backend import observed_action
+
+    command = _item(
+        CommandExecutionThreadItem(
+            id="exec-1",
+            command="ls",
+            command_actions=[],
+            cwd=LegacyAppPathString("/w"),
+            status=CommandExecutionStatus.completed,
+            type="commandExecution",
+        )
+    )
+    patch = _item(
+        FileChangeThreadItem(
+            id="patch-1",
+            changes=[
+                FileUpdateChange(
+                    path="a.py", kind=PatchChangeKind(AddPatchChangeKind(type="add")), diff=""
+                )
+            ],
+            status=PatchApplyStatus.completed,
+            type="fileChange",
+        )
+    )
+    text = _item(AgentMessageThreadItem(id="m-1", type="agentMessage", text="hi"))
+
+    shell = observed_action(command, workspace="/w")
+    write = observed_action(patch, workspace="/w")
+
+    assert shell is not None
+    assert shell.kind == "shell"
+    assert shell.fields["command"] == "ls"
+    assert write is not None
+    assert write.kind == "file_write"
+    assert observed_action(text, workspace="/w") is None
