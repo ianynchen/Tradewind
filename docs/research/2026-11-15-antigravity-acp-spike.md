@@ -163,3 +163,48 @@ block also changed workspace write access. (d) as designed could not be
 shown to work. Without an allow list, (d) means: no network from the
 agent's own shell at all. Settings were restored to the turn 3–4 state.
 Turns used: 7 of 20. Stopped for the owner's decision.
+
+## Task 5 — MCP shim (turns 8–10) and built-in network tools (turns 11–12)
+
+**Owner ruling d1 (2026-11-15):** the agent's shell is offline (strict,
+sandbox on, every escape denied by Tradewind in broker mode); network work
+goes through broker-checked MCP tools in the shim.
+
+- Turns 8–9 were lost to a **harness bug** (the probe MCP server used the
+  mcp 1.x `FastMCP` import; the installed `mcp` is 2.x, so the server
+  crashed at start). Not an `agy` finding. Turn 8 still listed `agy`'s
+  built-in tools: `read_file`, `edit_file`, `write_file`, `run_command`,
+  `manage_task`, `send_message`, `invoke_subagent`, `define_subagent`,
+  `manage_subagents`, `schedule`, `run_workflow`, `swarm`,
+  `ask_question`, `search_web`.
+- Turn 10 (fixed server, 8 s wait after `session/new`):
+  - **The shim runs outside `agy`'s sandbox:** the MCP tool's own HTTP call
+    reached the loopback canary (`/mcp`). Network via MCP works under
+    strict.
+  - **`agy` asks for MCP tools too:** `session/request_permission` with
+    `allow_once`/`reject_once` for each MCP call.
+  - **Visible tool name** is `mcp_<server name>_<tool>`, e.g.
+    `mcp_tradewind-7f3a91c2_probe_echo`; the `tool_call` `kind` is `other`,
+    the title `Run mcp_<server>_<tool>`.
+  - **No `_meta.is_mcp_tool_call`** and no server field in `rawInput` on
+    agy 1.5.9 (design C2 assumed them). Identification must use the exact
+    per-turn prefix `mcp_<random shim name>_` in the tool name.
+  - **Startup race:** `agy` logs "Preloading 1 MCP servers" at
+    `session/new`, but the tool list is taken at the prompt; a prompt sent
+    before the server is ready sees no MCP tools. Tradewind must wait until
+    the shim has connected (and listed its tools) before `session/prompt`.
+- Turn 11: **`search_web` ran with no approval request** (a server-side
+  search; the query leaves the machine to Google, which already has the
+  conversation). **`invoke_subagent` ran with no approval request**; the
+  subagents run in the background and `session/prompt` returned `end_turn`
+  while they were still starting.
+- Turn 12 (agy kept alive 90 s after `end_turn`): each subagent's own
+  transcript (`brain/<subagent id>/.system_generated/logs/transcript*.jsonl`)
+  shows a planned `run_command touch marker-sub` and **nothing after it**:
+  the command never ran, and no approval request reached the client in 90 s.
+  The browser subagent produced no steps; the canary got no hit.
+  **Result:** subagents do not bypass approval over ACP; they stall. In
+  broker mode they cannot do approved work, and a stalled subagent must not
+  hold the M10 idle wait open.
+
+Turns used: 12 of 20.
