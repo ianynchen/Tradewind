@@ -56,12 +56,14 @@ its own.
 
 | Decision | Choice | Evidence / why |
 |---|---|---|
+| Client | A small in-repo ACP JSON-RPC client (no new dependency; a maintained official Python ACP library needs owner approval). Client capabilities `fs.readTextFile=false`, `fs.writeTextFile=false`, `terminal=false`: the agent uses its own tools | ACP is small |
+| Parallel turns | Allowed | Spike turns 18–19: no lock or token errors |
 | Process model | One `agy acp` process per turn, spawned in its own process group: `initialize` (protocol 1; accept a reply of 1 or 2), `authenticate {methodId: "oauth-personal"}`, `session/new` or `session/resume`, prompt, `session/close`, terminate | Per-turn `ToolHost`; 1.3–1.8 s to a ready session (1.5.3); `close` advertised (1.5.9) |
 | Profile **(owner M1)** | `--gemini-dir <NativeStoreConfig.antigravity_dir>`, `--disable-telemetry`, `--include-default-customizations=false`, env `AGY_CLI_DISABLE_AUTO_UPDATE=1`. Tradewind owns `<dir>/antigravity-cli/settings.json` | Settings and conversations are per gemini-dir. The login token is the shared keychain item (`gemini`/`antigravity`), so Tradewind and the owner's `agy` share one login (accepted fallback) |
 | Settings | Broker mode: `toolPermission: "strict"`, `enableTerminalSandbox: true`, `disableSlashCommands: true`, `useAICredits: false`, `agentMode: ""`. Engine-auto: the same with `toolPermission: "request-review"` (strict overrides Auto) | Spike turns 1–7, 17 |
 | Environment **(owner M4)** | Inherit the owner's environment; remove only auth-switching variables (`GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`) | Scope rule |
 | Auth errors | `ApiKeyAuth` → `ConfigError`; not logged in (stdout/stderr `Open the following link…`, or `-32000`) → `ConfigError` naming `agy acp --login --gemini-dir <dir>`; `SUBSCRIPTION_REQUIRED` → `ConfigError` | T3 Code |
-| Model, effort, mode | `session/set_config_option`: `mode` first, then `model` (validated), then the `thought_level`-category option (validated after the model) | Spike: options `mode`, `model`, `thought_level` |
+| Model, effort, mode | `session/set_config_option`: `mode` first, then `model` (unknown → `ConfigError` "model unavailable for this Google account"), then the `thought_level`-category option (validated after the model; unknown → `Unsupported`) | Spike: options `mode`, `model`, `thought_level` |
 | System prompt | `_meta.antigravity.systemPrompt.append` on every `session/new` and `session/resume` | Kept across processes on 1.5.9 (spike), resent anyway |
 | Resume | `session/resume`; drop `_meta.isReplay` updates as a guard | Spike: works across processes, no replay |
 | Shim readiness | After `session/new`/`resume`, wait until the shim has connected to `ToolHost` and listed its tools before `session/prompt` | Spike turn 8: the tool list is taken at the prompt; an early prompt sees no MCP tools |
@@ -73,29 +75,43 @@ its own.
 | `request_permission`, `kind: execute`, `rawInput.CommandLine` | `shell {command, cwd, sandboxed = not BypassSandbox, interactive = IsDaemon}` | gate |
 | `kind: read`, `rawInput.Path` | `file_read {path, in_workspace}` | gate |
 | `kind: edit`, `rawInput.Path` (+`Content` or `Target`/`Replacement`) | `file_write {path, in_workspace, change}` | gate |
-| tool name `mcp_<server>_<tool>` | `mcp {server, tool, args}`; `server` = the shim only if the name starts with this turn's exact `mcp_tradewind-<8 hex>_` prefix **and** `<tool>` is in the shim's own tool list | gate |
-| `tool_call` `search_web` (`kind: search`) | `web_search {query}` | observe |
+| tool name `mcp_<shim>_<tool>` for this turn's shim | `caller_tool {name, args, source}`: only if the name starts with this turn's exact `mcp_tradewind-<8 hex>_` prefix **and** the rest is exactly a tool in the shim's own list (the shim is the only MCP server the engine has: workspace MCP config is a preflight stop, and the profile has none) | gate |
+| any other `mcp_…` name | `native {unknown_tool: true}` (cannot be split reliably) | gate |
+| `tool_call` for a tool that never asks: `search_web` (`kind: search`) | `web_search {query}` | observe |
 | `tool_call` `invoke_subagent` | `subagent {type: TypeName, task: Prompt}` | observe |
 | `tool_call` `manage_task` `send_input` | `input_to_running {target: TaskId, text: Input}` | observe |
 | `tool_call` `schedule` | `native` (schedules a later prompt in the session) | observe |
 | `current_mode_update` | `mode_change {from, to}` | observe |
 | `request_permission` with `toolCallId` `interaction_*` | `question {title, choices}` | gate |
-| anything else | `native {…, unrecognised: true}` | gate or observe |
+| `tool_call` for `manage_subagents`, `send_message`, `define_subagent`, `manage_task` (other actions) | `native` (known, observe default allow) | observe |
+| any other tool | `native {unknown_tool: true}`: at the gate → rules, then the broker; never observed (a request may follow) | gate |
+
+Every other `tool_call` is decided only when its `request_permission` arrives.
 
 `toolSummary` is removed from `fields` (kept in `native_args`). The spike
 found no `_meta.is_mcp_tool_call`, hence the exact prefix-plus-tool-list
 test.
 
-## Default rules (`05` §2.2)
+## Rules (`05` §2)
 
-| id | rule | Owner ruling |
-|---|---|---|
-| ag.no-escape | `shell` with `sandboxed=false` → **deny**, record (broker mode only) | d1: the agent's shell is offline; `input_to_running` then stays in the sandbox |
-| ag.no-browser | `subagent` with `type=browser` → **stop**, record | spike item 1 |
-| ag.search | `web_search` → allow, **record** | spike item 2 |
-| ag.mode | `mode_change` away from the set mode → **stop** (broker mode), record (engine-auto) | M7 |
-| ag.question | `question` → **stop** ("Antigravity asked: '<title>' — questions are not supported yet") | M5 |
-| tw.shim | `mcp` on this turn's shim → allow (the broker is asked inside `ToolHost`, as on Codex) | C2 |
+**Floor rules** (owner rulings; a caller can tighten, never loosen):
+
+| id | rule | modes | Owner ruling |
+|---|---|---|---|
+| ag.no-escape | `shell` with `sandboxed=false` → **deny**, record | broker | d1: the shell is offline; `input_to_running` then stays in the sandbox |
+| ag.no-browser | `subagent` with `type=browser` → **stop**, record | both | spike item 1 |
+| ag.mode | `mode_change` with `to ne $turn.mode` → **stop**, record | broker | M7 (also watched: config updates that change the mode option) |
+| ag.mode-auto | `mode_change` → allow, record | engine_auto | M7 |
+| ag.question | `question` → **stop** ("Antigravity asked: '<title>' — questions are not supported yet") | both | M5 |
+
+**Default rules** (a caller may override):
+
+| id | rule | modes | Owner ruling |
+|---|---|---|---|
+| ag.search | `web_search` → allow, **record** ("Antigravity searched: '<query>'") | both | spike item 2 |
+| tw.shim | `caller_tool` on `$turn.shim_server` → allow at the engine layer (the broker is asked once, inside `ToolHost`, as on Codex) | both | C2 |
+
+`agy` built-in tools reach the broker under the shared names (`shell`, `apply_patch` for `file_write`, …; `05` §1.1).
 
 Network work goes through MCP tools in the shim (GitHub, issue tracker,
 fetch, browser automation), which runs outside `agy`'s sandbox and is
@@ -120,43 +136,71 @@ broker mode they stall at their first approval (spike turns 12, 22, 24).
 ## Preflight checks (`05` §4)
 
 1. Login (auth errors above).
-2. **Version check (owner M2):** `agy --version` against Tradewind's record
-   of verified versions (pass, fail or timed out, with findings). An
-   unrecorded version, before a broker-mode turn, runs the safety suite
-   `tradewind.adapters.antigravity_check` (the spike's traps, scripted;
-   15-minute cap; one run at a time; "timed out" retries at most hourly).
-   Fail → `Stop` with the findings for broker-mode turns; engine-auto turns
-   are not checked. The suite also re-reads the built-in tool names and
-   confirms the subagent transcript path.
-3. **Workspace customizations (owner C1):** scan the cwd, the repo root and
+2. **Auto available (owner, M9 safety):** in engine_auto (including the
+   no-broker case), if the session's `mode` options lack `auto` → `Stop`
+   ("update agy or set a broker"); never allow-all.
+3. **Version check (owner M2):** `agy --version` against Tradewind's record
+   of verified versions (pass, fail or timed out, with findings). Before a
+   broker-mode turn on an unrecorded version, the safety suite
+   `tradewind.adapters.antigravity_check` runs (the spike's traps,
+   scripted). Its rules:
+   - each trap needs positive evidence that it was attempted (a request
+     reached Tradewind, or the trap fired); no evidence → inconclusive,
+     retried twice, then the check **fails**;
+   - the suite answers every request with allow, in a throwaway workspace,
+     with local canaries only;
+   - 15-minute cap; reaching it records "timed out" (not a fail): the
+     waiting broker-mode turns `Stop` with "Antigravity safety check timed
+     out for agy <version>; retry later", and the next broker-mode turn
+     retries at most once per hour per version;
+   - one run at a time; it runs in its own task and records its result
+     even if the waiting turn is stopped;
+   - fail → `Stop` with the recorded findings, without rerunning; the owner
+     reruns on demand;
+   - engine-auto turns are not checked;
+   - each run refreshes the built-in tool-name list (shipped fallback list
+     from the spike for engine-auto on an unchecked version) and confirms
+     the subagent transcript path.
+4. **Workspace customizations (owner C1):** scan the cwd, the repo root and
    the folders between for `.agents/` hooks, plugins, skills and MCP
    config, and `.gemini/` and `.agent/` content (empty skill folders
-   ignored; nothing above the repo root — spike). Found → `Ask` with
-   choices `stop` (default), `delete` (copy to a timestamped backup in
-   Tradewind's data folder, then delete; never restored; tracked files show
-   as deletions — the user's responsibility), `proceed` (record "loaded
-   without broker control"). Evidence: a repo-root `hooks.json` ran its
+   ignored; nothing above the repo root — spike). Found → `Ask` with the
+   file list as `details` and choices `stop` (default), `delete`,
+   `proceed`. The change happens in `run()` after `TurnStarted`:
+   `delete` copies only the scanned files to
+   `<data>/backups/<timestamp>-<turn id>/` (paths relative to the repo
+   root), then deletes them (a file already gone is skipped; if any copy
+   fails, nothing is deleted and the turn ends with `ConfigError`); never
+   restored; tracked files show as deletions — the user's responsibility;
+   a notice names the files and the backup path. `proceed` records
+   "Antigravity customizations loaded without broker control: <files>". Evidence: a repo-root `hooks.json` ran its
    `SessionStart` and `PreInvocation` hooks at the first prompt with no
    question.
-4. **Name collisions (C2):** a caller tool named like an `agy` built-in →
+5. **Name collisions (C2):** a caller tool named like an `agy` built-in →
    `Stop`.
 
 ## Structured output (owner way 1, M6; seam in `05` §6)
 
 1. With an `output_schema`, the shim serves the result tool; the model sees
-   it as `mcp_<shim>_tradewind_submit_result` (spike), so the instruction
-   block and the reminder are built per turn with that name.
-2. The prompt gets a trailing instruction block; the mirror keeps only the
-   caller's prompt.
+   it as `mcp_<shim>_tradewind_submit_result` (spike), so the texts below
+   are built per turn with that name.
+2. The prompt gets a trailing block: "When you have finished, call
+   `<result tool>` exactly once with your final answer." The mirror keeps
+   only the caller's prompt.
 3. Calls are validated; the last valid result wins; at most 3 calls.
 4. Result-tool calls are hidden from events and the mirror.
 5. If the turn ends without a valid result and fewer than 3 calls were
-   made, one reminder is sent.
+   made, one reminder is sent: "Call `<result tool>` now with your final
+   answer."
 6. Everything after the reminder stays visible (except result-tool calls);
    the reminder is recorded as a notice; `final_text` is the main answer.
 7. Still no result → `end_turn`, `structured_output=None`.
 8. A result recorded before an early end is dropped.
-9. Non-schema turns: the append says the result tool is not available.
+9. Non-schema turns: the append says "no tool called
+   tradewind_submit_result is available in this turn".
+
+Follow-up (separate, small): make Claude's `final_text` rule the same when
+its CLI reminder fires.
 
 ## Stop reasons
 
