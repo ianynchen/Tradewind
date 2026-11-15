@@ -164,6 +164,7 @@ def _run_handler_on_a_real_loop(
         loop,
         out_queue,
         ledger if ledger is not None else ApprovalLedger(wait_s=0.0),
+        "/w",
     )
 
     caller_done = threading.Event()
@@ -1394,20 +1395,47 @@ def test_report_work_maps_items_deltas_and_turn_end() -> None:
 async def test_plain_turn_events_are_identical_with_activity_notifications() -> None:
     """05 Acceptance: work signals never become events or mirror items --
     the same turn with and without the activity notifications yields
-    exactly the same events."""
+    exactly the same events, so exactly the same mirror rows (the runner
+    mirrors each `ItemCompleted.message`)."""
     from openai_codex.generated.v2_all import (
         AgentMessageDeltaNotification,
         CommandExecutionOutputDeltaNotification,
+        ItemGuardianApprovalReviewCompletedNotification,
+        ItemGuardianApprovalReviewStartedNotification,
+        McpToolCallProgressNotification,
+        ReasoningSummaryTextDeltaNotification,
         ReasoningTextDeltaNotification,
+        TerminalInteractionNotification,
     )
 
     ids = {"thread_id": "t-1", "turn_id": "n-1"}
-    plain = _queue_of(_completed(_agent_item("m-1", "hello")), _turn_done())
+    plain = _queue_of(
+        _completed(_command_item("exec-1")),
+        _completed(_agent_item("m-1", "hello")),
+        _turn_done(),
+    )
     busy = _queue_of(
+        _started(_command_item("exec-1")),
+        _note(
+            ItemGuardianApprovalReviewStartedNotification.model_construct(
+                target_item_id="exec-1", review_id="r-1"
+            )
+        ),
+        _note(
+            ItemGuardianApprovalReviewCompletedNotification.model_construct(
+                target_item_id="exec-1", review_id="r-1"
+            )
+        ),
+        _note(CommandExecutionOutputDeltaNotification(item_id="exec-1", delta="x", **ids)),
+        _note(TerminalInteractionNotification(item_id="exec-1", process_id="p", stdin="y", **ids)),
+        _note(McpToolCallProgressNotification(item_id="call-1", message="50%", **ids)),
+        _completed(_command_item("exec-1")),
         _started(_agent_item("m-1", "")),
         _note(ReasoningTextDeltaNotification(item_id="r", content_index=0, delta="t", **ids)),
+        _note(
+            ReasoningSummaryTextDeltaNotification(item_id="r", summary_index=0, delta="s", **ids)
+        ),
         _note(AgentMessageDeltaNotification(item_id="m-1", delta="hel", **ids)),
-        _note(CommandExecutionOutputDeltaNotification(item_id="e", delta="x", **ids)),
         _completed(_agent_item("m-1", "hello")),
         _turn_done(),
     )
@@ -1418,12 +1446,64 @@ async def test_plain_turn_events_are_identical_with_activity_notifications() -> 
         policy=_gate(_ScriptedBroker("allow")),
         ledger=ApprovalLedger(),
     )
+    busy_work = _RecordingWork()
     busy_events, _ = await _consume_all(
-        busy, work=_RecordingWork(), policy=_gate(_ScriptedBroker("allow")), ledger=ApprovalLedger()
+        busy, work=busy_work, policy=_gate(_ScriptedBroker("allow")), ledger=ApprovalLedger()
     )
 
     assert busy_events == plain_events
-    assert [type(e).__name__ for e in plain_events] == ["ItemCompleted", "TurnCompleted"]
+    assert [type(e).__name__ for e in plain_events] == [
+        "ItemCompleted",
+        "ItemCompleted",
+        "TurnCompleted",
+    ]
+
+    def mirror_rows(events: list[object]) -> list[tuple[str, str, dict[str, object], str | None]]:
+        return [
+            (e.message.role, e.message.kind, e.message.content, e.message.native_id)
+            for e in events
+            if isinstance(e, ItemCompleted)
+        ]
+
+    assert mirror_rows(busy_events) == mirror_rows(plain_events)
+    assert [kind for _role, kind, _content, _id in mirror_rows(plain_events)] == [
+        "command_execution",
+        "text",
+    ]
+    # The activity notifications did reach the supervisor.
+    assert ("active", "call-1") in busy_work.signals
+
+
+async def test_a_failed_interrupt_keeps_the_policy_stop_reason() -> None:
+    """The engine may have ended the turn already; the stop reason must
+    still end it as `TurnFailed(reason)`."""
+    from tradewind.domain.events import TurnFailed
+
+    backend = CodexBackend(_profile(), NativeStoreConfig())
+
+    async def failing_interrupt() -> None:
+        raise RuntimeError("turn already finished")
+
+    policy = _gate(_RaisingBroker(), caller=[_rule("shell", "deny")])
+    for script in (
+        _queue_of(codex_backend._StopRequested(reason="no network"), _turn_done("completed")),
+        _queue_of(_completed(_command_item("exec-5")), _turn_done("completed")),
+    ):
+        events = [
+            event
+            async for event in backend._consume(
+                "turn-1",
+                script,
+                ModelSpec(model="gpt-5.4-mini"),
+                failing_interrupt,
+                policy=policy,
+                ledger=ApprovalLedger(wait_s=0.0),
+                workspace="/w",
+            )
+        ]
+        failed = [e for e in events if isinstance(e, TurnFailed)]
+        assert len(failed) == 1
+        assert "turn already finished" not in failed[0].error
 
 
 def test_thread_settings_engine_auto_uses_the_auto_reviewer_with_workspace_write() -> None:

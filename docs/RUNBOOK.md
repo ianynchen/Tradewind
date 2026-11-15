@@ -184,7 +184,7 @@ caller-facing summary.
 - **engine_auto = Codex's auto-reviewer.** `permission_mode="engine_auto"` starts or resumes
   the thread with `approvals_reviewer=ApprovalsReviewer.auto_review`
   (`openai_codex/generated/v2_all.py:235-238`; it is the value the SDK's own
-  `ApprovalMode.auto_review` maps to, `openai_codex/_approval_mode.py:30-34`) with the
+  `ApprovalMode.auto_review` maps to, `openai_codex/_approval_mode.py:29-33`) with the
   `workspace-write` sandbox, also when no broker is set. Approval requests that still reach
   the client go through the gate. Without engine_auto nothing changed: `user` reviewer, and
   `read-only` when no broker is configured.

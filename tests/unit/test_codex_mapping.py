@@ -681,3 +681,36 @@ def test_observed_action_covers_only_commands_and_file_changes() -> None:
     assert write is not None
     assert write.kind == "file_write"
     assert observed_action(text, workspace="/w") is None
+
+
+@pytest.mark.parametrize(
+    ("path", "workspace", "inside"),
+    [
+        ("a.py", "/w", True),
+        ("src/../a.py", "/w", True),
+        ("../x", "/w", False),
+        ("a/../../x", "/w", False),
+        ("../../etc/passwd", "/w", False),
+        ("/w/src/b.py", "/w", True),
+        ("/w/../etc/hosts", "/w", False),
+        ("/wx/b.py", "/w", False),
+        ("/etc/hosts", "/w", False),
+        ("a.py", None, False),
+        ("/w/a.py", None, False),
+    ],
+)
+def test_in_workspace_resolves_relative_paths_before_the_check(
+    path: str, workspace: str | None, inside: bool
+) -> None:
+    """`in_workspace` is a security field: a caller rule `file_write where
+    in_workspace is_false -> deny` must not be bypassed by `..` in a
+    relative path, and an unknown workspace is never "inside"."""
+    from tradewind.adapters.codex_backend import file_write_action
+
+    change = FileUpdateChange(
+        path=path, kind=PatchChangeKind(AddPatchChangeKind(type="add")), diff=""
+    )
+
+    action = file_write_action([change], workspace=workspace, native_args={})
+
+    assert action.fields["changes"] == [{"path": path, "change": "add", "in_workspace": inside}]

@@ -93,13 +93,13 @@ class PolicyGate:
             return "allow"
         return "ask"
 
-    def _evaluate(self, action: Action) -> PolicyResult:
+    def _evaluate(self, action: Action, mode_default: Outcome) -> PolicyResult:
         result = evaluate(
             action,
             floor=self._floor,
             caller=self._caller,
             defaults=self._defaults,
-            mode_default=self._mode_default(),
+            mode_default=mode_default,
             turn=self._turn,
         )
         if result.record:
@@ -116,8 +116,10 @@ class PolicyGate:
         return result
 
     def observe(self, action: Action) -> Literal["allow", "stop"]:
-        """Decide an action the engine already runs: `deny` and `ask` stop."""
-        return "allow" if self._evaluate(action).outcome == "allow" else "stop"
+        """Decide an action the engine already runs: `deny` and `ask` stop.
+        The mode default is `allow` in every mode (05 §2.3), so only a
+        matching rule can stop the turn."""
+        return "allow" if self._evaluate(action, "allow").outcome == "allow" else "stop"
 
     async def gate(
         self,
@@ -129,7 +131,7 @@ class PolicyGate:
     ) -> GateDecision:
         if pass_through:
             return GateDecision("allow", None, False, False, ())
-        result = self._evaluate(action)
+        result = self._evaluate(action, self._mode_default())
         ids = result.rule_ids
         if result.outcome == "allow":
             return GateDecision("allow", None, False, result.record, ids)

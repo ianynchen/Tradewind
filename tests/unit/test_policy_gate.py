@@ -97,7 +97,11 @@ def test_observe_default_allow_and_deny_becomes_stop():
         caller=[Rule("d", "caller_tool", {"name": Matcher("equals", "x")}, "deny")],
     )
     assert gate2.observe(_action(name="x")) == "stop"
-    assert gate2.observe(_action(name="y")) == "stop"  # engine_auto + broker -> ask -> stop
+    # 05 §2.3: the observe default is `allow` in every mode -- a gate's
+    # `ask` default never stops an observed action; only a matching rule does.
+    assert gate2.observe(_action(name="y")) == "allow"
+    gate3, _ = _gate(mode="broker")
+    assert gate3.observe(_action()) == "allow"
 
 
 async def test_engine_auto_without_broker_allows_without_asking():

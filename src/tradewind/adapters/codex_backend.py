@@ -682,15 +682,16 @@ def _extract_tool_name(params: JsonObject) -> str | None:
 
 
 def _in_workspace(path: str, workspace: str | None) -> bool:
-    """A relative patch path is relative to the thread's cwd, so inside the
-    workspace; an absolute one is inside only under `workspace` (unknown
-    workspace -> False, the narrower answer)."""
-    if not os.path.isabs(path):
-        return True
+    """Whether a patch path is inside `workspace` -- a security field (05
+    §1): a relative path is joined to `workspace` (the thread's cwd) and
+    `..` is resolved lexically (symlinks are not followed), then one
+    `commonpath` check applies to relative and absolute paths alike. An
+    unknown workspace gives False, the narrower answer."""
     if workspace is None:
         return False
     root = os.path.normpath(workspace)
-    return os.path.commonpath([root, os.path.normpath(path)]) == root
+    target = os.path.normpath(os.path.join(root, path))
+    return os.path.commonpath([root, target]) == root
 
 
 def shell_action(params: JsonObject) -> Action:
@@ -1278,6 +1279,22 @@ def _drive_turn(
         out_queue.put(_DONE)
 
 
+async def _interrupt_for_stop(
+    request_interrupt: Callable[[], Awaitable[None]] | None, turn_id: str
+) -> None:
+    """Interrupt the turn for a policy stop (05 §2.6). A failed interrupt is
+    logged, not raised, so the stop reason still ends the turn as
+    `TurnFailed(reason)` (the engine may already have finished the turn)."""
+    if request_interrupt is None:
+        return
+    try:
+        await request_interrupt()
+    except Exception:
+        _logger.warning(
+            "interrupt for a policy stop failed", exc_info=True, extra={"turn_id": turn_id}
+        )
+
+
 def _direct_policy(ctx: TurnContext, out_queue: queue.Queue[object]) -> PolicyGate:
     """The gate for a `TurnContext` built without the runner (`ctx.policy`
     unset -- direct construction, as in unit tests): broker mode with no
@@ -1648,8 +1665,7 @@ class CodexBackend(Backend):
             if isinstance(item, _StopRequested):
                 if stop_reason is None:
                     stop_reason = item.reason
-                    if request_interrupt is not None:
-                        await request_interrupt()
+                    await _interrupt_for_stop(request_interrupt, turn_id)
                 continue
             if isinstance(item, _ReplayPromptRequest):
                 # FR-6.1 reactive degrade: the worker classified the
@@ -1702,8 +1718,7 @@ class CodexBackend(Backend):
                 observed_stop = self._observe(payload.item, policy, ledger, workspace)
                 if observed_stop is not None and stop_reason is None:
                     stop_reason = observed_stop
-                    if request_interrupt is not None:
-                        await request_interrupt()
+                    await _interrupt_for_stop(request_interrupt, turn_id)
             elif isinstance(payload, ContextCompactedNotification):
                 # The engine compacted its OWN context (FR-5.8
                 # observability). Codex encrypts the summary
