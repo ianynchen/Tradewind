@@ -614,9 +614,12 @@ class LangchainBackend(Backend):
             schemas = ctx.tools.schemas()
             bound_model = _bind_tools(chat_model, schemas)
             history = await ctx.load_history()
+            if work is not None:
+                # The in-turn summarizer call is a model call (05 §7): signalled
+                # before and after, so a long compaction is not model silence.
+                work.model_active()
             record, failure_item = await self._maybe_auto_compact(ctx, history)
             if work is not None:
-                # The in-turn summarizer call is a model call (05 §7).
                 work.model_active()
             if failure_item is not None:
                 # Auto-compaction failed (FR-5.8 hard-fail rule): surfaced
@@ -692,6 +695,8 @@ class LangchainBackend(Backend):
                                 if ctx.compaction is not None
                                 else 20000
                             )
+                            if work is not None:
+                                work.model_active()
                             try:
                                 recovery_record, _usage = await self._compact(
                                     ctx.model_spec, history, keep_recent_tokens=keep_recent

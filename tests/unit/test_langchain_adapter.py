@@ -1633,3 +1633,57 @@ async def test_plain_turn_events_are_unchanged_by_governance_wiring() -> None:
         "ItemCompleted",
         "TurnCompleted",
     ]
+
+
+class _LoggedFlakyChatModel(_FlakyChatModel):
+    """Logs each model call into `log` (shared with a `_WorkLog`)."""
+
+    log: list[object] = Field(default_factory=list)
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: object,
+    ) -> ChatResult:
+        self.log.append(("model_call",))
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+async def test_overflow_recovery_signals_model_activity_before_the_summarizer_call() -> None:
+    from tradewind.application.config import CompactionSettings
+
+    sid = "11111111-1111-1111-1111-111111111111"
+    history = [
+        StoredMessage(
+            role="user" if n % 2 else "assistant",
+            kind="text",
+            content={"text": f"message {n} " * 30},
+            seq=n,
+            session_id=sid,
+            turn_id=f"t-old-{n // 2}",
+            created_at=f"2026-01-01T00:00:0{n}",
+        )
+        for n in range(1, 5)
+    ]
+    work = _WorkLog()
+    model = _LoggedFlakyChatModel(
+        responses=[AIMessage(content="pad")],
+        script=[
+            _StatusError(400, "prompt is too long for this model"),
+            AIMessage(content="## Goal\ncheckpoint"),
+            AIMessage(content="recovered"),
+        ],
+    )
+    model.log = work.signals  # assigned, not validated: pydantic would copy the list
+    ctx = _retry_ctx(history=history)
+    ctx.compaction = CompactionSettings(auto=False, reserve_tokens=20, keep_recent_tokens=40)
+    ctx.work = cast(Any, work)
+
+    events = [e async for e in _backend(model).run(ctx)]
+
+    assert cast(TurnCompleted, events[-1]).result.final_text == "recovered"
+    calls = [i for i, s in enumerate(work.signals) if s == ("model_call",)]
+    # Call 0 failed, call 1 is the summarizer: a signal sits right before it.
+    assert work.signals[calls[1] - 1] == ("model_active",)

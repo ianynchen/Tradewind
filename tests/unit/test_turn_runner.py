@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import json
 import warnings
 from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import aclosing
@@ -2884,3 +2885,57 @@ async def test_prepare_turn_receives_the_callers_on_preflight(tmp_path: Path) ->
     assert fake.contexts[0].on_preflight is on_preflight
     assert asked == ["Delete stale files?"]
     assert fake.contexts[0].preflight == {"stale": "delete"}
+
+
+# --- turn governance: a plain LangChain tool turn through the real runner
+# keeps the same events and mirror rows it had before governance (ruling 4) ---
+
+
+async def test_langchain_plain_tool_turn_events_and_mirror_rows_are_unchanged(
+    tmp_path: Path,
+) -> None:
+    async def handler(**_kwargs: object) -> str:
+        return "ok"
+
+    tool = Tool(name="echo", description="d", input_schema={"type": "object"}, handler=handler)
+    model = _ScriptedChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "echo", "args": {"a": 1}, "id": "c1", "type": "tool_call"}],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+
+    def factory(p: Profile, native_config: NativeStoreConfig) -> Backend:
+        return LangchainBackend(p, native_config, chat_model_factory=lambda _spec: model)
+
+    tw = Tradewind(_config(tmp_path, _profile()), backend_factories={"langchain": factory})
+    session = await tw.create(_VALID_ID, SessionOptions(tools=[tool]))
+
+    events = [e async for e in session.stream("go")]
+
+    conn = cast(Any, tw._store)._conn
+    rows = [
+        (role, kind, json.loads(content))
+        for role, kind, content in conn.execute(
+            "SELECT role, kind, content_json FROM messages WHERE session_id = ? ORDER BY seq",
+            (_VALID_ID,),
+        )
+    ]
+    # Literals captured from the pre-governance adapter (same script).
+    assert [type(e).__name__ for e in events] == [
+        "TurnStarted",
+        "ItemCompleted",
+        "ItemCompleted",
+        "TextDelta",
+        "ItemCompleted",
+        "TurnCompleted",
+    ]
+    assert rows == [
+        ("user", "text", {"text": "go"}),
+        ("assistant", "tool_use", {"id": "c1", "name": "echo", "input": {"a": 1}}),
+        ("tool", "tool_result", {"tool_use_id": "c1", "content": "ok", "is_error": False}),
+        ("assistant", "text", {"text": "done"}),
+    ]
