@@ -79,6 +79,7 @@ from tradewind.domain.models import (
     Tool,
     TurnResult,
 )
+from tradewind.domain.policy import Action, Rule
 
 _VALID_ID = "33333333-3333-3333-3333-333333333333"
 
@@ -2213,3 +2214,71 @@ async def test_no_broker_detection_still_works(tmp_path: Path) -> None:
     assert getattr(backend.seen.broker, "is_default_allow_all", False) is True
     assert backend.seen.policy is not None
     assert backend.seen.policy.has_broker is False
+
+
+class _RecordingNoticeBackend(_ToolCallingBackend):
+    """Raises one recorded gate notice; optionally ends with no terminal."""
+
+    def __init__(
+        self, profile: Profile, native_config: NativeStoreConfig, *, terminal: bool
+    ) -> None:
+        super().__init__(profile, native_config, "my_tool", {})
+        self._terminal = terminal
+
+    def _notice(self, ctx: TurnContext) -> None:
+        assert ctx.policy is not None
+        ctx.policy.observe(
+            Action(
+                kind="caller_tool",
+                fields={"name": "t"},
+                backend="langchain",
+                native_name="t",
+                native_args={},
+                summary="t",
+            )
+        )
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        yield TurnStarted(turn_id=ctx.turn_id)
+        self._notice(ctx)
+        if self._terminal:
+            yield ItemCompleted(
+                message=NormalizedMessage(role="assistant", kind="text", content={"text": "x"})
+            )
+            yield _completed("done")
+
+
+def _record_rule() -> Rule:
+    return Rule(id="rec", kind="any", where={}, outcome="allow", record=True)
+
+
+def _is_policy_notice(event: Event) -> bool:
+    return (
+        isinstance(event, ItemCompleted) and event.message.content.get("type") == "policy_recorded"
+    )
+
+
+async def test_gate_notice_precedes_next_event_and_is_persisted(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _RecordingNoticeBackend(profile, NativeStoreConfig(), terminal=True)
+    session = await tw.create(_VALID_ID, SessionOptions(policy_rules=[_record_rule()]))
+    events = [e async for e in session.stream("go")]
+
+    assert [_is_policy_notice(e) for e in events] == [False, True, False, False]
+    assert isinstance(events[-1], TurnCompleted)
+    stored = tw._store.history(_VALID_ID, include_children=False, include_raw=False)
+    assert any(m.content.get("type") == "policy_recorded" for m in stored)
+
+
+async def test_gate_notice_precedes_synthesized_terminal(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _RecordingNoticeBackend(profile, NativeStoreConfig(), terminal=False)
+    session = await tw.create(_VALID_ID, SessionOptions(policy_rules=[_record_rule()]))
+    events = [e async for e in session.stream("go")]
+
+    assert isinstance(events[-1], TurnFailed)
+    assert _is_policy_notice(events[-2])
+    stored = tw._store.history(_VALID_ID, include_children=False, include_raw=False)
+    assert any(m.content.get("type") == "policy_recorded" for m in stored)

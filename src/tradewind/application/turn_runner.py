@@ -473,6 +473,22 @@ class TurnRunner:
         final_text: str | None = None
         structured_output: dict[str, object] | None = None
         watchdog_task: asyncio.Task[None] | None = None
+        # One gate per turn; events it emits are buffered here and
+        # drained into the store and stream by the event loop below.
+        gate_events: list[Event] = []
+
+        async def drain_gate_events() -> list[Event]:
+            """Persist and tap the buffered gate notices; the caller
+            yields them."""
+            drained, gate_events[:] = list(gate_events), []
+            for gate_event in drained:
+                if isinstance(gate_event, ItemCompleted):
+                    await anyio.to_thread.run_sync(
+                        self._store.append_message, session_id, turn_id, gate_event.message
+                    )
+                self._tap(gate_event, turn_id)
+            return drained
+
         timed_out = [False]
         usage: dict[str, object] | None = None
         cost_usd: float | None = None
@@ -571,9 +587,6 @@ class TurnRunner:
             # for them too would consult it twice per tool call -- harmless
             # for a stateless allow/deny broker, but wrong for "ask"
             # semantics (blocks on a human; must not be asked twice).
-            # One gate per turn; events it emits are buffered here and
-            # drained into the store and stream by the event loop below.
-            gate_events: list[Event] = []
             gate = PolicyGate(
                 broker=broker,
                 floor=[*floor_tradewind(), *backend.floor_rules()],
@@ -720,16 +733,7 @@ class TurnRunner:
                 async with aclosing(backend_run) as backend_events:
                     async for event in backend_events:
                         # Gate notices raised since the last event come first.
-                        while gate_events:
-                            gate_event = gate_events.pop(0)
-                            if isinstance(gate_event, ItemCompleted):
-                                await anyio.to_thread.run_sync(
-                                    self._store.append_message,
-                                    session_id,
-                                    turn_id,
-                                    gate_event.message,
-                                )
-                            self._tap(gate_event, turn_id)
+                        for gate_event in await drain_gate_events():
                             yield gate_event
                         if isinstance(event, ItemCompleted):
                             await anyio.to_thread.run_sync(
@@ -752,6 +756,10 @@ class TurnRunner:
                     await watchdog_task
 
                 if terminal_status is None:
+                    # A notice raised after the last backend event must
+                    # precede the synthesized terminal, which stays last.
+                    for gate_event in await drain_gate_events():
+                        yield gate_event
                     # The backend's iterator ended with neither TurnCompleted
                     # nor TurnFailed -- per `Backend.run`'s contract, this
                     # happens on a mid-turn interrupt: the caller's stop(),
@@ -850,6 +858,11 @@ class TurnRunner:
                 watchdog_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError), anyio.CancelScope(shield=True):
                     await watchdog_task
+            if gate_events:
+                # Notices raised before an abnormal end (a raising backend,
+                # an abandoned stream) still reach the store.
+                with anyio.CancelScope(shield=True):
+                    await drain_gate_events()
             if terminal_status is None:
                 # Reached only when the caller abandoned the stream before
                 # a terminal event was produced (GeneratorExit from an
