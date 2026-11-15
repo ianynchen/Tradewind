@@ -32,6 +32,7 @@ from typing import ClassVar, Protocol, cast
 import anyio
 
 from tradewind.application.config import TradewindConfig
+from tradewind.application.policy_gate import PolicyGate
 from tradewind.application.ports import Backend, SessionStorePort, TurnContext
 from tradewind.application.resume import ResumePlanner
 from tradewind.application.tool_host import ToolHost
@@ -55,6 +56,7 @@ from tradewind.domain.models import (
     TurnStatus,
     Verdict,
 )
+from tradewind.domain.policy import TurnVars, floor_tradewind
 
 _logger = logging.getLogger(__name__)
 
@@ -569,7 +571,26 @@ class TurnRunner:
             # for them too would consult it twice per tool call -- harmless
             # for a stateless allow/deny broker, but wrong for "ask"
             # semantics (blocks on a human; must not be asked twice).
-            tool_host_broker = broker if backend.name == "codex" else None
+            # One gate per turn; events it emits are buffered here and
+            # drained into the store and stream by the event loop below.
+            gate_events: list[Event] = []
+            gate = PolicyGate(
+                broker=broker,
+                floor=[*floor_tradewind(), *backend.floor_rules()],
+                caller=options.policy_rules,
+                defaults=backend.default_rules(),
+                turn=TurnVars(
+                    mode="engine_auto" if options.permission_mode == "engine_auto" else "broker",
+                    engine_mode=None,
+                    shim_server=None,
+                    workspace=str(options.cwd) if options.cwd is not None else None,
+                    result_tool=None,
+                ),
+                has_broker=not getattr(broker, "is_default_allow_all", False),
+                emit=gate_events.append,
+                backend=backend.name,
+            )
+            tool_host_broker = gate.as_broker("shim") if backend.name == "codex" else None
             async with ToolHost(
                 options.tools,
                 options.mcp_servers,
@@ -665,6 +686,7 @@ class TurnRunner:
                     last_turn_usage=last_turn_usage,
                     last_turn_id=last_turn_id,
                     max_tool_rounds=max_tool_rounds,
+                    policy=gate,
                 )
 
                 # FR-6.6 wall-clock deadline: a watchdog TASK (deliberately
@@ -697,6 +719,18 @@ class TurnRunner:
                 backend_run = cast("AsyncGenerator[Event]", backend.run(ctx))
                 async with aclosing(backend_run) as backend_events:
                     async for event in backend_events:
+                        # Gate notices raised since the last event come first.
+                        while gate_events:
+                            gate_event = gate_events.pop(0)
+                            if isinstance(gate_event, ItemCompleted):
+                                await anyio.to_thread.run_sync(
+                                    self._store.append_message,
+                                    session_id,
+                                    turn_id,
+                                    gate_event.message,
+                                )
+                            self._tap(gate_event, turn_id)
+                            yield gate_event
                         if isinstance(event, ItemCompleted):
                             await anyio.to_thread.run_sync(
                                 self._store.append_message, session_id, turn_id, event.message

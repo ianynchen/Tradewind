@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
 from tradewind.application.tool_host import ToolHost
@@ -38,6 +38,8 @@ if TYPE_CHECKING:
         NativeStoreConfig,
         RetrySettings,
     )
+    from tradewind.application.policy_gate import PolicyGate
+    from tradewind.domain.policy import Rule
 
 
 class SessionStorePort(ABC):
@@ -351,6 +353,15 @@ class TurnContext:
     # `TurnCompleted` carrying `end_reason="max_tool_rounds"`, an honest
     # partial — never `failed`, never a fake clean finish.
     max_tool_rounds: int | None = None
+    # Turn governance (docs/components/05-turn-governance.md §2): the runner
+    # always sets `policy`; adapters call `ctx.policy.gate(...)` /
+    # `.observe(...)`. `work` arrives with the supervisor (Task 4).
+    policy: PolicyGate | None = None
+    # Typed `object` until Task 4 adds `tradewind.application.supervisor`
+    # (then: `WorkSupervisor | None`).
+    work: object | None = None
+    timeout_reason: dict[str, object] | None = None
+    preflight: dict[str, str] = field(default_factory=dict)
 
 
 class Backend(ABC):
@@ -364,10 +375,22 @@ class Backend(ABC):
     """
 
     name: ClassVar[BackendName]
+    uses_result_tool: ClassVar[bool] = False
 
     def __init__(self, profile: Profile, native_config: NativeStoreConfig) -> None:
         self.profile = profile
         self.native_config = native_config
+
+    async def prepare_turn(self, ctx: TurnContext) -> None:  # noqa: B027
+        """Per-turn setup before `run()`; the default does nothing."""
+
+    def floor_rules(self) -> list[Rule]:
+        """Backend-specific floor rules (§2.4); none by default."""
+        return []
+
+    def default_rules(self) -> list[Rule]:
+        """Backend-specific default rules (§2.4); none by default."""
+        return []
 
     @abstractmethod
     def capabilities(self) -> Capabilities:

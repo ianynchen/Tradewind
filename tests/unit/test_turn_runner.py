@@ -2127,3 +2127,89 @@ async def test_plain_turn_persists_no_structured_output(tmp_path: Path) -> None:
         "SELECT final_text, structured_output_json FROM turns WHERE session_id = ?", (_VALID_ID,)
     ).fetchone()
     assert row == ("hi", None)
+
+
+# --- (7) turn governance: the policy gate on the turn context ---
+
+
+class _PolicyProbeBackend(_ToolCallingBackend):
+    """Records `ctx.policy` and `ctx.broker`, then runs the tool-call script."""
+
+    def __init__(self, profile: Profile, native_config: NativeStoreConfig, name: BackendName):
+        super().__init__(profile, native_config, "my_tool", {"x": 1})
+        self.name = name  # type: ignore[misc]
+        self.seen: TurnContext | None = None
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        self.seen = ctx
+        yield TurnStarted(turn_id=ctx.turn_id)
+        if self.name == "codex":
+            # The codex shim path: ToolHost itself consults its broker.
+            outcome = await ctx.tools.call("my_tool", {"x": 1})
+            final_text = outcome.content
+        else:
+            final_text = "n/a"
+        yield _completed(final_text)
+
+
+class _CountingBroker:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def decide(self, tool_name: str, tool_input: dict[str, object]) -> str:
+        self.calls.append((tool_name, tool_input))
+        return "allow"
+
+
+def _my_tool() -> Tool:
+    async def handler(**_kwargs: object) -> str:
+        return "handled"
+
+    return Tool(name="my_tool", description="d", input_schema={"type": "object"}, handler=handler)
+
+
+async def test_runner_sets_policy_on_context(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    backend = _PolicyProbeBackend(profile, NativeStoreConfig(), "langchain")
+    tw._backends["default"] = backend
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("go")
+
+    assert backend.seen is not None
+    assert backend.seen.policy is not None
+    assert backend.seen.work is None
+    assert backend.seen.preflight == {}
+
+
+async def test_codex_toolhost_uses_gate_broker_once(tmp_path: Path) -> None:
+    profile = _profile()
+    broker = _CountingBroker()
+    tw = Tradewind(_config(tmp_path, profile))
+    backend = _PolicyProbeBackend(profile, NativeStoreConfig(), "codex")
+    tw._backends["default"] = backend
+    session = await tw.create(
+        _VALID_ID, SessionOptions(tools=[_my_tool()], permission_broker=broker)
+    )
+    result = await session.run("go")
+
+    assert result.final_text == "handled"
+    assert len(broker.calls) == 1
+    assert broker.calls[0][0] == "my_tool"
+    # The raw broker stays on the context for adapters not yet on the gate.
+    assert backend.seen is not None
+    assert backend.seen.broker is broker
+
+
+async def test_no_broker_detection_still_works(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    backend = _PolicyProbeBackend(profile, NativeStoreConfig(), "langchain")
+    tw._backends["default"] = backend
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("go")
+
+    assert backend.seen is not None
+    assert getattr(backend.seen.broker, "is_default_allow_all", False) is True
+    assert backend.seen.policy is not None
+    assert backend.seen.policy.has_broker is False
