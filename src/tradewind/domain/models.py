@@ -481,6 +481,35 @@ def timeout_notice(*, limit: str, value: float, elapsed: float) -> NormalizedMes
     )
 
 
+def process_report_notice(
+    *,
+    turn_id: str,
+    session_id: str,
+    backend: str,
+    limit: dict[str, float | str] | None,
+    open_items: list[dict[str, str]],
+    processes: list[dict[str, str | int]],
+    last_action: str | None,
+) -> NormalizedMessage:
+    """The mirrored `kind="event"` visibility item for the process report
+    (05-turn-governance §3.4): the fired limit (if any), the open work
+    items, the engine processes still alive and the last action."""
+    return NormalizedMessage(
+        role="assistant",
+        kind="event",
+        content={
+            "type": "process_report",
+            "turn_id": turn_id,
+            "session_id": session_id,
+            "backend": backend,
+            "limit": limit,
+            "open_items": open_items,
+            "processes": processes,
+            "last_action": last_action,
+        },
+    )
+
+
 def resume_degraded_notice(*, reason: str) -> NormalizedMessage:
     """The mirrored `kind="event"` visibility item for a NATIVE->REPLAY
     degrade or cross-backend continuation (FR-6.1): the conversation
