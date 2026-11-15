@@ -72,8 +72,9 @@ pair is engine plumbing, hidden from the live stream AND from
 `native_transcript_items` (so reconcile never backfills it); the tool is
 auto-allowed without consulting the broker; and it does not cost the caller
 a tool round -- `_build_options` gives the CLI's `max_turns` headroom for it,
-and `_CallerRoundCap` keeps `max_tool_rounds` exact for caller tools. A schema turn that ends
-without a valid result -- a clean finish with no `structured_output` (the
+and `_CallerRoundCap` keeps `max_tool_rounds` exact for caller tools (on
+every capped turn, schema or not). A schema turn that ends without a valid
+result -- a clean finish with no `structured_output` (the
 CLI silently disables structured output when it rejects a schema at init),
 or the CLI's own `error_max_structured_output_retries` -- still COMPLETES,
 keeping its text, with `structured_output=None`; an honest partial
@@ -553,15 +554,20 @@ def _make_precompact_hook(pending_events: list[Event]) -> HookCallback:
 
 
 class _CallerRoundCap:
-    """Exact caller-tool-round cap for a schema turn (FR-6.5 with FR-1.3).
+    """Exact caller-tool-round cap for any capped turn (FR-6.5).
 
-    A schema turn gives the CLI `max_turns` headroom for its StructuredOutput
-    call (`_build_options`), so the CLI no longer enforces
-    `max_tool_rounds` exactly; this does. `_drive_client` feeds it every
-    `AssistantMessage` (`observe`); a round is one model response
-    (`message_id` -- the CLI streams one `AssistantMessage` per content
-    block, all sharing it) holding at least one caller tool call. The
-    permission bridge asks `is_over_cap` per call. Per-turn state, touched
+    The CLI's own `max_turns` cannot do this: the bundled CLI runs response
+    k's tools BEFORE its `max_turns` check, so `max_turns = N + 1` still
+    let `max_tool_rounds=0` run the first response's tools; and a schema
+    turn needs extra `max_turns` headroom for the StructuredOutput call
+    (FR-1.3), which would admit one more caller round. So the adapter
+    enforces the cap itself and `max_turns` is only a backstop
+    (`_build_options`). `_drive_client` feeds this every `AssistantMessage`
+    (`observe`); a round is one model response (`message_id` -- the CLI
+    streams one `AssistantMessage` per content block, all sharing it)
+    holding at least one caller tool call; StructuredOutput calls never
+    count. The permission bridge asks `is_over_cap` per call and refuses
+    the first call past the cap with an interrupt. Per-turn state, touched
     only from this turn's event loop.
 
     A single response holding BOTH a StructuredOutput call and a caller call
@@ -637,8 +643,8 @@ def _make_can_use_tool(
             # a caller tool -- the broker never sees it.
             return PermissionResultAllow()
         if round_cap is not None and await round_cap.is_over_cap(context.tool_use_id):
-            # FR-6.5 on a schema turn: the caller's cap, enforced here (not
-            # a broker verdict, so no PermissionRequested). Interrupting
+            # FR-6.5: the caller's cap, enforced here exactly (not a
+            # broker verdict, so no PermissionRequested). Interrupting
             # ends the CLI's loop; `_drive_client` reports the honest
             # `max_tool_rounds` completion.
             round_cap.hit = True
@@ -714,9 +720,10 @@ class ClaudeBackend(Backend):
             supports_native_resume=True,
             supports_fork=True,
             supports_transcript_read=True,
-            # Enforced natively via `ClaudeAgentOptions.max_turns` (FR-6.5):
-            # see `_build_options` for the rounds->turns mapping and
-            # `_drive_client` for the honest `max_tool_rounds` completion.
+            # Enforced exactly by `_CallerRoundCap` through the permission
+            # bridge (FR-6.5), with `ClaudeAgentOptions.max_turns` as a
+            # backstop (`_build_options`); `_drive_client` reports the honest
+            # `max_tool_rounds` completion.
             supports_tool_round_cap=True,
             # The engine owns the turn; re-running a started turn could
             # duplicate tool side effects (FR-6.6): pre-turn connect retry
@@ -805,18 +812,18 @@ class ClaudeBackend(Backend):
             system_prompt=cast(Any, system_prompt),
             model=ctx.model_spec.model,
             cwd=ctx.session.cwd,
-            # FR-6.5 rounds->turns mapping: the CLI's `max_turns` counts
-            # assistant responses in the query loop (`ResultMessage.
-            # num_turns`), and a run that executes N tool rounds takes N+1
-            # assistant responses (each round's response plus the final
-            # one), so a cap of N tool rounds is `max_turns = N + 1`.
-            # None (uncapped) stays None -- the CLI applies no cap of its
-            # own. A schema turn adds ONE more (FR-1.3): the CLI counts its
-            # StructuredOutput call as a turn, and when the model first ends
-            # with plain text it appends a reminder and asks again -- so N
-            # caller rounds need at most N + 2 responses there. That
-            # headroom would also admit an (N+1)th caller round, so on a
-            # schema turn `_CallerRoundCap` enforces N exactly.
+            # FR-6.5: the cap itself is enforced exactly by
+            # `_CallerRoundCap` (the CLI runs a response's tools before its
+            # own `max_turns` check, so `max_turns` alone overran it by one
+            # round). `max_turns` stays as a BACKSTOP only, bounding a
+            # runaway if the permission path were ever bypassed. Its value
+            # is the most responses a well-behaved capped run can need, so
+            # it never stops a turn before the exact cap does: N tool rounds
+            # take N + 1 responses (each round's response plus the final
+            # one); a schema turn adds one more (FR-1.3) -- the CLI counts
+            # its StructuredOutput call as a turn, and when the model first
+            # ends with plain text it appends a reminder and asks again.
+            # None (uncapped) stays None.
             max_turns=(
                 None
                 if ctx.max_tool_rounds is None
@@ -854,10 +861,10 @@ class ClaudeBackend(Backend):
             )
         pending_events: list[Event] = []
         terminate_flag = [False]
+        # FR-6.5: whenever a cap is set, the adapter enforces it exactly
+        # (`_CallerRoundCap`); `max_turns` is only a backstop.
         round_cap = (
-            _CallerRoundCap(ctx.max_tool_rounds)
-            if ctx.output_schema is not None and ctx.max_tool_rounds is not None
-            else None
+            _CallerRoundCap(ctx.max_tool_rounds) if ctx.max_tool_rounds is not None else None
         )
         client = ClaudeSDKClient(
             self._build_options(ctx, pending_events, terminate_flag, round_cap)
@@ -965,9 +972,9 @@ class ClaudeBackend(Backend):
                         )
                         return
                     if round_cap is not None and round_cap.hit:
-                        # FR-6.5: this abort was OUR cap denial on a schema
-                        # turn -- the same honest partial a plain capped
-                        # turn reports, with no structured result.
+                        # FR-6.5: this abort was OUR cap denial -- an honest
+                        # `max_tool_rounds` partial, with no structured
+                        # result.
                         yield TurnCompleted(
                             result=TurnResult(
                                 turn_id=ctx.turn_id,

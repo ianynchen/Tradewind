@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `claude`: `max_tool_rounds` now holds exactly (FR-6.5). The bundled CLI
+  runs a response's tools before it checks its own `max_turns`, so
+  `max_tool_rounds=0` still ran the first response's tools (and `N` let
+  round `N+1` run). The adapter now counts caller-tool rounds itself and
+  refuses the first call past the cap with an interrupt, and the turn
+  ends as `max_tool_rounds`. `max_turns` stays only as a backstop
+  (`N + 1`, or `N + 2` on a schema turn). Uncapped turns are unchanged.
+
 ### Added
 
 - Structured output on the `claude` and `langchain` backends (FR-1.3):

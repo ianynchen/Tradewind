@@ -1204,3 +1204,79 @@ async def test_call_without_a_tool_use_id_goes_to_the_broker_uncounted() -> None
     assert isinstance(result, PermissionResultAllow)
     assert asked == ["x"]
     assert round_cap.hit is False
+
+
+# --- FR-6.5 on a PLAIN turn (no schema). The bundled CLI runs response k's
+# tools BEFORE its own `max_turns` check, so `max_turns = N + 1` alone let
+# `max_tool_rounds=0` still run the first response's tools. The same exact
+# caller-round cap now applies whenever a cap is set; `max_turns` stays only
+# as a backstop. ---
+
+
+def _capped_plain_ctx(max_tool_rounds: int | None) -> TurnContext:
+    ctx = _make_ctx(output_schema=None, max_tool_rounds=max_tool_rounds)
+    ctx.broker = cast(Any, _AllowBroker())
+    return ctx
+
+
+async def test_plain_turn_with_zero_cap_executes_no_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_agent_sdk import PermissionResultDeny
+
+    decisions = _install_cli_like_client(monkeypatch, [[("t1", "mcp__tradewind__x")], []])
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_capped_plain_ctx(0))]
+
+    assert len(decisions) == 1
+    assert isinstance(decisions[0], PermissionResultDeny)
+    assert decisions[0].interrupt is True
+    assert not any(isinstance(e, PermissionRequested) for e in events)
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert len(completed) == 1
+    assert completed[0].result.end_reason == "max_tool_rounds"
+    assert completed[0].result.structured_output is None
+
+
+async def test_plain_turn_with_cap_one_refuses_the_second_round(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from claude_agent_sdk import PermissionResultAllow, PermissionResultDeny
+
+    decisions = _install_cli_like_client(
+        monkeypatch, [[("t1", "mcp__tradewind__x")], [("t2", "mcp__tradewind__x")], []]
+    )
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_capped_plain_ctx(1))]
+
+    assert [type(d) for d in decisions] == [PermissionResultAllow, PermissionResultDeny]
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.end_reason == "max_tool_rounds"
+
+
+async def test_uncapped_plain_turn_is_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No cap: every round goes to the broker and runs, as before."""
+    from claude_agent_sdk import PermissionResultAllow
+
+    decisions = _install_cli_like_client(
+        monkeypatch, [[("t1", "mcp__tradewind__x")], [("t2", "mcp__tradewind__x")], []]
+    )
+    captured_options: list[Any] = []
+    real_build_options = ClaudeBackend._build_options
+
+    def capturing(self: ClaudeBackend, *args: Any, **kwargs: Any) -> Any:
+        options = real_build_options(self, *args, **kwargs)
+        captured_options.append(options)
+        return options
+
+    monkeypatch.setattr(ClaudeBackend, "_build_options", capturing)
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = [event async for event in backend.run(_capped_plain_ctx(None))]
+
+    assert [type(d) for d in decisions] == [PermissionResultAllow, PermissionResultAllow]
+    assert captured_options[0].max_turns is None
+    completed = [e for e in events if isinstance(e, TurnCompleted)]
+    assert completed[0].result.end_reason == "end_turn"

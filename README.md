@@ -299,7 +299,8 @@ never be mistaken for a clean finish:
 
 `max_tool_rounds` (non-negative int; `0` = one model response, no tool execution) is enforced
 only where an adapter can do so honestly — `supports_tool_round_cap` in the capability matrix.
-`langchain` caps its own loop exactly; `claude` maps it to the SDK's native `max_turns`.
+`langchain` caps its own loop exactly; `claude` counts caller-tool rounds itself and refuses the
+first tool call past the cap (the SDK's `max_turns` is kept only as a backstop).
 `codex`/`cursor` run their loops engine-side with no cap surface and raise `Unsupported` when
 one is requested — never a timer-faked cap.
 
@@ -468,7 +469,7 @@ emulates silently — an unsupported call raises `Unsupported`.
 | `supports_native_resume` | no (mirror rebuild) | yes | yes | yes |
 | `supports_fork` | no (`tw.fork` covers it) | yes | yes | no |
 | `supports_transcript_read` | no | yes | yes | no |
-| `supports_tool_round_cap` | yes (own loop) | yes (native `max_turns`) | no | no |
+| `supports_tool_round_cap` | yes (own loop) | yes (exact, via the permission bridge) | no | no |
 
 **NATIVE→REPLAY degrade is not implemented** (ARCHITECTURE §7 P-7): a reaped or expired native
 session on `claude`/`codex`/`cursor` currently surfaces as `TurnFailed` rather than degrading
