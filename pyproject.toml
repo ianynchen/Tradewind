@@ -107,6 +107,14 @@ module = "tradewind.application.turn_runner"
 disallow_any_expr = false
 
 [[tool.mypy.overrides]]
+# `PolicyGate` calls the public `PermissionBroker.decide(str, dict[str, Any])`
+# contract and unpacks its `BrokerDecision`; the flagged expressions are that
+# Any-typed protocol signature itself (same root cause as `turn_runner`).
+# `disallow_any_explicit` stays on. Narrowed to this module only.
+module = "tradewind.application.policy_gate"
+disallow_any_expr = false
+
+[[tool.mypy.overrides]]
 # `ToolHost` is the first application-layer code to actually *invoke* two
 # Any-tainted third-party contracts rather than merely store them:
 # (1) domain `Tool.handler: Callable[..., Awaitable[Any]]` (task-2-brief.md

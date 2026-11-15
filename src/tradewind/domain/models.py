@@ -13,6 +13,8 @@ from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, SecretStr
 
+from tradewind.domain.policy import Mode, Rule
+
 BackendName = Literal["claude", "codex", "cursor", "langchain"]
 TierName = str
 EffortLevel = Literal["low", "medium", "high", "xhigh"]
@@ -288,6 +290,8 @@ class SessionOptions(BaseModel):
     output_schema: dict[str, Any] | None = None
     permission_broker: PermissionBroker | None = None
     cwd: Path | None = None
+    permission_mode: Mode | None = None
+    policy_rules: list[Rule] = []
 
     def snapshot(self) -> dict[str, Any]:
         """Declarative parts only (I-2): tool names+schemas, redacted MCP
@@ -324,6 +328,8 @@ class SessionOptions(BaseModel):
             "tier": self.tier,
             "output_schema": self.output_schema,
             "cwd": str(self.cwd) if self.cwd is not None else None,
+            "permission_mode": self.permission_mode,
+            "policy_rules": [rule.to_dict() for rule in self.policy_rules],
             "has_unrefed_secrets": has_unrefed_secrets,
         }
 
@@ -438,6 +444,24 @@ def retry_notice(
             "max_attempts": max_attempts,
             "delay_s": delay_s,
             "error": error,
+        },
+    )
+
+
+def policy_record_notice(
+    *, action_kind: str, summary: str, outcome: str, rule_ids: list[str]
+) -> NormalizedMessage:
+    """The mirrored `kind="event"` visibility item for a policy decision a
+    rule asked to record (turn governance, same form as `retry_notice`)."""
+    return NormalizedMessage(
+        role="assistant",
+        kind="event",
+        content={
+            "type": "policy_recorded",
+            "action_kind": action_kind,
+            "summary": summary,
+            "outcome": outcome,
+            "rule_ids": rule_ids,
         },
     )
 
