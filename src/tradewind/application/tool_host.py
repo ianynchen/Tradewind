@@ -460,18 +460,29 @@ class ToolHost:
     ) -> protocol.Response | None:
         """Answer one request line, or return `None` if the peer closes the
         connection first. A closed peer means the engine gave up on the call
-        (05 "Port and interface changes"): the call is cancelled, so a
-        pending broker question is cancelled and a late "ask" answer can
-        never run the tool. Bytes that arrive while the call runs (a second,
-        pipelined request line) are fed back into `buffered`, so the
-        protocol is unchanged. Limitation: a peer that half-closes its write
+        (05 "Port and interface changes"): the call is cancelled while it is
+        still before its tool runs, so a pending broker question is
+        cancelled and a late "ask" answer can never start the tool. Once the
+        broker has allowed the call and the tool (local handler or
+        MCP-proxied call) has started, the tool runs in a shielded scope
+        (`_call(shield_dispatch=True)`): an approved action finishes or
+        fails cleanly, and only its reply is discarded. Bytes that arrive
+        while the call runs (a second, pipelined request line) are fed back
+        into `buffered`, so the protocol is unchanged. An exception from the
+        call is re-raised as itself, not wrapped in the task group's
+        `ExceptionGroup`, so callers see the same exception type as before
+        this method existed. Limitation: a peer that half-closes its write
         side after sending (`send_eof`) is treated as gone; the shim never
         does that."""
         answers: list[protocol.Response] = []
+        failures: list[Exception] = []
         async with anyio.create_task_group() as tg:
 
             async def answer() -> None:
-                answers.append(await self._handle_socket_line(line))
+                try:
+                    answers.append(await self._handle_socket_line(line))
+                except Exception as exc:  # re-raised below, outside the task group
+                    failures.append(exc)
                 tg.cancel_scope.cancel()
 
             tg.start_soon(answer)
@@ -482,6 +493,8 @@ class ToolHost:
                     tg.cancel_scope.cancel()
                     break
                 buffered.feed_data(data)
+        if failures:
+            raise failures[0]
         return answers[0] if answers else None
 
     async def _send_response_line(self, stream: SocketStream, response: protocol.Response) -> bool:
@@ -509,7 +522,7 @@ class ToolHost:
             return protocol.ErrorResponse(error=str(exc))
         if isinstance(request, protocol.ListRequest):
             return protocol.ListResponse(tools=self.schemas())
-        outcome = await self.call(request.name, request.arguments)
+        outcome = await self._call(request.name, request.arguments, shield_dispatch=True)
         return protocol.CallResponse(content=outcome.content, is_error=outcome.is_error)
 
     async def shim_server_def(self) -> McpServerDef:
@@ -543,6 +556,16 @@ class ToolHost:
         return local + list(self._mcp_schemas.values()) + result
 
     async def call(self, name: str, arguments: dict[str, object]) -> ToolOutcome:
+        return await self._call(name, arguments, shield_dispatch=False)
+
+    async def _call(
+        self, name: str, arguments: dict[str, object], *, shield_dispatch: bool
+    ) -> ToolOutcome:
+        """`shield_dispatch` (socket path only): once the broker has allowed
+        the call, run the tool in a shielded scope so an abandoned
+        connection cannot stop an approved action half-way. In-process
+        callers (`call()`) keep today's behaviour: cancelling them cancels
+        the tool."""
         if name == RESULT_TOOL_NAME and self._result_validator is not None:
             # Structural pass-through (05 §2.3): never asks the broker.
             return self._submit_result(self._result_validator, arguments)
@@ -557,9 +580,12 @@ class ToolHost:
                 # handle to interrupt from here) -- a recorded Phase-3
                 # limitation, not a silent drop (spec + RUNBOOK).
                 return ToolOutcome(content=reason or "permission denied", is_error=True)
-        if name in self._tools:
-            return await self._call_local(self._tools[name], arguments)
-        return await self._call_mcp(name, arguments)
+        with anyio.CancelScope(shield=shield_dispatch):
+            if name in self._tools:
+                outcome = await self._call_local(self._tools[name], arguments)
+            else:
+                outcome = await self._call_mcp(name, arguments)
+        return outcome
 
     def _submit_result(
         self,
