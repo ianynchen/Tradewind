@@ -132,3 +132,34 @@ request; it schedules a later prompt in the same session, whose own tool
 calls then ask as usual.
 
 Turns used: 4 of 20. The spike stopped here for the owner's decision.
+
+### Owner ruling and follow-up probes (turns 5–7)
+
+The owner first chose to deny escapes for interactive shells
+(`IsDaemon: true` + `BypassSandbox: true`). That does not close the path:
+any long-running command (e.g. a background `sh`) can receive input
+through `manage_task` too. The owner then chose **(d): no escapes at all;
+network through the sandbox's allow list**, subject to this test.
+
+| Turn | Probe | Result |
+|---|---|---|
+| 5 | `session/new` `_meta.antigravity.disabledTools: ["manage_task"]`, then start `bash` and send input | **Ignored by agy 1.5.9.** `manage_task send_input` still ran (`marker-input2` created). No switch removes the input tool. |
+| 6 | `toolPermission: "strict"` + `permissions.allow: ["read_url(example.com)"]`, sandboxed `curl https://example.com` and `https://www.iana.org` | Both asked; **both blocked** (exit 6, host not resolved). Matches the docs: "Strict mode automatically turns on sandboxing with network access denied." |
+| 7 | Same with `toolPermission: "request-review"` | Every command still asked (good), but **both curls blocked again**, and `touch marker-rr` in the workspace now **failed** with a sandbox error (it succeeded in turns 3–4 without a `permissions` block). |
+
+Documentation read (antigravity.google/docs/permissions, /sandbox,
+/settings, /cli/reference, schemas/v1/settings.json): rules are
+`permissions.{allow,ask,deny}` with `command(...)`, `read_file(...)`,
+`write_file(...)`, `read_url(...)`, `execute_url(...)`, `mcp(...)`,
+`unsandboxed(...)` (business/enterprise only); "Domains allowed under
+`read_url` are added to the sandbox's outbound allowlist"; `toolPermission`
+values `request-review` (default), `proceed-in-sandbox`, `strict`,
+`always-proceed`.
+
+**Result for (d):** on agy 1.5.9 with a personal Google AI Pro account over
+ACP, the documented sandbox allow list did **not** give sandboxed commands
+network access in either permission level tried, and a `permissions`
+block also changed workspace write access. (d) as designed could not be
+shown to work. Without an allow list, (d) means: no network from the
+agent's own shell at all. Settings were restored to the turn 3–4 state.
+Turns used: 7 of 20. Stopped for the owner's decision.
