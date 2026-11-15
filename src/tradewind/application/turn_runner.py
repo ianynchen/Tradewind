@@ -794,86 +794,99 @@ class TurnRunner:
                     work=supervisor,
                 )
 
-                # FR-6.6 work supervisor (05 §3): a TASK (deliberately not
-                # a cancel scope across this generator's yields -- the
-                # 0.5.0 pitfall class) that, when a limit fires, records
-                # why, queues one timeout notice (drained before the next
-                # event, so before any terminal) and interrupts the
-                # backend; if the stream then ends without a terminal
-                # event, the synthesized terminal below reads `timed_out`.
-                async def on_fire(limit: str, value: float, elapsed: float) -> None:
-                    ctx.timeout_reason = {"limit": limit, "value": value, "elapsed": elapsed}
-                    timed_out[0] = True
-                    gate_events.append(
-                        ItemCompleted(
-                            message=timeout_notice(limit=limit, value=value, elapsed=elapsed)
-                        )
-                    )
-                    # Shielded: the backend may answer with its terminal
-                    # while this call is in flight, and the runner then
-                    # cancels this task; the interrupt itself must finish,
-                    # so `stop_supervisor` awaits it.
-                    nonlocal interrupt_task
-                    interrupt_task = asyncio.ensure_future(backend.interrupt(session_id))
-                    await asyncio.shield(interrupt_task)
-
-                supervisor_task = asyncio.get_running_loop().create_task(supervisor.run(on_fire))
-
-                async def stop_supervisor() -> None:
-                    """Cancel the supervisor, then wait for an interrupt it
-                    sent; that interrupt's error is raised here."""
-                    supervisor_task.cancel()
-                    with contextlib.suppress(asyncio.CancelledError):
-                        await supervisor_task
-                    if interrupt_task is not None:
-                        await _await_interrupt(interrupt_task, session_id)
-
-                # `aclosing` (not a bare `async for`) so that if THIS
-                # generator (`execute()`) is itself abandoned/aclosed mid-turn
-                # (a consumer `break`s out of `session.stream()` without
-                # calling `stop()`), the backend's own generator is closed
-                # deterministically right here -- rather than left to
-                # whenever the garbage collector happens to finalize it -- so
-                # a backend blocked on e.g. a network call unwinds its
-                # `finally`s (cancel scopes, connections) immediately.
-                # `Backend.run()`'s port signature is the broader
-                # `AsyncIterator[Event]` (ports.py, task-8 brief, not
-                # touched here), but every concrete implementation is an
-                # `async def ... yield ...` generator (an `AsyncGenerator`,
-                # which is what `aclosing` needs -- an `aclose()` method);
-                # the cast reflects that real contract without widening the
-                # port's own.
-                backend_run = cast("AsyncGenerator[Event]", backend.run(ctx))
-                async with aclosing(backend_run) as backend_events:
-                    async for event in backend_events:
-                        # Gate notices raised since the last event come first.
-                        for gate_event in await drain_gate_events():
-                            yield gate_event
-                        if isinstance(event, ItemCompleted):
-                            await anyio.to_thread.run_sync(
-                                self._store.append_message, session_id, turn_id, event.message
+                # 05 §4: `prepare_turn` runs before the supervisor starts
+                # (its time is not counted by any limit) and before `run()`.
+                # A stop requested before or during it ends the turn without
+                # `run()`: the synthesized terminal below records it as
+                # interrupted, with no `TurnStarted`. A `ConfigError` from it
+                # (a preflight `Stop`) fails the turn and propagates.
+                stopped_before_run = session_id in self._interrupt_requested
+                if not stopped_before_run:
+                    await backend.prepare_turn(ctx)
+                    stopped_before_run = session_id in self._interrupt_requested
+                if not stopped_before_run:
+                    # FR-6.6 work supervisor (05 §3): a TASK (deliberately not
+                    # a cancel scope across this generator's yields -- the
+                    # 0.5.0 pitfall class) that, when a limit fires, records
+                    # why, queues one timeout notice (drained before the next
+                    # event, so before any terminal) and interrupts the
+                    # backend; if the stream then ends without a terminal
+                    # event, the synthesized terminal below reads `timed_out`.
+                    async def on_fire(limit: str, value: float, elapsed: float) -> None:
+                        ctx.timeout_reason = {"limit": limit, "value": value, "elapsed": elapsed}
+                        timed_out[0] = True
+                        gate_events.append(
+                            ItemCompleted(
+                                message=timeout_notice(limit=limit, value=value, elapsed=elapsed)
                             )
-                        if isinstance(event, TurnCompleted):
-                            terminal_status = event.result.status
-                            final_text = event.result.final_text
-                            structured_output = event.result.structured_output
-                            usage = cast("dict[str, object]", event.result.usage)
-                            cost_usd = event.result.cost_usd
-                        elif isinstance(event, TurnFailed):
-                            terminal_status = "failed"
-                            error = event.error
-                        if isinstance(event, TurnCompleted | TurnFailed):
-                            # The turn is over: no limit may fire while the
-                            # terminal is consumed or the backend cleans up.
-                            # A notice from a limit that fired just before
-                            # still precedes the terminal.
-                            await stop_supervisor()
+                        )
+                        # Shielded: the backend may answer with its terminal
+                        # while this call is in flight, and the runner then
+                        # cancels this task; the interrupt itself must finish,
+                        # so `stop_supervisor` awaits it.
+                        nonlocal interrupt_task
+                        interrupt_task = asyncio.ensure_future(backend.interrupt(session_id))
+                        await asyncio.shield(interrupt_task)
+
+                    supervisor_task = asyncio.get_running_loop().create_task(
+                        supervisor.run(on_fire)
+                    )
+
+                    async def stop_supervisor() -> None:
+                        """Cancel the supervisor, then wait for an interrupt it
+                        sent; that interrupt's error is raised here."""
+                        supervisor_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await supervisor_task
+                        if interrupt_task is not None:
+                            await _await_interrupt(interrupt_task, session_id)
+
+                    # `aclosing` (not a bare `async for`) so that if THIS
+                    # generator (`execute()`) is itself abandoned/aclosed mid-turn
+                    # (a consumer `break`s out of `session.stream()` without
+                    # calling `stop()`), the backend's own generator is closed
+                    # deterministically right here -- rather than left to
+                    # whenever the garbage collector happens to finalize it -- so
+                    # a backend blocked on e.g. a network call unwinds its
+                    # `finally`s (cancel scopes, connections) immediately.
+                    # `Backend.run()`'s port signature is the broader
+                    # `AsyncIterator[Event]` (ports.py, task-8 brief, not
+                    # touched here), but every concrete implementation is an
+                    # `async def ... yield ...` generator (an `AsyncGenerator`,
+                    # which is what `aclosing` needs -- an `aclose()` method);
+                    # the cast reflects that real contract without widening the
+                    # port's own.
+                    backend_run = cast("AsyncGenerator[Event]", backend.run(ctx))
+                    async with aclosing(backend_run) as backend_events:
+                        async for event in backend_events:
+                            # Gate notices raised since the last event come first.
                             for gate_event in await drain_gate_events():
                                 yield gate_event
-                        self._tap(event, turn_id)
-                        yield event
+                            if isinstance(event, ItemCompleted):
+                                await anyio.to_thread.run_sync(
+                                    self._store.append_message, session_id, turn_id, event.message
+                                )
+                            if isinstance(event, TurnCompleted):
+                                terminal_status = event.result.status
+                                final_text = event.result.final_text
+                                structured_output = event.result.structured_output
+                                usage = cast("dict[str, object]", event.result.usage)
+                                cost_usd = event.result.cost_usd
+                            elif isinstance(event, TurnFailed):
+                                terminal_status = "failed"
+                                error = event.error
+                            if isinstance(event, TurnCompleted | TurnFailed):
+                                # The turn is over: no limit may fire while the
+                                # terminal is consumed or the backend cleans up.
+                                # A notice from a limit that fired just before
+                                # still precedes the terminal.
+                                await stop_supervisor()
+                                for gate_event in await drain_gate_events():
+                                    yield gate_event
+                            self._tap(event, turn_id)
+                            yield event
 
-                await stop_supervisor()
+                    await stop_supervisor()
 
                 if terminal_status is None:
                     # A notice raised after the last backend event must
@@ -883,7 +896,8 @@ class TurnRunner:
                     # The backend's iterator ended with neither TurnCompleted
                     # nor TurnFailed -- per `Backend.run`'s contract, this
                     # happens on a mid-turn interrupt: the caller's stop(),
-                    # or a fired FR-6.6 supervisor limit.
+                    # or a fired FR-6.6 supervisor limit -- or `run()` was
+                    # never called (a stop around `prepare_turn`, 05 §4).
                     interrupted = timed_out[0] or session_id in self._interrupt_requested
                     terminal_status = "interrupted" if interrupted else "failed"
                     error = None if interrupted else "turn ended without emitting a terminal event"

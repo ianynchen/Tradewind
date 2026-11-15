@@ -280,9 +280,13 @@ def _redact_secret_map(values: dict[str, str]) -> tuple[dict[str, str], bool]:
 
 
 class SessionOptions(BaseModel):
-    """Declarative parts snapshot into `options_json` (I-2); `tools` and
-    `permission_broker` carry live objects re-supplied by the embedder at
-    resume and are never part of the snapshot."""
+    """Declarative parts snapshot into `options_json` (I-2); `tools`,
+    `permission_broker` and `on_preflight` carry live objects re-supplied
+    by the embedder at resume and are never part of the snapshot.
+
+    `on_preflight(question, details, choices)` answers a preflight `Ask`
+    (05-turn-governance §4) with one of `choices`; None, an error, or an
+    answer not in `choices` means the check's safe default."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -293,6 +297,7 @@ class SessionOptions(BaseModel):
     tier: TierName | None = None
     output_schema: dict[str, Any] | None = None
     permission_broker: PermissionBroker | None = None
+    on_preflight: Callable[[str, dict[str, object], list[str]], Awaitable[str]] | None = None
     cwd: Path | None = None
     permission_mode: Mode | None = None
     policy_rules: list[Rule] = []
@@ -300,7 +305,7 @@ class SessionOptions(BaseModel):
     def snapshot(self) -> dict[str, Any]:
         """Declarative parts only (I-2): tool names+schemas, redacted MCP
         defs, system_prompt, tier, cwd. Excludes live objects (tool
-        handlers, permission_broker) entirely."""
+        handlers, permission_broker, on_preflight) entirely."""
         has_unrefed_secrets = False
         mcp_servers_snapshot: list[dict[str, Any]] = []
         for server in self.mcp_servers:

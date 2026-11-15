@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 import functools
 import warnings
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import aclosing
 from pathlib import Path
 from typing import Any, ClassVar, cast
@@ -2693,3 +2693,151 @@ async def test_gate_notice_precedes_synthesized_terminal(tmp_path: Path) -> None
     assert _is_policy_notice(events[-2])
     stored = tw._store.history(_VALID_ID, include_children=False, include_raw=False)
     assert any(m.content.get("type") == "policy_recorded" for m in stored)
+
+
+# --- 05-turn-governance §4: prepare_turn and a stop around it ---
+
+
+class _PreparingBackend(_ScriptedBackend):
+    """Records the calls the runner makes. `prepare_turn` sleeps for
+    `prepare_s`, or (with `wait_for_interrupt`) waits until `interrupt()`
+    arrives; `on_floor` runs while the runner sets the turn up, before
+    `prepare_turn`."""
+
+    def __init__(
+        self,
+        profile: Profile,
+        native_config: NativeStoreConfig,
+        *,
+        prepare_s: float = 0.0,
+        wait_for_interrupt: bool = False,
+        raise_in_prepare: Exception | None = None,
+    ) -> None:
+        super().__init__(profile, native_config, [])
+        self._prepare_s = prepare_s
+        self._wait_for_interrupt = wait_for_interrupt
+        self._raise_in_prepare = raise_in_prepare
+        self.on_floor: Callable[[], None] | None = None
+        self.calls: list[str] = []
+        self.side_effects: list[str] = []
+        self.in_prepare = anyio.Event()
+        self._interrupted = anyio.Event()
+
+    def floor_rules(self) -> list[Rule]:
+        if self.on_floor is not None:
+            self.on_floor()
+        return []
+
+    async def prepare_turn(self, ctx: TurnContext) -> None:  # noqa: ARG002 -- Backend interface
+        self.calls.append("prepare_turn")
+        self.in_prepare.set()
+        if self._raise_in_prepare is not None:
+            raise self._raise_in_prepare
+        if self._wait_for_interrupt:
+            await self._interrupted.wait()
+        await anyio.sleep(self._prepare_s)
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        self.calls.append("run")
+        self.side_effects.append("deleted files")
+        yield TurnStarted(turn_id=ctx.turn_id)
+        yield _completed()
+
+    async def interrupt(self, session_id: str) -> None:  # noqa: ARG002 -- Backend interface
+        self.calls.append("interrupt")
+        self._interrupted.set()
+
+
+def _assert_interrupted_without_turn_started(events: list[Event]) -> None:
+    assert not any(isinstance(e, TurnStarted) for e in events)
+    assert isinstance(events[-1], TurnCompleted)
+    assert events[-1].result.status == "interrupted"
+    assert events[-1].result.end_reason == "interrupted"
+
+
+async def test_stop_before_prepare_turn_records_interrupted_without_run(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _PreparingBackend(profile, NativeStoreConfig())
+    # A stop that lands while the runner sets the turn up.
+    fake.on_floor = functools.partial(tw._turn_runner._interrupt_requested.add, _VALID_ID)
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    events = [e async for e in session.stream("hi")]
+
+    _assert_interrupted_without_turn_started(events)
+    assert fake.calls == []
+    assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == ["interrupted"]
+
+
+async def test_stop_after_prepare_turn_records_interrupted_without_run(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _PreparingBackend(profile, NativeStoreConfig(), wait_for_interrupt=True)
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    events: list[Event] = []
+
+    async def consume() -> None:
+        events.extend([e async for e in session.stream("hi")])
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(consume)
+        with anyio.fail_after(5):
+            await fake.in_prepare.wait()
+        # The backend receives the interrupt while it waits in prepare_turn.
+        await session.stop()
+
+    _assert_interrupted_without_turn_started(events)
+    assert fake.calls == ["prepare_turn", "interrupt"]
+    assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == ["interrupted"]
+
+
+async def test_run_not_called_and_no_side_effect(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _PreparingBackend(profile, NativeStoreConfig(), wait_for_interrupt=True)
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(session.run, "hi")
+        with anyio.fail_after(5):
+            await fake.in_prepare.wait()
+        await session.stop()
+
+    assert "run" not in fake.calls
+    assert fake.side_effects == []
+
+
+async def test_config_error_from_prepare_turn_propagates_and_fails_the_turn(
+    tmp_path: Path,
+) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _PreparingBackend(
+        profile, NativeStoreConfig(), raise_in_prepare=ConfigError("workspace is locked")
+    )
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    with pytest.raises(ConfigError, match="workspace is locked"):
+        await session.run("hi")
+
+    assert fake.calls == ["prepare_turn"]
+    assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == ["failed"]
+
+
+async def test_prepare_turn_time_not_counted_by_supervisor(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _PreparingBackend(profile, NativeStoreConfig(), prepare_s=0.5)
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    events = [e async for e in session.stream("hi", request_timeout_s=0.2)]
+
+    assert not any(_is_timeout_notice(e) for e in events)
+    assert isinstance(events[-1], TurnCompleted)
+    assert events[-1].result.status == "completed"

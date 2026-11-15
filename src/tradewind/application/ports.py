@@ -383,7 +383,26 @@ class Backend(ABC):
         self.native_config = native_config
 
     async def prepare_turn(self, ctx: TurnContext) -> None:  # noqa: B027
-        """Per-turn setup before `run()`; the default does nothing."""
+        """Per-turn setup before `run()` (05-turn-governance §4); the
+        default does nothing.
+
+        The runner awaits this after building `ctx` and before the work
+        supervisor starts and `run()` is called, so its time is not counted
+        by any limit. A backend runs its preflight checks here
+        (`tradewind.application.preflight.run_checks`) and stores answers
+        on `ctx.preflight`; it changes nothing itself -- `run()` applies
+        the answers, before `TurnStarted`.
+
+        A backend registers the turn as in flight for
+        `ctx.session.session_id` from the start of this method, so
+        `interrupt()` reaches a turn that waits here (e.g. on a preflight
+        question) and ends the wait. When a stop was requested before or
+        during this call, the runner does not call `run()`.
+
+        Failure modes:
+            ConfigError: a preflight check returned `Stop`; the turn ends
+                `failed` and the error propagates to the caller.
+        """
 
     def floor_rules(self) -> list[Rule]:
         """Backend-specific floor rules (§2.4); none by default."""
@@ -407,7 +426,13 @@ class Backend(ABC):
     def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
         """Execute one turn, yielding the normalized event stream.
 
-        `TurnStarted` is always the first event. On a clean finish,
+        `TurnStarted` is always the first event, with one exception: a
+        turn stopped, or failed, before `TurnStarted` (a stop around
+        `prepare_turn`, or a stop, limit or error while `run()` is still
+        before `TurnStarted`) gets a terminal record with no `TurnStarted`
+        (05-turn-governance §4). Work `run()` does before `TurnStarted`
+        (e.g. applying `ctx.preflight` answers) may raise `ConfigError`.
+        On a clean finish,
         `TurnCompleted` is the last event; on an unrecoverable error,
         `TurnFailed` is the last event instead. `interrupt()` called for
         `ctx.session.session_id` while this iterator is in flight ends it
