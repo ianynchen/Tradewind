@@ -76,3 +76,59 @@ each key is honoured over ACP.
 `GEMINI_API_KEY` (T3 Code scrubs it), `GOOGLE_API_KEY`,
 `GOOGLE_APPLICATION_CREDENTIALS`, `ANTIGRAVITY_APP_DATA_DIR`,
 `ANTIGRAVITY_CREDENTIAL_SCOPE`.
+
+## Task 3 — settings (2 of 20 turns used)
+
+- Settings file: `<gemini-dir>/antigravity-cli/settings.json`; a run before
+  the file existed logged "Failed to load CLI settings, using defaults"; runs
+  after it did not. Spike settings: `toolPermission: "strict"`,
+  `agentMode: ""`, `enableTerminalSandbox: true`,
+  `disableSlashCommands: true`, `useAICredits: false`.
+- The owner's own setup is `~/.gemini/antigravity-cli/settings.json` and
+  `~/.gemini/config/mcp_config.json`; with `--gemini-dir`, neither is read
+  (the spike dir has no `config/mcp_config.json`).
+- Slash commands (turns 1–2, **inconclusive**): `agy` still advertises 13
+  commands (`goal`, `compact`, `swarm`, `teamwork`, `schedule`, …) with
+  `disableSlashCommands: true`. `/help` (not a command) and `/compact` both
+  produced a normal model answer and no compaction updates, which suggests
+  no expansion over ACP (T3 Code notes the same for `/compact`), but this is
+  not proven. Tradewind keeps both protections from the design
+  (`disableSlashCommands` and the `Message:` prefix).
+
+## Task 4 — permission traps (turns 3–4, all requests answered `allow_once`)
+
+Every approval request offered exactly `allow_once` ("Allow") and
+`reject_once` ("Deny"). Each request followed a `tool_call` update with the
+same `toolCallId`, `kind: "execute"`, and `rawInput` with `CommandLine`,
+`BypassSandbox`, `WaitMsBeforeAsync`, `toolSummary` (and `IsDaemon` for a
+long-running shell).
+
+| Trap | Request seen | Action happened | Evidence |
+|---|---|---|---|
+| Shell command in workspace (`touch marker-shell`) | yes | yes | marker file |
+| Write outside workspace, under `/tmp` | yes | yes (temp dir is granted by default) | marker file |
+| Read outside workspace, under `/tmp` | yes | yes | secret in the reply |
+| Loopback network, in sandbox | yes | **blocked by the sandbox** (exit 7, no canary hit) | canary log empty |
+| Non-loopback network, in sandbox | yes | blocked by the sandbox | canary log empty |
+| Sandbox escape (`BypassSandbox: true`, loopback curl) | **yes** | yes after allow | canary hit `/escape` |
+| Write outside workspace, in `$HOME` | yes | blocked by the sandbox | no marker file |
+| Read outside workspace, in `$HOME` | yes | blocked by the sandbox | secret not in the log |
+| Background command (`sleep 15 && touch marker-bg`) | yes | yes | marker file |
+| Interactive shell start (`bash`, `IsDaemon: true`) | yes | yes | task id |
+| **Input into the running shell (`manage_task` `send_input`)** | **no** | **yes** (`touch marker-input` ran) | marker file; `tool_call` kind `other`, title "Run manage_task", **no `session/request_permission`** |
+| Scheduled follow-up (`schedule`, 15 s) | no | yes (the agent scheduled its own follow-up prompt) | `tool_call` "Run schedule" |
+
+The sandbox message for a blocked command says: "you can run the command
+again with `BypassSandbox` set to true to request explicit user permission".
+
+**Risky path found (gate rule: stop and report to the owner).** Input sent
+to an already-approved interactive shell runs **without any approval
+request**. In this run the shell was inside the sandbox, so the input was
+contained (workspace writes, no network). But if the approved shell had
+been started with `BypassSandbox: true`, every later input line (e.g.
+`git push`, a deploy command) would run outside the sandbox with no
+request reaching the broker. The `schedule` tool also runs without a
+request; it schedules a later prompt in the same session, whose own tool
+calls then ask as usual.
+
+Turns used: 4 of 20. The spike stopped here for the owner's decision.
