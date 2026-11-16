@@ -136,8 +136,8 @@ def _tradewind(tmp_path: Path) -> Tradewind:
     )
 
 
-def _workspace(tmp_path: Path, name: str = "ws") -> Path:
-    workspace = tmp_path / name
+def _workspace(tmp_path: Path) -> Path:
+    workspace = tmp_path / "ws"
     workspace.mkdir()
     return workspace
 
@@ -162,6 +162,12 @@ async def _create(
     )
 
 
+def _session_start_hook(marker: Path) -> dict[str, object]:
+    """A `SessionStart` hook that only touches `marker`."""
+    hook = {"type": "command", "command": f"touch {shlex.quote(str(marker))}"}
+    return {"SessionStart": [{"hooks": [hook]}]}
+
+
 def _decide(
     session: Session, action: Literal["delete", "proceed"], expected: list[Path]
 ) -> CustomizationDecision:
@@ -183,8 +189,7 @@ async def test_project_hook_runs_on_proceed_not_after_delete(tmp_path: Path) -> 
     with anyio.fail_after(_CAP_S):
         marker = tmp_path / "hook-ran"
         workspace = _workspace(tmp_path)
-        hook = {"type": "command", "command": f"touch {shlex.quote(str(marker))}"}
-        settings_path = _write_settings(workspace, {"hooks": {"SessionStart": [{"hooks": [hook]}]}})
+        settings_path = _write_settings(workspace, {"hooks": _session_start_hook(marker)})
         tradewind = _tradewind(tmp_path)
         expected = [Path(".claude/settings.json")]
 
@@ -221,14 +226,25 @@ async def test_project_allow_rule_does_not_bypass_can_use_tool(tmp_path: Path) -
     so the rule matched the tool. Today the `.claude/settings.json` flag is
     needed for its hooks, not for this permission rule.
 
-    Pass (positive evidence): with the rule present, the broker got the
-    probe tool, and the tool ran. Fail: the tool ran with no broker
-    question; a future CLI then skips `can_use_tool` for project allow
-    rules. "Inconclusive": the model did not call the tool."""
+    The same settings file has a `SessionStart` hook that touches a marker
+    in the temp folder. The marker proves the file was loaded, so a CLI
+    that ignores the file cannot give a vacuous pass.
+
+    Pass (positive evidence): the settings were loaded (marker), the broker
+    got the probe tool, and the tool ran. Fail: the tool ran with no broker
+    question; a permission rule then skips `can_use_tool`. "Inconclusive":
+    the model did not call the tool, or the settings were not loaded."""
     _print_engine_version()
     with anyio.fail_after(_CAP_S):
+        marker = tmp_path / "settings-loaded"
         workspace = _workspace(tmp_path)
-        _write_settings(workspace, {"permissions": {"allow": [_PROBE_FULL_NAME]}})
+        _write_settings(
+            workspace,
+            {
+                "permissions": {"allow": [_PROBE_FULL_NAME]},
+                "hooks": _session_start_hook(marker),
+            },
+        )
         probe, broker = _Probe(), _RecordingBroker()
         session = await _create(
             _tradewind(tmp_path), workspace, tools=[probe.tool()], broker=broker
@@ -241,10 +257,13 @@ async def test_project_allow_rule_does_not_bypass_can_use_tool(tmp_path: Path) -
         if not probe.calls and _PROBE not in broker.calls:
             pytest.fail(f"inconclusive: the model did not call the probe tool\n{detail}")
         assert _PROBE in broker.calls, (
-            "a project permissions.allow rule now skips can_use_tool: the probe tool ran "
-            "with no broker question. The .claude/settings.json flag is then needed for "
-            f"permission rules too, not only for hooks (06 §1)\n{detail}"
+            "the probe tool ran with no broker question: a permission rule (project or "
+            "user) now skips can_use_tool; if it is the project rule, the "
+            ".claude/settings.json flag is then needed for permission rules too, not only "
+            f"for hooks (06 §1)\n{detail}"
         )
+        if not marker.exists():
+            pytest.fail(f"inconclusive: the project settings were not loaded\n{detail}")
         assert probe.calls, f"the broker allowed the call, but the tool did not run\n{detail}"
 
 
