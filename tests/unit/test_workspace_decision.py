@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import stat
 from datetime import UTC, datetime, timedelta, timezone
@@ -215,4 +216,52 @@ def test_decision_model_values() -> None:
 
 
 def test_outcome_is_frozen_dataclass() -> None:
-    assert DecisionOutcome(run=True, notice=None, delete=(), files_text="").run
+    outcome = DecisionOutcome(run=True, notice=None, delete=(), files_text="")
+    with pytest.raises(dataclasses.FrozenInstanceError):
+        outcome.run = False  # type: ignore[misc]
+
+
+def test_partial_delete_failure_says_what_happened(tmp_path: Path) -> None:
+    root, backups = tmp_path / "repo", tmp_path / "backups"
+    root.mkdir()
+    scan = _make_scan(root, "a.json", "sub/b.json", "c.json")
+    os.chmod(root / "sub", 0o500)  # unlink of sub/b.json fails
+    try:
+        with pytest.raises(ConfigError) as exc:
+            apply_delete(scan, backup_dir=backups, turn_id="turn-1", now=NOW)
+    finally:
+        os.chmod(root / "sub", 0o700)
+    msg = str(exc.value)
+    assert "deleted: a.json" in msg
+    assert "failed: sub/b.json (" in msg
+    assert "not attempted: c.json" in msg
+    assert f"backup at {backups / FOLDER}" in msg
+    assert not (root / "a.json").exists()
+    assert (root / "c.json").exists()
+    assert (backups / FOLDER / "c.json").exists()
+
+
+def test_absolute_path_is_an_assertion_error(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    other = tmp_path / "evil.json"
+    other.write_text("x")
+    scan = CustomizationScan(root=root, files=(FoundFile(other, "h", "k"),), fingerprint="fp1")
+    with pytest.raises(AssertionError):
+        apply_delete(scan, backup_dir=tmp_path / "b", turn_id="t", now=NOW)
+    assert other.exists()
+
+
+def test_symlinked_parent_folder_outside_root_is_an_assertion_error(tmp_path: Path) -> None:
+    root, outside = tmp_path / "repo", tmp_path / "outside"
+    root.mkdir()
+    outside.mkdir()
+    (outside / "x.json").write_text("x")
+    (root / "link").symlink_to(outside, target_is_directory=True)
+    scan = CustomizationScan(
+        root=root, files=(FoundFile(Path("link/x.json"), "h", "k"),), fingerprint="fp1"
+    )
+    with pytest.raises(AssertionError):
+        apply_delete(scan, backup_dir=tmp_path / "b", turn_id="t", now=NOW)
+    assert (outside / "x.json").exists()
+    assert not (tmp_path / "b").exists()

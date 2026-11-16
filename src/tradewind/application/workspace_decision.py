@@ -81,11 +81,13 @@ def apply_delete(
             a copy or a delete failed.
         AssertionError: a scanned path is outside `scan.root`.
     """
+    root_real = scan.root.resolve()
     for f in scan.files:
         norm = os.path.normpath(f.path)
-        assert not os.path.isabs(norm) and norm != ".." and not norm.startswith(".." + os.sep), (
-            f"scanned path outside the scan root: {f.path}"
-        )
+        outside = os.path.isabs(norm) or norm == ".." or norm.startswith(".." + os.sep)
+        # The last component may be a symlink; its parent folder may not lead out.
+        if outside or not (scan.root / norm).parent.resolve().is_relative_to(root_real):
+            raise AssertionError(f"scanned path outside the scan root: {f.path}")
     if backup_dir is None:
         raise ConfigError("delete needs TradewindConfig.customization_backup_dir")
     if backup_dir.resolve().is_relative_to(scan.root.resolve()):
@@ -101,11 +103,18 @@ def apply_delete(
             shutil.copyfile(scan.root / rel, dest)  # follows a symlink
     except OSError as exc:
         raise ConfigError(f"customization backup failed, nothing deleted: {exc}") from exc
-    for rel in present:
+    deleted: list[Path] = []
+    for index, rel in enumerate(present):
         try:
             (scan.root / rel).unlink()  # a symlink: the link only
         except FileNotFoundError:
             pass
         except OSError as exc:
-            raise ConfigError(f"could not delete {rel} (backup kept at {backup}): {exc}") from exc
+            not_attempted = ", ".join(str(p) for p in present[index + 1 :]) or "none"
+            raise ConfigError(
+                f"deleted: {', '.join(str(p) for p in deleted) or 'none'}; "
+                f"failed: {rel} ({exc}); not attempted: {not_attempted}; backup at {backup}"
+            ) from exc
+        else:
+            deleted.append(rel)
     return backup
