@@ -154,6 +154,13 @@ the adapter never has to import `application.turn_runner` itself — and default
 whichever broker is or isn't configured. See README.md's "Security defaults" section for the
 caller-facing summary.
 
+**Claude isolation (0.14).** `Profile.backend_options["isolated"] = True` passes
+`setting_sources=[]` (the CLI gets `--setting-sources=`: no user, project or local settings,
+so no plugins, hooks, permission rules or CLAUDE.md) and `strict_mcp_config=True`
+(`--strict-mcp-config`: only the caller's MCP servers). It does not change what the CLI
+reads outside settings sources: managed (enterprise) policy, the login credentials, and its
+own memory directory. A non-bool value is refused when the backend is built.
+
 ### Claude turn governance findings (claude-agent-sdk 0.2.151, CLI 2.1.258; task 8)
 
 - **engine_auto is not enabled on Claude.** The SDK's `auto` permission mode lets a model

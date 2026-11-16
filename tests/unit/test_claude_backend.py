@@ -2172,3 +2172,82 @@ def test_installed_sdk_keeps_the_cli_process_where_the_adapter_reads_it() -> Non
     assert "self._transport = SubprocessCLITransport(" in inspect.getsource(ClaudeSDKClient)
     assert hasattr(SubprocessCLITransport(prompt="", options=options), "_process")
     assert "self._process = await anyio.open_process(" in inspect.getsource(SubprocessCLITransport)
+
+
+# --- isolation (0.14): backend_options["isolated"] ---
+
+
+def _isolated_profile(value: object) -> Profile:
+    return Profile(
+        backend="claude",
+        auth=SubscriptionAuth(),
+        models={"standard": ModelSpec(model="claude-sonnet-4-5")},
+        backend_options={"isolated": value},
+    )
+
+
+async def _captured_options(monkeypatch: pytest.MonkeyPatch, profile: Profile) -> Any:
+    _install_cli_like_client(monkeypatch, [[]])
+    captured: list[Any] = []
+    real_build_options = ClaudeBackend._build_options
+
+    def capturing(self: ClaudeBackend, *args: Any, **kwargs: Any) -> Any:
+        options = real_build_options(self, *args, **kwargs)
+        captured.append(options)
+        return options
+
+    monkeypatch.setattr(ClaudeBackend, "_build_options", capturing)
+    backend = ClaudeBackend(profile, NativeStoreConfig())
+    await _collect_bounded(backend.run(_capped_plain_ctx(None)))
+    return captured[0]
+
+
+async def test_default_profile_loads_settings_as_before(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without the option nothing changes: the SDK loads every settings source."""
+    options = await _captured_options(monkeypatch, _profile())
+    assert options.setting_sources is None
+    assert options.strict_mcp_config is False
+
+
+async def test_isolated_profile_loads_no_settings_and_no_outside_mcp(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`isolated=True`: no user, project or local settings (so no plugins or
+    hooks), and only the caller's MCP servers (`--strict-mcp-config`)."""
+    options = await _captured_options(monkeypatch, _isolated_profile(True))
+    assert options.setting_sources == []
+    assert options.strict_mcp_config is True
+    assert options.tools == []
+
+
+async def test_isolated_false_is_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    options = await _captured_options(monkeypatch, _isolated_profile(False))
+    assert options.setting_sources is None
+    assert options.strict_mcp_config is False
+
+
+@pytest.mark.parametrize("value", ["yes", 1, None])
+def test_isolated_must_be_a_bool(value: object) -> None:
+    """A typo such as "yes" (or 1) must not silently mean "not isolated"."""
+    with pytest.raises(ValueError, match="isolated"):
+        ClaudeBackend(_isolated_profile(value), NativeStoreConfig())
+
+
+async def test_isolation_reaches_the_cli_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The SDK transport, not only the options object: `[]` must become
+    `--setting-sources=` (not be dropped as falsy) and strict MCP must become
+    `--strict-mcp-config`. Guards an SDK upgrade too."""
+    from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+
+    def argv_of(options: Any) -> list[str]:
+        transport = SubprocessCLITransport(prompt="", options=options)
+        transport._cli_path = "claude"  # resolved by connect() in real runs
+        return transport._build_command()
+
+    argv = argv_of(await _captured_options(monkeypatch, _isolated_profile(True)))
+    assert "--strict-mcp-config" in argv
+    assert "--setting-sources=" in argv
+
+    default_argv = argv_of(await _captured_options(monkeypatch, _profile()))
+    assert "--strict-mcp-config" not in default_argv
+    assert not any(a.startswith("--setting-sources") for a in default_argv)
