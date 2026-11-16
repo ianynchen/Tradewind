@@ -238,7 +238,7 @@
 
 **Interfaces:**
 - Values: Claude `True/True/True` (engine_auto per Task 8 finding); Codex `True/True/True`; LangChain `False/True/True`; Cursor `False/False/False`.
-- The fake backend declares `uses_result_tool=True`, floor and default rules, two preflight checks, and drives gate, observe, work signals with and without end signals, and the result tool the way the Antigravity adapter will (04 §Turn algorithm).
+- The fake backend declares `uses_result_tool=True`, floor and default rules, two preflight checks, and drives gate, observe, work signals with and without end signals, and the result tool the way the Antigravity adapter would have (it was stopped) (04 §Turn algorithm).
 - [ ] **Step 1: Write failing tests**: capability values per backend; Cursor `Unsupported`; fake backend end-to-end: floor deny, caller tighten, observe stop, unsignalled subagent closes as normal end keeping the structured result, preflight ask/stop, result tool via shim.
 - [ ] **Steps 2–5:** run → fail → implement → pass → gate && commit `feat: governance capabilities, Cursor guard and fake backend`.
 
