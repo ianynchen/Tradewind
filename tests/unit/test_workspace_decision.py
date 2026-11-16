@@ -252,16 +252,24 @@ def test_absolute_path_is_an_assertion_error(tmp_path: Path) -> None:
     assert other.exists()
 
 
-def test_symlinked_parent_folder_outside_root_is_an_assertion_error(tmp_path: Path) -> None:
+def test_symlinked_parent_folder_outside_root_is_refused_before_any_copy(tmp_path: Path) -> None:
     root, outside = tmp_path / "repo", tmp_path / "outside"
     root.mkdir()
     outside.mkdir()
     (outside / "x.json").write_text("x")
     (root / "link").symlink_to(outside, target_is_directory=True)
+    (root / "ok.json").write_text("ok")
     scan = CustomizationScan(
-        root=root, files=(FoundFile(Path("link/x.json"), "h", "k"),), fingerprint="fp1"
+        root=root,
+        files=(FoundFile(Path("ok.json"), "h", "k"), FoundFile(Path("link/x.json"), "h", "k")),
+        fingerprint="fp1",
     )
-    with pytest.raises(AssertionError):
+    with pytest.raises(ConfigError) as exc:
         apply_delete(scan, backup_dir=tmp_path / "b", turn_id="t", now=NOW)
+    assert str(exc.value) == (
+        f"cannot delete through a symlinked folder: link -> {outside.resolve()}; "
+        "remove the link and scan again"
+    )
+    assert (root / "ok.json").exists()
     assert (outside / "x.json").exists()
     assert not (tmp_path / "b").exists()

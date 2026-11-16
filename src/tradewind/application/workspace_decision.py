@@ -85,8 +85,19 @@ def apply_delete(
     for f in scan.files:
         norm = os.path.normpath(f.path)
         outside = os.path.isabs(norm) or norm == ".." or norm.startswith(".." + os.sep)
-        # The last component may be a symlink; its parent folder may not lead out.
-        if outside or not (scan.root / norm).parent.resolve().is_relative_to(root_real):
+        if outside:
+            raise AssertionError(f"scanned path outside the scan root: {f.path}")
+        # The last component may be a symlink; its parent folders may not lead out.
+        if not (scan.root / norm).parent.resolve().is_relative_to(root_real):
+            current = Path(".")
+            for part in Path(norm).parent.parts:
+                current = current / part
+                link = scan.root / current
+                if link.is_symlink():
+                    raise ConfigError(
+                        f"cannot delete through a symlinked folder: {current} -> "
+                        f"{link.resolve()}; remove the link and scan again"
+                    )
             raise AssertionError(f"scanned path outside the scan root: {f.path}")
     if backup_dir is None:
         raise ConfigError("delete needs TradewindConfig.customization_backup_dir")
