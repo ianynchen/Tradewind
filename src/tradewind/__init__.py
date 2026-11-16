@@ -29,7 +29,7 @@ from tradewind.application.config import (
     TurnDefaults,
 )
 from tradewind.application.ports import Backend, SessionStorePort
-from tradewind.domain.models import Profile
+from tradewind.domain.models import CustomizationDecision, Profile
 
 __version__ = "0.12.0"
 
@@ -65,6 +65,7 @@ _client._set_backend_factories(
 )
 
 __all__ = [
+    "CustomizationDecision",
     "EventHook",
     "NativeStoreConfig",
     "Session",

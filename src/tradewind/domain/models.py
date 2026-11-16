@@ -209,6 +209,17 @@ class Profile(BaseModel):
     backend_options: dict[str, Any] = {}
 
 
+class CustomizationDecision(BaseModel):
+    """The caller's per-turn answer to a customization scan
+    (docs/components/06-workspace-safety.md §3). `fingerprint` is the one
+    from the scan. Never stored by Tradewind (D4)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["stop", "delete", "proceed"]
+    fingerprint: str
+
+
 class Tool(BaseModel):
     """A live, callable tool. Never serialized whole (I-2): `snapshot()`
     emits only name/description/input_schema; the handler is re-supplied by
