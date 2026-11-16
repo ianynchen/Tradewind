@@ -1045,7 +1045,10 @@ class ClaudeBackend(Backend):
             ),
             resume=ctx.session.native_session_id,
             # 06 §4: on a subscription profile, "" for each auth variable
-            # the caller has set (the SDK cannot remove one).
+            # the caller has set (the SDK cannot remove one). If
+            # `session_store` is ever set, the SDK's `_copy_auth_files` reads
+            # `opt_env.get(...) or os.environ.get(...)`: "" falls back to the
+            # real key and skips the Keychain copy, so that path fails closed.
             env=engine_env(self.profile.auth, self.auth_env_vars(), os.environ).overrides,
             output_format=(
                 {"type": "json_schema", "schema": ctx.output_schema}

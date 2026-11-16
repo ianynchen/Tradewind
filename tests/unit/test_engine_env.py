@@ -13,7 +13,7 @@ from __future__ import annotations
 import importlib.metadata
 import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from pathlib import Path
 
 import claude_agent_sdk._cli_version
@@ -144,6 +144,17 @@ class _VersionedFailsBeforeStart(_VersionedFake):
         yield  # an async generator, like every real backend
 
 
+class _VersionedStopsInPrepare(_VersionedFake):
+    """The caller's `stop()` lands during `prepare_turn`, so `run()` is never
+    called and the runner synthesizes the interrupted result (05 §4)."""
+
+    stop: Callable[[], Awaitable[None]]
+
+    async def prepare_turn(self, ctx: TurnContext) -> None:
+        await super().prepare_turn(ctx)
+        await self.stop()
+
+
 def _tradewind(tmp_path: Path, backend_cls: type[_VersionedFake]) -> Tradewind:
     tmp_path.mkdir(exist_ok=True)
     profile = _profile("codex", subscription=False)
@@ -160,7 +171,7 @@ def _tradewind(tmp_path: Path, backend_cls: type[_VersionedFake]) -> Tradewind:
 
 def _version_logs(caplog: pytest.LogCaptureFixture) -> list[dict[str, object]]:
     return [
-        {k: r.__dict__[k] for k in ("turn_id", "session_id", "engine_version")}
+        {k: r.__dict__[k] for k in ("turn_id", "session_id", "backend", "engine_version")}
         for r in caplog.records
         if r.name == "tradewind.application.turn_runner"
         and r.levelno == logging.INFO
@@ -181,8 +192,18 @@ async def test_version_on_turn_result_and_logged_at_turn_start(
     # Read on each turn (no cache): an engine upgraded between turns shows.
     assert (first.engine_version, second.engine_version) == ("1.0.0", "1.0.1")
     assert _version_logs(caplog) == [
-        {"turn_id": first.turn_id, "session_id": _ID, "engine_version": "1.0.0"},
-        {"turn_id": second.turn_id, "session_id": _ID, "engine_version": "1.0.1"},
+        {
+            "turn_id": first.turn_id,
+            "session_id": _ID,
+            "backend": "codex",
+            "engine_version": "1.0.0",
+        },
+        {
+            "turn_id": second.turn_id,
+            "session_id": _ID,
+            "backend": "codex",
+            "engine_version": "1.0.1",
+        },
     ]
 
     # A turn that fails before `TurnStarted` still logged its version.
@@ -193,6 +214,21 @@ async def test_version_on_turn_result_and_logged_at_turn_start(
         await failing_session.run("go")
     [log] = _version_logs(caplog)
     assert log["engine_version"] == "1.0.0"
+
+
+async def test_version_on_synthesized_interrupted_result(tmp_path: Path) -> None:
+    tw = _tradewind(tmp_path, _VersionedStopsInPrepare)
+    fake = tw._backends["default"]
+    assert isinstance(fake, _VersionedStopsInPrepare)
+    session = await tw.create(_ID, SessionOptions())
+    fake.stop = session.stop
+
+    result = await session.run("go")
+
+    # The runner's own result, not the backend's, still records the engine.
+    assert "run" not in fake.calls
+    assert (result.status, result.end_reason) == ("interrupted", "interrupted")
+    assert result.engine_version == "1.0.0"
 
 
 def test_claude_and_codex_report_their_bundled_engine_versions() -> None:
