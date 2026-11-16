@@ -1,5 +1,7 @@
 # Turn Governance (PR 1) Implementation Plan
 
+> **History.** The Antigravity adapter was stopped by the owner on 2026-11-15 because of Google's terms (`docs/components/04-antigravity-adapter.md`, Status). References to PR 2 below are not planned work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Give every Tradewind backend one action policy, one work supervisor, one preflight step and one prompt rule, plus the result-tool seam, without changing plain-turn behaviour.
@@ -236,7 +238,7 @@
 
 **Interfaces:**
 - Values: Claude `True/True/True` (engine_auto per Task 8 finding); Codex `True/True/True`; LangChain `False/True/True`; Cursor `False/False/False`.
-- The fake backend declares `uses_result_tool=True`, floor and default rules, two preflight checks, and drives gate, observe, work signals with and without end signals, and the result tool the way the Antigravity adapter will (04 §Turn algorithm).
+- The fake backend declares `uses_result_tool=True`, floor and default rules, two preflight checks, and drives gate, observe, work signals with and without end signals, and the result tool the way the Antigravity adapter would have (it was stopped) (04 §Turn algorithm).
 - [ ] **Step 1: Write failing tests**: capability values per backend; Cursor `Unsupported`; fake backend end-to-end: floor deny, caller tighten, observe stop, unsignalled subagent closes as normal end keeping the structured result, preflight ask/stop, result tool via shim.
 - [ ] **Steps 2–5:** run → fail → implement → pass → gate && commit `feat: governance capabilities, Cursor guard and fake backend`.
 

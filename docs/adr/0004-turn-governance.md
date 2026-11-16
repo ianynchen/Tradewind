@@ -14,7 +14,7 @@ Date: 2026-11-15 · Status: Accepted · Spec: `docs/components/05-turn-governanc
 
 Safety and lifecycle rules (which action may run, when a turn is stuck,
 what to check before a turn starts, how a prompt is read) were being
-written once per backend. The planned Antigravity adapter
+written once per backend. The Antigravity adapter (later stopped; see 04)
 (`docs/components/04-antigravity-adapter.md`) had grown about 15 special
 rules of this kind. Each backend would have its own code for them, its own
 tests, and its own gaps. The owner asked (2026-11-15) for generic
@@ -59,11 +59,12 @@ arguments only.
 ### Shipped in PR 1
 
 Claude, Codex and LangChain, and a fake backend that exercises the seams
-as Antigravity will. Capability flags (engine_auto / work supervisor /
+as the Antigravity adapter would have (it was stopped). Capability flags (engine_auto / work supervisor /
 action policy): Claude False/True/True, Codex True/True/True, LangChain
 False/True/True, Cursor False/False/False. Claude `engine_auto` is
 unsupported because the SDK's auto mode bypasses `can_use_tool`. The
-Antigravity mapping is PR 2 (future work).
+Antigravity mapping was planned as PR 2. The owner stopped it on 2026-11-15
+because of Google's terms (`04-antigravity-adapter.md`, Status).
 
 ## Consequences
 

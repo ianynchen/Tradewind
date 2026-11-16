@@ -1,9 +1,10 @@
 # Component: Turn Governance (action policy, work supervisor, preflight, prompt rule)
 
-Status: design (2026-11-15). Owner-approved restructuring of the Antigravity
+Status: implemented (0.12.0); designed 2026-11-15. Owner-approved restructuring of the Antigravity
 design (`04-antigravity-adapter.md`) into backend-neutral mechanisms;
-revised after an independent review. Not implemented. Delivered in PR 1
-(Delivery, below).
+revised after an independent review. Implemented in PR 1 (0.12.0). The
+Antigravity adapter (`04`) was stopped by the owner on 2026-11-15 because of
+Google's terms; Antigravity rows below are history.
 
 ## Purpose
 
@@ -350,14 +351,15 @@ refuses a caller tool of that name, and exposes `result_slot` (`attempts`,
 **PR 1 (this component):** the four mechanisms, the result-tool seam, the
 §7 mappings, engine_auto and the prompt rule for Claude and Codex, and a
 fake backend that exercises gate, observe, work signals with and without
-end signals, preflight and the result tool as Antigravity will.
+end signals, preflight and the result tool as the Antigravity adapter would
+have (it was stopped).
 REQUIREMENTS in the same PR: new FRs for the action policy, permission
 modes, preflight and the prompt rule; FR-4 (vocabulary, broker
 compatibility); FR-6.6 (supervisor; hard cap optional; "every backend");
 FR-8.1 (new flags); FR-2 and the port docstring (terminal record without
 `TurnStarted`).
 
-**PR 2:** the Antigravity adapter (`04`).
+**PR 2:** the Antigravity adapter (`04`). Stopped by the owner, 2026-11-15 (Google's terms).
 
 ## Acceptance (PR 1)
 
