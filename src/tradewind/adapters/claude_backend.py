@@ -136,6 +136,7 @@ from tradewind.application.policy_gate import PolicyGate, caller_tool_source
 from tradewind.application.ports import Backend, TurnContext
 from tradewind.application.supervisor import WorkSupervisor
 from tradewind.application.tool_host import ToolHost
+from tradewind.application.workspace_scan import CustomizationPattern
 from tradewind.domain.compaction import compose_replay_prompt
 from tradewind.domain.errors import Unsupported
 from tradewind.domain.events import (
@@ -857,6 +858,17 @@ class ClaudeBackend(Backend):
         None rather than that stale value.
         """
         return self._native_ids.pop(session_id, None)
+
+    def customization_patterns(self) -> list[CustomizationPattern]:
+        # 06 §1. Skills, agents and commands are not flagged: `tools=[]`
+        # reaches the CLI as `--tools ""` (claude_agent_sdk subprocess_cli.py
+        # `_build_command`), which turns off every built-in tool.
+        return [
+            CustomizationPattern(".claude/settings.json", "claude-settings", False),
+            CustomizationPattern(".claude/settings.local.json", "claude-settings", False),
+            CustomizationPattern(".claude/hooks", "claude-hook", True),
+            CustomizationPattern(".mcp.json", "claude-mcp", False),
+        ]
 
     def capabilities(self) -> Capabilities:
         # Exactly the table in the task-10 brief, plus structured output

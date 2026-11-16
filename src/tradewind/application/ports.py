@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
 from tradewind.application.tool_host import ToolHost
+from tradewind.application.workspace_scan import CustomizationPattern
 from tradewind.domain.events import Event
 from tradewind.domain.models import (
     BackendName,
@@ -430,6 +431,11 @@ class Backend(ABC):
 
     def default_rules(self) -> list[Rule]:
         """Backend-specific default rules (§2.4); none by default."""
+        return []
+
+    def customization_patterns(self) -> list[CustomizationPattern]:
+        """Workspace files this engine loads that can run code or loosen
+        permissions without a broker question (06 §1); none by default."""
         return []
 
     @abstractmethod
