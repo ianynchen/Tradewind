@@ -106,8 +106,9 @@ def test_delete_copies_then_deletes_and_returns_backup(tmp_path: Path) -> None:
     root, backups = tmp_path / "repo", tmp_path / "backups"
     root.mkdir()
     scan = _make_scan(root, ".claude/settings.json", ".claude/hooks/x.sh")
-    backup = apply_delete(scan, backup_dir=backups, turn_id="turn-1", now=NOW)
+    backup, deleted = apply_delete(scan, backup_dir=backups, turn_id="turn-1", now=NOW)
     assert backup == backups / FOLDER
+    assert deleted == (Path(".claude/settings.json"), Path(".claude/hooks/x.sh"))
     assert (backup / ".claude/settings.json").read_text() == "content of .claude/settings.json"
     assert (backup / ".claude/hooks/x.sh").read_text() == "content of .claude/hooks/x.sh"
     assert not (root / ".claude/settings.json").exists()
@@ -119,7 +120,7 @@ def test_backup_folder_name_uses_utc(tmp_path: Path) -> None:
     root.mkdir()
     scan = _make_scan(root, ".mcp.json")
     local = NOW.astimezone(timezone(timedelta(hours=5)))
-    backup = apply_delete(scan, backup_dir=tmp_path / "b", turn_id="t", now=local)
+    backup, _ = apply_delete(scan, backup_dir=tmp_path / "b", turn_id="t", now=local)
     assert backup.name == "20261115T090807Z-t"
 
 
@@ -143,7 +144,8 @@ def test_delete_skips_gone_file(tmp_path: Path) -> None:
     root.mkdir()
     scan = _make_scan(root, "a.json", "b.json")
     (root / "a.json").unlink()
-    backup = apply_delete(scan, backup_dir=backups, turn_id="turn-1", now=NOW)
+    backup, deleted = apply_delete(scan, backup_dir=backups, turn_id="turn-1", now=NOW)
+    assert deleted == (Path("b.json"),)
     assert not (backup / "a.json").exists()
     assert (backup / "b.json").exists()
     assert not (root / "b.json").exists()
@@ -157,7 +159,7 @@ def test_delete_symlink_backs_up_target_removes_link_only(tmp_path: Path) -> Non
     target.write_text("target content")
     (root / ".mcp.json").symlink_to(target)
     scan = _make_scan(root, ".mcp.json")
-    backup = apply_delete(scan, backup_dir=backups, turn_id="turn-1", now=NOW)
+    backup, _ = apply_delete(scan, backup_dir=backups, turn_id="turn-1", now=NOW)
     copy = backup / ".mcp.json"
     assert copy.read_text() == "target content"
     assert not copy.is_symlink()
@@ -184,7 +186,7 @@ def test_backup_folder_mode_0700(tmp_path: Path) -> None:
     old = os.umask(0)
     try:
         scan = _make_scan(root, ".claude/settings.local.json")
-        backup = apply_delete(scan, backup_dir=backups, turn_id="turn-1", now=NOW)
+        backup, _ = apply_delete(scan, backup_dir=backups, turn_id="turn-1", now=NOW)
     finally:
         os.umask(old)
     for folder in (backups, backup, backup / ".claude"):

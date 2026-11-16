@@ -236,7 +236,9 @@ class Session:
         customizations: CustomizationDecision | None = None,
     ) -> Session:
         """`customizations` is the decision for the child's first turn; the
-        child never takes the parent's decision (D9)."""
+        child never takes the parent's decision (D9). Scan the parent first
+        (same cwd and backend, so the same fingerprint); a refused child
+        turn leaves its session row."""
         return await self._client._spawn(self, prompt, tier, customizations)
 
 

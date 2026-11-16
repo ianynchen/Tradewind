@@ -972,9 +972,14 @@ class TurnRunner:
                 if not stopped_before_run:
                     # 06 §3: a `delete` happens just before `run()`; a
                     # failure fails the turn, like a `prepare_turn`
-                    # `ConfigError`, and nothing reaches the engine.
+                    # `ConfigError`, and nothing reaches the engine. The
+                    # notice is stored at once, so the mirror has it even
+                    # when no `TurnStarted` follows (a backend that fails
+                    # first, a consumer that stops reading); it is yielded
+                    # after `TurnStarted`. A stop during the delete still
+                    # ends the turn without `run()`.
                     if customization_outcome.delete:
-                        backup = await anyio.to_thread.run_sync(
+                        backup, deleted = await anyio.to_thread.run_sync(
                             lambda: apply_delete(
                                 customization_scan,
                                 backup_dir=self._config.customization_backup_dir,
@@ -982,9 +987,9 @@ class TurnRunner:
                                 now=datetime.now(UTC),
                             )
                         )
+                        deleted_text = ", ".join(str(p) for p in deleted) or "none"
                         notice_text: str | None = (
-                            f"workspace customizations deleted: "
-                            f"{customization_outcome.files_text}; backup at {backup}"
+                            f"workspace customizations deleted: {deleted_text}; backup at {backup}"
                         )
                     else:
                         notice_text = customization_outcome.notice
@@ -997,7 +1002,14 @@ class TurnRunner:
                         pending_notice = ItemCompleted(
                             message=customization_notice(text=notice_text)
                         )
-
+                        await anyio.to_thread.run_sync(
+                            self._store.append_message,
+                            session_id,
+                            turn_id,
+                            pending_notice.message,
+                        )
+                    stopped_before_run = session_id in self._interrupt_requested
+                if not stopped_before_run:
                     # FR-6.6 work supervisor (05 §3): a TASK (deliberately not
                     # a cancel scope across this generator's yields -- the
                     # 0.5.0 pitfall class) that, when a limit fires, records
@@ -1091,13 +1103,9 @@ class TurnRunner:
                             self._tap(event, turn_id)
                             yield event
                             if isinstance(event, TurnStarted) and pending_notice is not None:
+                                # Stored when it was made (above); tapped
+                                # here, in stream order.
                                 notice, pending_notice = pending_notice, None
-                                await anyio.to_thread.run_sync(
-                                    self._store.append_message,
-                                    session_id,
-                                    turn_id,
-                                    notice.message,
-                                )
                                 self._tap(notice, turn_id)
                                 yield notice
 

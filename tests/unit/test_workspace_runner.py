@@ -7,7 +7,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
+from collections.abc import AsyncIterator
+from contextlib import aclosing
 from pathlib import Path
 from typing import Any
 
@@ -17,17 +20,20 @@ from fake_governed_backend import FakeGovernedBackend, Say
 from pydantic import SecretStr
 
 from tradewind import Tradewind
-from tradewind.application import workspace_scan
+from tradewind.application import turn_runner, workspace_decision, workspace_scan
 from tradewind.application.config import NativeStoreConfig, TradewindConfig
-from tradewind.application.workspace_scan import CustomizationPattern
-from tradewind.domain.errors import ConfigError
+from tradewind.application.ports import TurnContext
+from tradewind.application.workspace_scan import CustomizationPattern, CustomizationScan
+from tradewind.domain.errors import ConfigError, Unsupported
 from tradewind.domain.events import Event, ItemCompleted, TurnCompleted, TurnStarted
 from tradewind.domain.models import (
     ApiKeyAuth,
+    Capabilities,
     CustomizationDecision,
     ModelSpec,
     Profile,
     SessionOptions,
+    SessionRow,
 )
 
 _ID = "66666666-6666-6666-6666-666666666666"
@@ -52,11 +58,36 @@ def _repo(path: Path, *, settings: bool = True) -> Path:
     return path
 
 
+class _NativeFake(FakeGovernedBackend):
+    """Resumes natively and reads its transcript, so the runner reconciles
+    a session that has a native id."""
+
+    def capabilities(self) -> Capabilities:
+        return (
+            super()
+            .capabilities()
+            .model_copy(update={"supports_native_resume": True, "supports_transcript_read": True})
+        )
+
+    async def probe_native(self, session: SessionRow) -> bool:  # noqa: ARG002
+        return True
+
+
+class _FailsBeforeStart(FakeGovernedBackend):
+    """Raises before `TurnStarted`, as Codex does for `max_tool_rounds`."""
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:  # noqa: ARG002
+        self.calls.append("run")
+        raise Unsupported("fails before TurnStarted")
+        yield  # an async generator, like every real backend
+
+
 def _tradewind(
     tmp_path: Path,
     *,
     patterns: list[CustomizationPattern] | None = _PATTERNS,
     backup_dir: Path | None = None,
+    backend_cls: type[FakeGovernedBackend] = FakeGovernedBackend,
 ) -> tuple[Tradewind, FakeGovernedBackend]:
     profile = _profile()
     tw = Tradewind(
@@ -67,7 +98,7 @@ def _tradewind(
             customization_backup_dir=backup_dir,
         )
     )
-    fake = FakeGovernedBackend(profile, NativeStoreConfig(), [Say("done")], patterns=patterns)
+    fake = backend_cls(profile, NativeStoreConfig(), [Say("done")], patterns=patterns)
     tw._backends["default"] = fake
     return tw, fake
 
@@ -105,7 +136,7 @@ async def test_refusal_leaves_no_turn_row_and_no_prompt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, decision: object, message: str
 ) -> None:
     repo = _repo(tmp_path / "repo")
-    tw, fake = _tradewind(tmp_path)
+    tw, fake = _tradewind(tmp_path, backend_cls=_NativeFake)
     reconciled: list[str] = []
 
     async def spy_reconcile(*_args: object) -> int:
@@ -114,6 +145,8 @@ async def test_refusal_leaves_no_turn_row_and_no_prompt(
 
     monkeypatch.setattr(tw._turn_runner._resume_planner, "reconcile", spy_reconcile)
     session = await tw.create(_ID, SessionOptions(cwd=repo))
+    # A native id on a backend that reads transcripts: a turn reconciles.
+    await anyio.to_thread.run_sync(tw._store.rehome_native, _ID, "codex", "native-1")
     if decision == "stop":
         decision = CustomizationDecision(
             action="stop", fingerprint=session.scan_customizations().fingerprint
@@ -128,6 +161,12 @@ async def test_refusal_leaves_no_turn_row_and_no_prompt(
     assert fake.calls == []
     assert reconciled == []
     assert (repo / _SETTINGS).exists()
+    # Control: the same session reconciles once the decision matches.
+    proceed = CustomizationDecision(
+        action="proceed", fingerprint=session.scan_customizations().fingerprint
+    )
+    await session.run("go", customizations=proceed)
+    assert reconciled == ["reconcile"]
 
 
 @pytest.mark.parametrize("action", ["proceed", "delete"])
@@ -357,3 +396,121 @@ async def test_backend_without_patterns_never_scans(
     assert fake.calls == ["prepare_turn", "run"]
     assert isinstance(events[-1], TurnCompleted)
     assert _customization_notices(events) == []
+
+
+async def _history_notices(tw: Tradewind, session_id: str) -> list[dict[str, Any]]:
+    return [
+        m.content
+        for m in await tw.history(session_id)
+        if m.kind == "event" and m.content.get("type") == "workspace_customizations"
+    ]
+
+
+async def test_delete_notice_persisted_when_backend_fails_before_turn_started(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    tw, fake = _tradewind(tmp_path, backup_dir=tmp_path / "backup", backend_cls=_FailsBeforeStart)
+    session = await tw.create(_ID, SessionOptions(cwd=repo))
+    decision = CustomizationDecision(
+        action="delete", fingerprint=session.scan_customizations().fingerprint
+    )
+
+    with pytest.raises(Unsupported):
+        await session.run("go", customizations=decision)
+
+    assert fake.calls == ["prepare_turn", "run"]
+    assert not (repo / _SETTINGS).exists()
+    [notice] = await _history_notices(tw, _ID)
+    assert notice["text"].startswith("workspace customizations deleted: .claude/settings.json;")
+
+
+async def test_delete_notice_persisted_when_consumer_breaks_at_turn_started(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    tw, _ = _tradewind(tmp_path, backup_dir=tmp_path / "backup")
+    session = await tw.create(_ID, SessionOptions(cwd=repo))
+    decision = CustomizationDecision(
+        action="delete", fingerprint=session.scan_customizations().fingerprint
+    )
+
+    async with aclosing(session.stream("go", customizations=decision)) as events:
+        async for event in events:
+            if isinstance(event, TurnStarted):
+                break
+
+    [notice] = await _history_notices(tw, _ID)
+    assert notice["text"].startswith("workspace customizations deleted: .claude/settings.json;")
+
+
+async def test_stop_during_delete_ends_the_turn_without_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    tw, fake = _tradewind(tmp_path, backup_dir=tmp_path / "backup")
+    session = await tw.create(_ID, SessionOptions(cwd=repo))
+    decision = CustomizationDecision(
+        action="delete", fingerprint=session.scan_customizations().fingerprint
+    )
+
+    def delete_then_stop(scan: CustomizationScan, **kwargs: Any) -> Any:
+        result = workspace_decision.apply_delete(scan, **kwargs)
+        anyio.from_thread.run(session.stop)  # the delete runs in a worker thread
+        return result
+
+    monkeypatch.setattr(turn_runner, "apply_delete", delete_then_stop)
+
+    events = [e async for e in session.stream("go", customizations=decision)]
+
+    assert fake.calls == ["prepare_turn"]
+    assert isinstance(events[-1], TurnCompleted)
+    assert events[-1].result.status == "interrupted"
+    assert not (repo / _SETTINGS).exists()
+    assert len(await _history_notices(tw, _ID)) == 1
+
+
+async def test_no_patterns_and_deleted_process_cwd_still_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    tw, fake = _tradewind(tmp_path, patterns=None)
+    session = await tw.create(_ID, SessionOptions())
+    gone = tmp_path / "gone"
+    gone.mkdir()
+    monkeypatch.chdir(gone)
+    gone.rmdir()
+
+    scan = session.scan_customizations()
+    result = await session.run("go")
+
+    assert scan.files == ()
+    assert scan.fingerprint == ""
+    assert result.status == "completed"
+    assert fake.calls == ["prepare_turn", "run"]
+
+
+async def test_delete_notice_lists_only_the_deleted_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    (repo / ".mcp.json").write_text("{}")
+    patterns = [*_PATTERNS, CustomizationPattern(".mcp.json", "mcp", is_dir=False)]
+    tw, _ = _tradewind(tmp_path, patterns=patterns, backup_dir=tmp_path / "backup")
+    session = await tw.create(_ID, SessionOptions(cwd=repo))
+    decision = CustomizationDecision(
+        action="delete", fingerprint=session.scan_customizations().fingerprint
+    )
+
+    def gone_before_delete(scan: CustomizationScan, **kwargs: Any) -> Any:
+        os.remove(repo / ".mcp.json")  # removed after the check, before the delete
+        return workspace_decision.apply_delete(scan, **kwargs)
+
+    monkeypatch.setattr(turn_runner, "apply_delete", gone_before_delete)
+
+    events = [e async for e in session.stream("go", customizations=decision)]
+
+    [backup] = list((tmp_path / "backup").iterdir())
+    [notice] = _customization_notices(events)
+    assert notice["text"] == (
+        f"workspace customizations deleted: .claude/settings.json; backup at {backup}"
+    )

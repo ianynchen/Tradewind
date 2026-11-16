@@ -68,9 +68,10 @@ def _mkdir_0700(folder: Path) -> None:
 
 def apply_delete(
     scan: CustomizationScan, *, backup_dir: Path | None, turn_id: str, now: datetime
-) -> Path:
+) -> tuple[Path, tuple[Path, ...]]:
     """Copy every scanned file to `<backup_dir>/<UTC stamp>-<turn id>/<relative path>`,
-    then delete them. Returns the backup folder.
+    then delete them. Returns the backup folder and the paths (relative to
+    `scan.root`) that were really deleted.
 
     A symlink is backed up as its target's content and removed as a link
     only. A file that is already gone is skipped. If any copy fails nothing
@@ -128,4 +129,4 @@ def apply_delete(
             ) from exc
         else:
             deleted.append(rel)
-    return backup
+    return backup, tuple(deleted)

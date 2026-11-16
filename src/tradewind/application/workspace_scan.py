@@ -101,13 +101,18 @@ def scan_session(session: SessionRow, backend: Backend) -> CustomizationScan:
     """Scan the engine's working folder for `backend`'s patterns: the
     session's `cwd` when it is set, else the process cwd (06 §2 "One
     folder"). `Session.scan_customizations()` and the turn runner both call
-    this, so they give the same fingerprint.
+    this, so they give the same fingerprint. With no patterns it touches
+    nothing, not even the process cwd.
 
     Raises:
         ConfigError: as `scan`.
     """
+    patterns = backend.customization_patterns()
+    if not patterns:
+        root = Path(session.cwd) if session.cwd is not None else Path()
+        return CustomizationScan(root=root, files=(), fingerprint="")
     folder = Path(session.cwd) if session.cwd is not None else Path.cwd()
-    return scan(folder, backend.customization_patterns(), backend.name)
+    return scan(folder, patterns, backend.name)
 
 
 def _lstat(path: Path) -> os.stat_result | None:
