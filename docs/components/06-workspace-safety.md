@@ -173,6 +173,8 @@ Delete rules (as in `04` C1, owner "delete means delete"):
   is the caller's responsibility.
 - `backup_dir` is a new `TradewindConfig.customization_backup_dir: Path | None`.
   - `delete` without it → `ConfigError`. There is no hidden default.
+  - Both `backup_dir` checks run before `begin_turn`, so a refused `delete`
+    leaves no turn row. `apply_delete` checks again.
   - A `backup_dir` inside the scan area → `ConfigError`.
   - Backup folders are created with mode 0700, because
     `settings.local.json` can hold secrets.
