@@ -55,7 +55,7 @@ def find_root(folder: Path) -> Path | None:
     no repository."""
     folder = folder.resolve()
     for candidate in (folder, *folder.parents):
-        if os.path.lexists(candidate / ".git"):
+        if _lstat(candidate / ".git") is not None:
             return candidate
     return None
 
@@ -86,19 +86,46 @@ def scan(folder: Path, patterns: Sequence[CustomizationPattern], backend: str) -
     if not files:
         return CustomizationScan(root=root, files=(), fingerprint="")
     lines = [backend, str(root.resolve()), *(f"{f.path.as_posix()} {f.sha256}" for f in files)]
-    fingerprint = hashlib.sha256("\n".join(lines).encode()).hexdigest()
+    fingerprint = hashlib.sha256(os.fsencode("\n".join(lines))).hexdigest()
     return CustomizationScan(root=root, files=files, fingerprint=fingerprint)
+
+
+def _lstat(path: Path) -> os.stat_result | None:
+    """`os.lstat`, or None when the path is absent. Only a missing path
+    (or a file where a folder was expected) counts as absent; any other
+    error, such as an unreadable parent folder, raises `ConfigError`."""
+    try:
+        return os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    except OSError as exc:
+        raise ConfigError(f"cannot inspect workspace path {path}: {exc}") from exc
+
+
+def _walk_failed(exc: OSError) -> None:
+    where: object = exc.filename
+    raise ConfigError(f"cannot read workspace folder {where}: {exc}") from exc
 
 
 def _candidates(path: Path, is_dir: bool) -> list[Path]:
     """Existing paths for one pattern. A broken symlink still counts as
-    present, so that reading it fails loudly."""
+    present, so that reading it fails loudly. A pattern folder that is
+    itself a symlink is followed (the engine follows it); symlinked folders
+    nested inside it are not."""
+    st = _lstat(path)
+    if st is None:
+        return []
     if not is_dir:
-        return [path] if os.path.lexists(path) else []
-    if path.is_symlink() or not path.is_dir():
+        return [path]
+    if stat.S_ISLNK(st.st_mode):
+        try:
+            st = os.stat(path)
+        except OSError as exc:
+            raise ConfigError(f"cannot read workspace folder {path}: {exc}") from exc
+    if not stat.S_ISDIR(st.st_mode):
         return []
     out: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
+    for dirpath, dirnames, filenames in os.walk(path, onerror=_walk_failed, followlinks=False):
         dirnames.sort()
         out.extend(Path(dirpath) / name for name in sorted(filenames))
     return out

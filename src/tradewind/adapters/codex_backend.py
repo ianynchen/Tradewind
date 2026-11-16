@@ -1387,14 +1387,14 @@ class CodexBackend(Backend):
         return self._native_ids.pop(session_id, None)
 
     def customization_patterns(self) -> list[CustomizationPattern]:
-        # 06 §1, Step 0 (static, codex 0.147.0 binary): no project-local key
-        # that runs code or loosens the sandbox or approvals was shown to be
-        # honored. `strings` finds "Ignored unsupported project-local config
-        # keys in ... manually set them in your user-level config.toml", but
-        # the allowed-key list is not recoverable as text. Project config,
-        # hooks and exec policies load only for a trusted project, and
-        # hooks need a trusted hash. So `.codex/config.toml` is not flagged.
-        return []
+        # 06 §1, Step 0 (static, codex 0.147.0 binary): `strings` shows
+        # "Ignored unsupported project-local config keys in ... manually set
+        # them in your user-level config.toml" and "Trusting the directory
+        # allows project-local config, hooks, and exec policies to load".
+        # The list of honored keys is not recoverable from the binary, so a
+        # dangerous key (sandbox_mode, approval_policy, notify, hooks) cannot
+        # be ruled out. Controller ruling (fix round 1): fail closed, flag it.
+        return [CustomizationPattern(".codex/config.toml", "codex-config", False)]
 
     def capabilities(self) -> Capabilities:
         # Exactly the table in the task-14 brief/controller ruling.

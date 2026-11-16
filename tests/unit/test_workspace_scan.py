@@ -146,7 +146,7 @@ def test_fingerprint_encoding(tmp_path: Path) -> None:
     _write(root / ".mcp.json", "one")
     digest = hashlib.sha256(b"one").hexdigest()
     lines = ["claude", str(root.resolve()), f".mcp.json {digest}"]
-    expected = hashlib.sha256("\n".join(lines).encode()).hexdigest()
+    expected = hashlib.sha256(os.fsencode("\n".join(lines))).hexdigest()
     # Pins the documented encoding: backend, root, then one line per pair.
     assert scan(root, [MCP], "claude").fingerprint == expected
 
@@ -196,9 +196,9 @@ def test_backend_patterns() -> None:
         CustomizationPattern(".claude/hooks", "claude-hook", True),
         CustomizationPattern(".mcp.json", "claude-mcp", False),
     ]
-    # Codex: Step 0 found no project-local key that runs code or loosens the
-    # sandbox or approvals (see the comment on CodexBackend).
-    assert CodexBackend(_profile("codex", sub), native).customization_patterns() == []
+    assert CodexBackend(_profile("codex", sub), native).customization_patterns() == [
+        CustomizationPattern(".codex/config.toml", "codex-config", False),
+    ]
     assert CursorBackend(_profile("cursor", sub), native).customization_patterns() == []
     lc = LangchainBackend(
         _profile("langchain", ApiKeyAuth(api_key=cast(Any, "k"))),
@@ -206,3 +206,56 @@ def test_backend_patterns() -> None:
         chat_model_factory=cast(Any, lambda *_a, **_k: None),
     )
     assert lc.customization_patterns() == []
+
+
+def _skip_if_root(path: Path) -> None:
+    if os.access(path, os.R_OK | os.X_OK):
+        pytest.skip("permissions not enforced (running as root)")
+
+
+def test_unreadable_dir_on_file_pattern_path_raises(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    _write(root / ".claude" / "settings.json")
+    (root / ".claude").chmod(0)
+    try:
+        _skip_if_root(root / ".claude")
+        with pytest.raises(ConfigError, match=r"\.claude"):
+            scan(root, [SETTINGS], "claude")
+        with pytest.raises(ConfigError, match=r"\.claude"):
+            scan(root, [HOOKS], "claude")
+    finally:
+        (root / ".claude").chmod(0o700)
+
+
+def test_unreadable_subdir_in_folder_pattern_raises(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    _write(root / ".claude" / "hooks" / "a.sh")
+    sub = root / ".claude" / "hooks" / "sub"
+    _write(sub / "b.sh")
+    sub.chmod(0)
+    try:
+        _skip_if_root(sub)
+        with pytest.raises(ConfigError, match="sub"):
+            scan(root, [HOOKS], "claude")
+    finally:
+        sub.chmod(0o700)
+
+
+def test_file_symlink_loop_raises(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    (root / ".mcp.json").symlink_to(root / ".mcp.json")
+    with pytest.raises(ConfigError, match=r"\.mcp\.json"):
+        scan(root, [MCP], "claude")
+
+
+def test_symlinked_pattern_folder_is_followed(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    elsewhere = tmp_path / "elsewhere"
+    _write(elsewhere / "a.sh")
+    nested_target = tmp_path / "nested"
+    _write(nested_target / "n.sh")
+    (elsewhere / "nested").symlink_to(nested_target, target_is_directory=True)
+    (root / ".claude").mkdir()
+    (root / ".claude" / "hooks").symlink_to(elsewhere, target_is_directory=True)
+    result = scan(root, [HOOKS], "claude")
+    assert _names(result) == {".claude/hooks/a.sh"}
