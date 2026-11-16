@@ -1,5 +1,7 @@
 # Turn Governance (PR 1) Implementation Plan
 
+> **History.** The Antigravity adapter was stopped by the owner on 2026-11-15 because of Google's terms (`docs/components/04-antigravity-adapter.md`, Status). References to PR 2 below are not planned work.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Give every Tradewind backend one action policy, one work supervisor, one preflight step and one prompt rule, plus the result-tool seam, without changing plain-turn behaviour.

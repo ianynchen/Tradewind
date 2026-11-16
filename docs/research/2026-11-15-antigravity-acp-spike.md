@@ -1,5 +1,7 @@
 # Spike: Antigravity over ACP — go/no-go (design 04)
 
+> **History.** The Antigravity adapter was stopped by the owner on 2026-11-15 because of Google's terms (`docs/components/04-antigravity-adapter.md`, Status). References to PR 2 below are not planned work.
+
 Date: 2026-11-15. Plan: `docs/superpowers/plans/2026-11-15-antigravity-acp-spike.md`.
 Design: `docs/components/04-antigravity-adapter.md`. Machine: the owner's
 macOS laptop. `agy --version`: **1.5.9** (the owner updated from 1.5.3 before
