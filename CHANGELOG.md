@@ -7,22 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
+## [0.12.0] - 2026-11-15
 
-- `claude`: `max_tool_rounds` now holds exactly (FR-6.5). The bundled CLI
-  runs a response's tools before it checks its own `max_turns`, so
-  `max_tool_rounds=0` still ran the first response's tools (and `N` let
-  round `N+1` run). The adapter now counts caller-tool rounds itself and
-  refuses the first call past the cap with an interrupt, and the turn
-  ends as `max_tool_rounds`. `max_turns` stays only as a backstop
-  (`N + 1`, or `N + 2` on a schema turn). On a plain turn the backstop
-  cannot fire before the exact cap. On a schema turn it can, because
-  invalid StructuredOutput attempts and the CLI's reminder also use CLI
-  turns; that ending is a schema turn without a valid result
-  (`end_turn`, `structured_output=None`, text kept), never
-  `max_tool_rounds`. Uncapped turns are unchanged.
+### Changed
+
+- A broker that raises now gives `deny` (05 §2.6); before, the error was not turned into a verdict.
+- The hard cap (`TurnDefaults.request_timeout_s`) now pauses while a broker question is open, on all backends. Its default is now `None` = backend default: no hard cap on a backend with the work supervisor (Claude, Codex, LangChain), 600 s on one without (Cursor). A fired limit emits a `turn_timeout` notice (`ItemCompleted(kind="event")`) before the terminal event.
+- Codex brokers now receive an extra `tradewind` key in the broker-copy arguments (`tradewind_action` if the tool already has a `tradewind` argument); the tool's own arguments are unchanged.
+- Prompts are always sent as a message: a prompt whose first non-whitespace character is `/` is sent with the prefix `Message: `, so slash commands are not expanded (Claude; Codex's app-server passes text as-is). The mirror keeps the original prompt.
+- New runtime dependency: `jsonschema>=4.26,<5`.
 
 ### Added
+
+- Turn governance (ADR-0004, `docs/components/05-turn-governance.md`; FR-4.5, FR-7.3, FR-8.1a, FR-11):
+  - Action policy: a shared `Action` vocabulary, `SessionOptions.policy_rules` and `permission_mode` (`broker` / `engine_auto`); floor rules, caller rules, backend default rules and mode default; `gate` and `observe`.
+  - Work supervisor: model silence (300 s) and work silence (1800 s) limits, `TurnDefaults.model_silence_timeout_s` and `work_silence_timeout_s`.
+  - Process report (WARNING log and event item) when a limit fires, on interrupt, or when descendants stay alive. Skipped on Claude and Codex (no public engine pid).
+  - Preflight checks: `SessionOptions.on_preflight`, `Ok` / `Ask` / `Stop`; `Stop` raises `ConfigError` before `TurnStarted`. A turn can now end with a terminal record and no `TurnStarted`.
+  - Result-tool seam: `tradewind_submit_result` (validated with `jsonschema`, at most 3 calls) for engines with no output schema.
+  - Capability flags `supports_engine_auto` / `supports_work_supervisor` / `supports_action_policy`: Claude False/True/True, Codex True/True/True, LangChain False/True/True, Cursor False/False/False. Claude `engine_auto` is unsupported because the SDK's auto mode bypasses `can_use_tool`; Codex `engine_auto` uses the auto-reviewer with the workspace-write sandbox. Unsupported settings raise `Unsupported` before `prepare_turn`.
 
 - Structured output on the `claude` and `langchain` backends (FR-1.3):
   `supports_structured_output` is now `True` on both, and `output_schema` no
@@ -57,6 +60,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SessionStorePort.finalize_turn` takes a new optional
   `structured_output` keyword, which the turn runner always passes; custom
   store implementations must accept it.
+
+### Fixed
+
+- `claude`: `max_tool_rounds` now holds exactly (FR-6.5). The bundled CLI
+  runs a response's tools before it checks its own `max_turns`, so
+  `max_tool_rounds=0` still ran the first response's tools (and `N` let
+  round `N+1` run). The adapter now counts caller-tool rounds itself and
+  refuses the first call past the cap with an interrupt, and the turn
+  ends as `max_tool_rounds`. `max_turns` stays only as a backstop
+  (`N + 1`, or `N + 2` on a schema turn). On a plain turn the backstop
+  cannot fire before the exact cap. On a schema turn it can, because
+  invalid StructuredOutput attempts and the CLI's reminder also use CLI
+  turns; that ending is a schema turn without a valid result
+  (`end_turn`, `structured_output=None`, text kept), never
+  `max_tool_rounds`. Uncapped turns are unchanged.
 
 ## [0.11.2] - 2026-09-03
 

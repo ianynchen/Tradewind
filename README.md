@@ -294,7 +294,7 @@ never be mistaken for a clean finish:
 | `max_tokens` | The provider truncated the output — an honest partial, not a clean finish. |
 | `max_tool_rounds` | Your per-call cap stopped the tool loop — honest partial. |
 | `interrupted` | `stop()` cut the turn off. |
-| `timeout` | The enforced `request_timeout_s` deadline ended the turn. |
+| `timeout` | An enforced time limit (`request_timeout_s`, or a supervisor silence limit) ended the turn. |
 | `broker_terminated` | Your broker returned `Denial(terminate=True)`: denials were delivered, then the turn ended. |
 
 `max_tool_rounds` (non-negative int; `0` = one model response, no tool execution) is enforced
@@ -470,10 +470,42 @@ emulates silently — an unsupported call raises `Unsupported`.
 | `supports_fork` | no (`tw.fork` covers it) | yes | yes | no |
 | `supports_transcript_read` | no | yes | yes | no |
 | `supports_tool_round_cap` | yes (own loop) | yes (exact, via the permission bridge) | no | no |
+| `supports_action_policy` | yes | yes | yes | no |
+| `supports_work_supervisor` | yes | yes | yes | no (keeps the 600 s hard cap) |
+| `supports_engine_auto` | no | no (the SDK's auto mode bypasses `can_use_tool`) | yes (Codex's auto-reviewer, workspace-write sandbox) | no |
+
+Engine-auto strength differs by engine: on Codex the engine's own auto review decides its tools
+inside its sandbox; elsewhere `permission_mode="engine_auto"` raises `Unsupported`.
 
 **NATIVE→REPLAY degrade is not implemented** (ARCHITECTURE §7 P-7): a reaped or expired native
 session on `claude`/`codex`/`cursor` currently surfaces as `TurnFailed` rather than degrading
 to a mirror-replay turn.
+
+## Turn governance
+
+One set of mechanisms holds on every backend that declares the flag (design:
+`docs/components/05-turn-governance.md`, decision: `docs/adr/0004-turn-governance.md`):
+
+- **Action policy.** `SessionOptions.policy_rules` (list of `Rule`) and `permission_mode`
+  (`"broker"` or `"engine_auto"`). Floor rules only deny or stop; a caller rule can tighten
+  anything but never loosen a floor rule. A broker on `ask` gets today's tool name and
+  arguments plus a `tradewind` key (`tradewind_action` if the tool has its own `tradewind`
+  argument) holding the shared action description; the tool itself never sees that key.
+  A broker that raises gives `deny`.
+- **Work supervisor.** `TurnDefaults.model_silence_timeout_s` (300), `work_silence_timeout_s`
+  (1800) and the optional hard cap `request_timeout_s` (`None` = backend default). All pause
+  while a broker question is open. A fired limit adds a `turn_timeout` notice before the
+  terminal event, and a process report when engine processes are involved.
+- **Preflight.** `SessionOptions.on_preflight(question, details, choices)` answers a check's
+  question; a check that stops the turn raises `ConfigError` before `TurnStarted`.
+- **Prompts are messages.** A prompt starting with `/` is sent as `Message: <prompt>`, so
+  slash commands are never expanded.
+
+Known limits: Claude and Codex process reports are skipped (no public engine pid); the
+`in_workspace` field of a file action is lexical (no symlink resolution); `cursor` supports
+none of this, and `policy_rules` or `permission_mode` raise `Unsupported` there. On Codex,
+observe sees only completed commands that had no approval request, so write narrow `shell` /
+`file_write` rules.
 
 ## Resume & recovery
 
@@ -501,9 +533,12 @@ on a guess.
   engines retry API errors internally; re-running a started turn could duplicate tool side
   effects — `supports_turn_retry` declares this honestly). Every scheduled retry is visible
   as a `retry_scheduled` event item in the stream and the mirror.
-- **Turn timeout** (`TurnDefaults.request_timeout_s`, default 600s, per-call override): a turn
-  exceeding the deadline is interrupted via the backend's own `interrupt()` and ends
-  `status="interrupted"`, `end_reason="timeout"` — on all four backends.
+- **Turn timeout** (`TurnDefaults.request_timeout_s`, default `None` = backend default: no
+  hard cap on a backend with the work supervisor, 600s on one without; per-call override): a
+  turn exceeding the deadline is interrupted via the backend's own `interrupt()` and ends
+  `status="interrupted"`, `end_reason="timeout"` — on all four backends. The cap pauses while
+  a broker question is open. The supervisor's model and work silence limits end a turn the same
+  way (see Turn governance).
 
 ## Testing your integration — no network
 

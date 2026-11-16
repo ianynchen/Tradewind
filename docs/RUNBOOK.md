@@ -206,6 +206,15 @@ caller-facing summary.
   `CodexClient._proc` (`openai_codex/client.py:222,259`), so the adapter does not report
   descendants (05 §3.4) until the SDK exposes the PID.
 
+### Known limits of turn governance (PR 1)
+
+- Claude and Codex process reports (05 §3.4) are skipped: neither SDK exposes the engine pid
+  publicly (see the two findings above).
+- `in_workspace` on file actions is lexical; symlinks are not resolved.
+- Cursor supports none of the governance features (`supports_action_policy`,
+  `supports_work_supervisor`, `supports_engine_auto` are all False).
+- The Antigravity mapping (`04-antigravity-adapter.md`) is PR 2 and is not implemented.
+
 ### Env gates for integration/live runs
 
 | Variable | Gates | Notes |
