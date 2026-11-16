@@ -1,6 +1,6 @@
 # Component: Workspace Safety (customizations, auth environment, engine version, safety suite)
 
-Status: design (2026-11-15). The owner approved decisions D1–D8. It was
+Status: approved by the owner (2026-11-15), with decisions D1–D9. It was
 revised after a first-principles adversarial review. Not implemented.
 
 ## Purpose
@@ -264,12 +264,11 @@ pass.
   example), RUNBOOK, CHANGELOG.
 - Release 0.13.0 (owner rule: minor bump after implementation).
 
-## Open questions (owner)
+## Workspace cases (owner)
 
-- Meridian's real workspaces: a repo root or a subfolder; worktrees or
-  submodules; trusted by the engines or not. The owner has not answered
-  yet. The design handles all of these cases, so the answer changes only
-  how many false flags Meridian sees, not what gets built.
+Meridian's working folders can be anything: a repo root or a subfolder;
+a clone, worktree or submodule; trusted by the engines or not. Meridian
+narrows this down later. The design handles every case.
 
 ## Left to the builder
 
