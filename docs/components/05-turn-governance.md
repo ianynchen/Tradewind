@@ -250,7 +250,9 @@ closed items. The terminal event comes after this point.
 | caller interrupt answered within 15 s | terminated | reported, not killed |
 | interrupt unanswered, or a limit fired | process group, then tree walk | killed; survivors reported |
 
-The report is emitted on a fired limit, on an interrupt, or when
+The process group step applies only when the engine has its own group;
+an engine that shares the caller's group gets the tree walk only. The
+report is emitted on a fired limit, on an interrupt, or when
 descendants are alive at a normal end. Process listing uses `ps` (no new
 dependency); a PID whose start time
 changed is not reported; the shim and the engine's own helper processes
@@ -295,10 +297,7 @@ Check(id) -> Ok | Ask(question, details, choices, default_choice) | Stop(reason)
 
 ## 5. Prompt rule (owner M11)
 
-A prompt is always a message to the model. Each adapter turns off its
-engine's slash-command expansion where a setting exists, and otherwise
-sends a prompt whose first non-whitespace character is `/` with the prefix
-`Message: `. The mirror keeps the caller's original prompt.
+A prompt is always treated as a message to the model, never expanded as a slash command, on every backend. The rule applies to an engine that expands slash commands: today Claude, which sends a prompt whose first non-whitespace character is `/` with the prefix `Message: ` (the CLI's own flag does not stop built-in commands). Codex's app-server (it passes text as-is; slash commands are a TUI feature) and LangChain (no slash parsing) do not expand slash commands, so they send the prompt unchanged; Cursor sends it unchanged too (tradewind adds no handling there, and the Cursor SDK's behaviour is not verified). The mirror keeps the caller's original prompt.
 
 ## 6. Result-tool seam
 

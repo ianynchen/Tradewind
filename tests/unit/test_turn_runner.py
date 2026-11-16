@@ -22,8 +22,11 @@ error-path tests in test_client_sessions.py (task-9 fix round 1):
 
 from __future__ import annotations
 
+import asyncio
+import functools
+import json
 import warnings
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Callable, Sequence
 from contextlib import aclosing
 from pathlib import Path
 from typing import Any, ClassVar, cast
@@ -39,6 +42,7 @@ from pydantic import ConfigDict, Field, SecretStr
 
 from tradewind.adapters.langchain_backend import LangchainBackend
 from tradewind.application import client as _client
+from tradewind.application import turn_runner as _turn_runner
 from tradewind.application.client import Tradewind
 from tradewind.application.config import (
     CompactionSettings,
@@ -46,7 +50,10 @@ from tradewind.application.config import (
     TradewindConfig,
     TurnDefaults,
 )
+from tradewind.application.policy_gate import PolicyGate
 from tradewind.application.ports import Backend, TurnContext
+from tradewind.application.preflight import Ask, Ok, Stop, run_checks
+from tradewind.application.supervisor import WorkSupervisor
 from tradewind.application.turn_runner import (
     _emulate_system_prompt,
     _fold_system_prompt,
@@ -79,6 +86,8 @@ from tradewind.domain.models import (
     Tool,
     TurnResult,
 )
+from tradewind.domain.policy import Action, Matcher, Rule
+from tradewind.domain.supervision import Limits
 
 _VALID_ID = "33333333-3333-3333-3333-333333333333"
 
@@ -1933,6 +1942,410 @@ async def test_completed_turn_is_untouched_by_the_watchdog(tmp_path: Path) -> No
     assert result.end_reason == "end_turn"
 
 
+# --- FR-6.6 work supervisor (05-turn-governance §3) ---
+
+
+class _SupervisedInterruptibleBackend(_InterruptibleBackend):
+    """`_InterruptibleBackend` that declares `supports_work_supervisor`,
+    records the context, and records `ctx.timeout_reason` as it was when
+    `interrupt()` arrived. With `terminal_after_interrupt`, it ends its
+    stream with its own terminal event (as the SDK backends do) instead of
+    none."""
+
+    def __init__(
+        self,
+        profile: Profile,
+        native_config: NativeStoreConfig,
+        *,
+        supervised: bool = True,
+        terminal_after_interrupt: bool = False,
+    ) -> None:
+        super().__init__(profile, native_config)
+        self._supervised = supervised
+        self._terminal_after_interrupt = terminal_after_interrupt
+        self.contexts: list[TurnContext] = []
+        self.reason_at_interrupt: list[dict[str, object] | None] = []
+
+    def capabilities(self) -> Capabilities:
+        return (
+            super().capabilities().model_copy(update={"supports_work_supervisor": self._supervised})
+        )
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        self.contexts.append(ctx)
+        yield TurnStarted(turn_id=ctx.turn_id)
+        await self._interrupted.wait()
+        if self._terminal_after_interrupt:
+            yield TurnCompleted(
+                result=TurnResult(
+                    turn_id=ctx.turn_id,
+                    status="interrupted",
+                    end_reason="interrupted",
+                    final_text=None,
+                    usage={},
+                    cost_usd=None,
+                )
+            )
+
+    async def interrupt(self, session_id: str) -> None:
+        self.reason_at_interrupt.append(self.contexts[-1].timeout_reason)
+        await super().interrupt(session_id)
+
+
+def _is_timeout_notice(event: Event) -> bool:
+    return (
+        isinstance(event, ItemCompleted)
+        and event.message.kind == "event"
+        and event.message.content.get("type") == "turn_timeout"
+    )
+
+
+async def test_cursor_keeps_600s_default(tmp_path: Path) -> None:
+    # A backend that reports no work (Cursor: supports_work_supervisor
+    # False) keeps today's 600 s wall-clock cap and gets no silence
+    # limits, which it could never satisfy.
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _CtxRecordingBackend(
+        profile, NativeStoreConfig(), [TurnStarted(turn_id="t"), _completed()]
+    )
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    await session.run("hi")
+
+    assert fake.capabilities().supports_work_supervisor is False
+    work = cast(WorkSupervisor, fake.contexts[0].work)
+    assert work.limits.hard_cap_s == 600.0
+
+
+async def test_supervised_backend_has_no_default_hard_cap(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _SupervisedInterruptibleBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    async for event in session.stream("hi"):
+        if isinstance(event, TurnStarted):
+            await session.stop()
+
+    work = cast(WorkSupervisor, fake.contexts[0].work)
+    assert work.limits == Limits(model_silence_s=300.0, work_silence_s=1800.0, hard_cap_s=None)
+    # Broker questions pause the limits: the gate's count reaches the
+    # supervisor.
+    gate = cast(PolicyGate, fake.contexts[0].policy)
+    assert gate.on_approval_change == work.approvals_changed
+
+
+async def test_explicit_request_timeout_still_applies(tmp_path: Path) -> None:
+    # A caller that sets a hard cap on a supervised backend still gets it.
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _SupervisedInterruptibleBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    result = await session.run("hi", request_timeout_s=0.2)
+
+    assert (result.status, result.end_reason) == ("interrupted", "timeout")
+    reason = fake.contexts[0].timeout_reason
+    assert reason is not None
+    assert (reason["limit"], reason["value"]) == ("hard_cap", 0.2)
+    assert cast(float, reason["elapsed"]) >= 0.2
+
+
+async def test_model_silence_override_ends_a_quiet_turn(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _SupervisedInterruptibleBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    result = await session.run("hi", model_silence_timeout_s=0.2)
+
+    assert result.end_reason == "timeout"
+    reason = fake.contexts[0].timeout_reason
+    assert reason is not None
+    assert (reason["limit"], reason["value"]) == ("model_silence", 0.2)
+
+
+@pytest.mark.parametrize(
+    "key", ["request_timeout_s", "model_silence_timeout_s", "work_silence_timeout_s"]
+)
+async def test_invalid_limit_override_raises_config_error_without_opening_a_turn(
+    tmp_path: Path, key: str
+) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _SupervisedInterruptibleBackend(profile, NativeStoreConfig())
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    for bad in (-1, 0, "60", True):
+        with pytest.raises(ConfigError, match=key):
+            await session.run("hi", **{key: bad})
+
+    assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == []
+
+
+class _GatedClock:
+    """Fake clock whose `sleep` returns only when the test opens the gate
+    (then the clock reads whatever the test set it to)."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+        self.gate = asyncio.Event()
+
+    def __call__(self) -> float:
+        return self.now
+
+    async def sleep(self, delay: float) -> None:  # noqa: ARG002 -- woken by the test
+        await self.gate.wait()
+
+
+class _CleanupAfterTerminalBackend(_ScriptedBackend):
+    """A supervised backend that, after its terminal event is consumed,
+    lets the fake clock run past every limit before its stream ends (slow
+    post-terminal cleanup)."""
+
+    def __init__(
+        self, profile: Profile, native_config: NativeStoreConfig, clock: _GatedClock
+    ) -> None:
+        super().__init__(profile, native_config, [])
+        self._clock = clock
+        self.contexts: list[TurnContext] = []
+        self.interrupts = 0
+
+    def capabilities(self) -> Capabilities:
+        return super().capabilities().model_copy(update={"supports_work_supervisor": True})
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        self.contexts.append(ctx)
+        # Engine I/O: the supervisor task starts its wait meanwhile.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        yield TurnStarted(turn_id=ctx.turn_id)
+        yield _completed()
+        self._clock.now = 100_000.0
+        self._clock.gate.set()
+        # Enough loop turns for a still-running supervisor to wake and
+        # fire (it needs a few); no real time passes.
+        for _ in range(100):
+            await asyncio.sleep(0)
+
+    async def interrupt(self, session_id: str) -> None:  # noqa: ARG002 -- Backend interface
+        self.interrupts += 1
+
+
+async def test_no_limit_fires_after_the_terminal_event(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Once the backend's terminal is out, the turn is over: a limit must
+    # not set timeout_reason, interrupt a finished turn, or write a
+    # timeout notice after the terminal.
+    clock = _GatedClock()
+    monkeypatch.setattr(
+        _turn_runner,
+        "WorkSupervisor",
+        functools.partial(WorkSupervisor, clock=clock, sleep=clock.sleep),
+    )
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _CleanupAfterTerminalBackend(profile, NativeStoreConfig(), clock)
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    events = [event async for event in session.stream("hi")]
+
+    assert isinstance(events[-1], TurnCompleted)
+    assert events[-1].result.status == "completed"
+    assert not any(_is_timeout_notice(event) for event in events)
+    assert fake.contexts[0].timeout_reason is None
+    assert fake.interrupts == 0
+    stored = tw._store.history(_VALID_ID, include_children=False, include_raw=False)
+    assert [m for m in stored if m.kind == "event"] == []
+
+
+class _SlowInterruptBackend(_ScriptedBackend):
+    """Answers a fired limit's interrupt with its terminal at once, while
+    its `interrupt()` call is still running (a slow SDK cancel)."""
+
+    def __init__(
+        self, profile: Profile, native_config: NativeStoreConfig, *, raises: bool = False
+    ) -> None:
+        super().__init__(profile, native_config, [])
+        self._raises = raises
+        self._interrupt_started = asyncio.Event()
+        self.interrupt_finished = False
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        yield TurnStarted(turn_id=ctx.turn_id)
+        await self._interrupt_started.wait()
+        yield TurnCompleted(
+            result=TurnResult(
+                turn_id=ctx.turn_id,
+                status="interrupted",
+                end_reason="interrupted",
+                final_text=None,
+                usage={},
+                cost_usd=None,
+            )
+        )
+
+    async def interrupt(self, session_id: str) -> None:  # noqa: ARG002 -- Backend interface
+        self._interrupt_started.set()
+        await asyncio.sleep(0.05)
+        self.interrupt_finished = True
+        if self._raises:
+            raise RuntimeError("engine cancel failed")
+
+
+def _record_interrupt_state_at_finalize(tw: Tradewind, fake: _SlowInterruptBackend) -> list[bool]:
+    seen: list[bool] = []
+    finalize = tw._store.finalize_turn
+
+    def recording_finalize(*args: Any, **kwargs: Any) -> None:
+        seen.append(fake.interrupt_finished)
+        finalize(*args, **kwargs)
+
+    tw._store.finalize_turn = recording_finalize  # type: ignore[method-assign]
+    return seen
+
+
+async def test_slow_interrupt_finishes_before_the_turn_finalizes(tmp_path: Path) -> None:
+    # The interrupt a fired limit sent must not outlive the turn (it could
+    # otherwise reach the next turn on this session).
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _SlowInterruptBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = fake
+    seen = _record_interrupt_state_at_finalize(tw, fake)
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    events = [event async for event in session.stream("hi", request_timeout_s=0.01)]
+
+    assert isinstance(events[-1], TurnCompleted)
+    assert _is_timeout_notice(events[-2])
+    assert seen == [True]
+
+
+async def test_error_from_a_slow_interrupt_surfaces_in_the_turn(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _SlowInterruptBackend(profile, NativeStoreConfig(), raises=True)
+    tw._backends["default"] = fake
+    seen = _record_interrupt_state_at_finalize(tw, fake)
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    with pytest.raises(RuntimeError, match="engine cancel failed"):
+        async for _ in session.stream("hi", request_timeout_s=0.01):
+            pass
+
+    assert seen == [True]
+
+
+class _HungInterruptBackend(_ScriptedBackend):
+    """A hung engine: once a fired limit's `interrupt()` starts, it never
+    returns. With `ends_stream`, the stream itself then ends with no
+    terminal; otherwise the stream hangs too."""
+
+    def __init__(
+        self, profile: Profile, native_config: NativeStoreConfig, *, ends_stream: bool
+    ) -> None:
+        super().__init__(profile, native_config, [])
+        self._ends_stream = ends_stream
+        self.interrupt_started = asyncio.Event()
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        yield TurnStarted(turn_id=ctx.turn_id)
+        await self.interrupt_started.wait()
+        if not self._ends_stream:
+            await asyncio.Event().wait()
+
+    async def interrupt(self, session_id: str) -> None:  # noqa: ARG002 -- Backend interface
+        self.interrupt_started.set()
+        await asyncio.Event().wait()
+
+
+async def test_hung_interrupt_cannot_keep_the_turn_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_turn_runner, "_INTERRUPT_GRACE_S", 0.05)
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _HungInterruptBackend(profile, NativeStoreConfig(), ends_stream=True)
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    with anyio.fail_after(5):
+        result = await session.run("hi", request_timeout_s=0.01)
+
+    assert (result.status, result.end_reason) == ("interrupted", "timeout")
+    assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == ["interrupted"]
+    assert _VALID_ID not in tw._turn_runner._busy
+
+
+async def test_hung_interrupt_cannot_block_a_caller_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(_turn_runner, "_INTERRUPT_GRACE_S", 0.05)
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _HungInterruptBackend(profile, NativeStoreConfig(), ends_stream=False)
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    turn = asyncio.ensure_future(session.run("hi", request_timeout_s=0.01))
+    await fake.interrupt_started.wait()
+    turn.cancel()
+
+    with anyio.fail_after(5):
+        with pytest.raises(asyncio.CancelledError):
+            await turn
+
+    # Finalized (not left in_progress) and the session is free again.
+    statuses = await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID)
+    assert statuses != ["in_progress"]
+    assert len(statuses) == 1
+    assert _VALID_ID not in tw._turn_runner._busy
+
+
+@pytest.mark.parametrize("supervised", [True, False])
+@pytest.mark.parametrize("terminal_after_interrupt", [True, False])
+async def test_timeout_notice_before_terminal_on_every_backend(
+    tmp_path: Path, supervised: bool, terminal_after_interrupt: bool
+) -> None:
+    # Whether the backend answers interrupt() with its own terminal event
+    # or with none (the runner then synthesizes one), the caller learns
+    # WHY the turn ended before it ends: one notice, then the terminal.
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _SupervisedInterruptibleBackend(
+        profile,
+        NativeStoreConfig(),
+        supervised=supervised,
+        terminal_after_interrupt=terminal_after_interrupt,
+    )
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    events = [event async for event in session.stream("hi", request_timeout_s=0.2)]
+
+    notices = [event for event in events if _is_timeout_notice(event)]
+    assert len(notices) == 1
+    assert isinstance(events[-1], TurnCompleted)
+    assert _is_timeout_notice(events[-2])
+    notice = cast(ItemCompleted, events[-2]).message.content
+    assert (notice["limit"], notice["value"]) == ("hard_cap", 0.2)
+    # The reason was set before the backend was asked to stop.
+    assert fake.reason_at_interrupt == [fake.contexts[0].timeout_reason]
+    assert fake.reason_at_interrupt[0] is not None
+    # The notice is in the mirror, not only on the stream.
+    stored = tw._store.history(_VALID_ID, include_children=False, include_raw=False)
+    assert [m.content.get("type") for m in stored if m.kind == "event"] == ["turn_timeout"]
+    if not terminal_after_interrupt:
+        assert cast(TurnCompleted, events[-1]).result.end_reason == "timeout"
+
+
 async def test_reported_usage_triggers_compaction_when_estimate_would_not(
     tmp_path: Path,
 ) -> None:
@@ -2127,3 +2540,487 @@ async def test_plain_turn_persists_no_structured_output(tmp_path: Path) -> None:
         "SELECT final_text, structured_output_json FROM turns WHERE session_id = ?", (_VALID_ID,)
     ).fetchone()
     assert row == ("hi", None)
+
+
+# --- (7) turn governance: the policy gate on the turn context ---
+
+
+class _PolicyProbeBackend(_ToolCallingBackend):
+    """Records `ctx.policy` and `ctx.broker`, then runs the tool-call script."""
+
+    def __init__(self, profile: Profile, native_config: NativeStoreConfig, name: BackendName):
+        super().__init__(profile, native_config, "my_tool", {"x": 1})
+        self.name = name  # type: ignore[misc]
+        self.seen: TurnContext | None = None
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        self.seen = ctx
+        yield TurnStarted(turn_id=ctx.turn_id)
+        if self.name == "codex":
+            # The codex shim path: ToolHost itself consults its broker.
+            outcome = await ctx.tools.call("my_tool", {"x": 1})
+            final_text = outcome.content
+        else:
+            final_text = "n/a"
+        yield _completed(final_text)
+
+
+class _CountingBroker:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, dict[str, object]]] = []
+
+    async def decide(self, tool_name: str, tool_input: dict[str, object]) -> str:
+        self.calls.append((tool_name, tool_input))
+        return "allow"
+
+
+def _my_tool() -> Tool:
+    async def handler(**_kwargs: object) -> str:
+        return "handled"
+
+    return Tool(name="my_tool", description="d", input_schema={"type": "object"}, handler=handler)
+
+
+async def test_runner_sets_policy_on_context(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    backend = _PolicyProbeBackend(profile, NativeStoreConfig(), "langchain")
+    tw._backends["default"] = backend
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("go")
+
+    assert backend.seen is not None
+    assert backend.seen.policy is not None
+    assert isinstance(backend.seen.work, WorkSupervisor)
+    assert backend.seen.timeout_reason is None
+    assert backend.seen.preflight == {}
+
+
+async def test_codex_toolhost_uses_gate_broker_once(tmp_path: Path) -> None:
+    profile = _profile()
+    broker = _CountingBroker()
+    tw = Tradewind(_config(tmp_path, profile))
+    backend = _PolicyProbeBackend(profile, NativeStoreConfig(), "codex")
+    tw._backends["default"] = backend
+    session = await tw.create(
+        _VALID_ID, SessionOptions(tools=[_my_tool()], permission_broker=broker)
+    )
+    result = await session.run("go")
+
+    assert result.final_text == "handled"
+    assert len(broker.calls) == 1
+    assert broker.calls[0][0] == "my_tool"
+    # The raw broker stays on the context for adapters not yet on the gate.
+    assert backend.seen is not None
+    assert backend.seen.broker is broker
+
+
+async def test_no_broker_detection_still_works(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    backend = _PolicyProbeBackend(profile, NativeStoreConfig(), "langchain")
+    tw._backends["default"] = backend
+    session = await tw.create(_VALID_ID, SessionOptions())
+    await session.run("go")
+
+    assert backend.seen is not None
+    assert getattr(backend.seen.broker, "is_default_allow_all", False) is True
+    assert backend.seen.policy is not None
+    assert backend.seen.policy.has_broker is False
+
+
+class _RecordingNoticeBackend(_ToolCallingBackend):
+    """Raises one recorded gate notice; optionally ends with no terminal."""
+
+    def __init__(
+        self, profile: Profile, native_config: NativeStoreConfig, *, terminal: bool
+    ) -> None:
+        super().__init__(profile, native_config, "my_tool", {})
+        self._terminal = terminal
+
+    def capabilities(self) -> Capabilities:
+        # It puts its action through `ctx.policy`, so caller rules apply.
+        return super().capabilities().model_copy(update={"supports_action_policy": True})
+
+    def _notice(self, ctx: TurnContext) -> None:
+        assert ctx.policy is not None
+        ctx.policy.observe(
+            Action(
+                kind="caller_tool",
+                fields={"name": "t"},
+                backend="langchain",
+                native_name="t",
+                native_args={},
+                summary="t",
+            )
+        )
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        yield TurnStarted(turn_id=ctx.turn_id)
+        self._notice(ctx)
+        if self._terminal:
+            yield ItemCompleted(
+                message=NormalizedMessage(role="assistant", kind="text", content={"text": "x"})
+            )
+            yield _completed("done")
+
+
+def _record_rule() -> Rule:
+    return Rule(id="rec", kind="any", where={}, outcome="allow", record=True)
+
+
+def _is_policy_notice(event: Event) -> bool:
+    return (
+        isinstance(event, ItemCompleted) and event.message.content.get("type") == "policy_recorded"
+    )
+
+
+async def test_gate_notice_precedes_next_event_and_is_persisted(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _RecordingNoticeBackend(profile, NativeStoreConfig(), terminal=True)
+    session = await tw.create(_VALID_ID, SessionOptions(policy_rules=[_record_rule()]))
+    events = [e async for e in session.stream("go")]
+
+    assert [_is_policy_notice(e) for e in events] == [False, True, False, False]
+    assert isinstance(events[-1], TurnCompleted)
+    stored = tw._store.history(_VALID_ID, include_children=False, include_raw=False)
+    assert any(m.content.get("type") == "policy_recorded" for m in stored)
+
+
+async def test_gate_notice_precedes_synthesized_terminal(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _RecordingNoticeBackend(profile, NativeStoreConfig(), terminal=False)
+    session = await tw.create(_VALID_ID, SessionOptions(policy_rules=[_record_rule()]))
+    events = [e async for e in session.stream("go")]
+
+    assert isinstance(events[-1], TurnFailed)
+    assert _is_policy_notice(events[-2])
+    stored = tw._store.history(_VALID_ID, include_children=False, include_raw=False)
+    assert any(m.content.get("type") == "policy_recorded" for m in stored)
+
+
+class _NoticeThenRaiseBackend(_RecordingNoticeBackend):
+    """Raises one recorded gate notice, then fails with its own error."""
+
+    def __init__(self, profile: Profile, native_config: NativeStoreConfig) -> None:
+        super().__init__(profile, native_config, terminal=False)
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        yield TurnStarted(turn_id=ctx.turn_id)
+        self._notice(ctx)
+        raise RuntimeError("backend boom")
+
+
+async def test_end_drain_failure_keeps_error_and_finalizes(tmp_path: Path) -> None:
+    """A store failure while the `finally` stores gate notices is logged:
+    the backend's own error still propagates and the turn is finalized."""
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _NoticeThenRaiseBackend(profile, NativeStoreConfig())
+    session = await tw.create(_VALID_ID, SessionOptions(policy_rules=[_record_rule()]))
+    store = tw._store
+    real_append = store.append_message
+
+    def append_message(session_id: str, turn_id: str, message: NormalizedMessage) -> int:
+        if message.content.get("type") == "policy_recorded":
+            raise OSError("disk full")
+        return real_append(session_id, turn_id, message)
+
+    store.append_message = append_message  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="backend boom"):
+        _ = [e async for e in session.stream("go")]
+
+    assert _turn_statuses(store, _VALID_ID) == ["failed"]
+
+
+class _ResultToolProbeBackend(_RecordingNoticeBackend):
+    """Uses the result tool (05 §6); observes one call to it and records
+    what the gate answered."""
+
+    uses_result_tool: ClassVar[bool] = True
+
+    def __init__(self, profile: Profile, native_config: NativeStoreConfig) -> None:
+        super().__init__(profile, native_config, terminal=True)
+        self.observed: list[str] = []
+
+    def _notice(self, ctx: TurnContext) -> None:
+        assert ctx.policy is not None
+        self.observed.append(
+            ctx.policy.observe(
+                Action(
+                    kind="caller_tool",
+                    fields={"name": "tradewind_submit_result"},
+                    backend="langchain",
+                    native_name="tradewind_submit_result",
+                    native_args={},
+                )
+            ).outcome
+        )
+
+
+@pytest.mark.parametrize(("schema", "outcome"), [({"type": "object"}, "stop"), (None, "allow")])
+async def test_turn_result_tool_variable_names_the_result_tool(
+    tmp_path: Path, schema: dict[str, object] | None, outcome: str
+) -> None:
+    """`$turn.result_tool` is the result tool's name on a turn that uses it,
+    else `None` -- so the rule matches only then."""
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    backend = _ResultToolProbeBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = backend
+    rule = Rule(
+        id="r",
+        kind="caller_tool",
+        where={"name": Matcher("equals", "$turn.result_tool")},
+        outcome="deny",
+    )
+    session = await tw.create(_VALID_ID, SessionOptions(output_schema=schema, policy_rules=[rule]))
+    _ = [e async for e in session.stream("go")]
+
+    assert backend.observed == [outcome]
+
+
+# --- 05-turn-governance §4: prepare_turn and a stop around it ---
+
+
+class _PreparingBackend(_ScriptedBackend):
+    """Records the calls the runner makes. `prepare_turn` sleeps for
+    `prepare_s`, or (with `wait_for_interrupt`) waits until `interrupt()`
+    arrives; `on_floor` runs while the runner sets the turn up, before
+    `prepare_turn`."""
+
+    def __init__(
+        self,
+        profile: Profile,
+        native_config: NativeStoreConfig,
+        *,
+        prepare_s: float = 0.0,
+        wait_for_interrupt: bool = False,
+        raise_in_prepare: Exception | None = None,
+    ) -> None:
+        super().__init__(profile, native_config, [])
+        self._prepare_s = prepare_s
+        self._wait_for_interrupt = wait_for_interrupt
+        self._raise_in_prepare = raise_in_prepare
+        self.on_floor: Callable[[], None] | None = None
+        self.calls: list[str] = []
+        self.side_effects: list[str] = []
+        self.in_prepare = anyio.Event()
+        self._interrupted = anyio.Event()
+
+    def floor_rules(self) -> list[Rule]:
+        if self.on_floor is not None:
+            self.on_floor()
+        return []
+
+    async def prepare_turn(self, ctx: TurnContext) -> None:  # noqa: ARG002 -- Backend interface
+        self.calls.append("prepare_turn")
+        self.in_prepare.set()
+        if self._raise_in_prepare is not None:
+            raise self._raise_in_prepare
+        if self._wait_for_interrupt:
+            await self._interrupted.wait()
+        await anyio.sleep(self._prepare_s)
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        self.calls.append("run")
+        self.side_effects.append("deleted files")
+        yield TurnStarted(turn_id=ctx.turn_id)
+        yield _completed()
+
+    async def interrupt(self, session_id: str) -> None:  # noqa: ARG002 -- Backend interface
+        self.calls.append("interrupt")
+        self._interrupted.set()
+
+
+def _assert_interrupted_without_turn_started(events: list[Event]) -> None:
+    assert not any(isinstance(e, TurnStarted) for e in events)
+    assert isinstance(events[-1], TurnCompleted)
+    assert events[-1].result.status == "interrupted"
+    assert events[-1].result.end_reason == "interrupted"
+
+
+async def test_stop_before_prepare_turn_records_interrupted_without_run(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _PreparingBackend(profile, NativeStoreConfig())
+    # A stop that lands while the runner sets the turn up.
+    fake.on_floor = functools.partial(tw._turn_runner._interrupt_requested.add, _VALID_ID)
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    events = [e async for e in session.stream("hi")]
+
+    _assert_interrupted_without_turn_started(events)
+    assert fake.calls == []
+    assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == ["interrupted"]
+
+
+async def test_stop_after_prepare_turn_records_interrupted_without_run(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _PreparingBackend(profile, NativeStoreConfig(), wait_for_interrupt=True)
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    events: list[Event] = []
+
+    async def consume() -> None:
+        events.extend([e async for e in session.stream("hi")])
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(consume)
+        with anyio.fail_after(5):
+            await fake.in_prepare.wait()
+        # The backend receives the interrupt while it waits in prepare_turn.
+        await session.stop()
+
+    _assert_interrupted_without_turn_started(events)
+    assert fake.calls == ["prepare_turn", "interrupt"]
+    assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == ["interrupted"]
+
+
+async def test_run_not_called_and_no_side_effect(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _PreparingBackend(profile, NativeStoreConfig(), wait_for_interrupt=True)
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    async with anyio.create_task_group() as tg:
+        tg.start_soon(session.run, "hi")
+        with anyio.fail_after(5):
+            await fake.in_prepare.wait()
+        await session.stop()
+
+    assert "run" not in fake.calls
+    assert fake.side_effects == []
+
+
+async def test_config_error_from_prepare_turn_propagates_and_fails_the_turn(
+    tmp_path: Path,
+) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _PreparingBackend(
+        profile, NativeStoreConfig(), raise_in_prepare=ConfigError("workspace is locked")
+    )
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    with pytest.raises(ConfigError, match="workspace is locked"):
+        await session.run("hi")
+
+    assert fake.calls == ["prepare_turn"]
+    assert await anyio.to_thread.run_sync(_turn_statuses, tw._store, _VALID_ID) == ["failed"]
+
+
+async def test_prepare_turn_time_not_counted_by_supervisor(tmp_path: Path) -> None:
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _PreparingBackend(profile, NativeStoreConfig(), prepare_s=0.5)
+    session = await tw.create(_VALID_ID, SessionOptions())
+
+    events = [e async for e in session.stream("hi", request_timeout_s=0.2)]
+
+    assert not any(_is_timeout_notice(e) for e in events)
+    assert isinstance(events[-1], TurnCompleted)
+    assert events[-1].result.status == "completed"
+
+
+class _AskingBackend(_PreparingBackend):
+    """Runs one preflight `Ask` in `prepare_turn` and records `ctx`."""
+
+    def __init__(self, profile: Profile, native_config: NativeStoreConfig) -> None:
+        super().__init__(profile, native_config)
+        self.contexts: list[TurnContext] = []
+
+    async def prepare_turn(self, ctx: TurnContext) -> None:
+        self.contexts.append(ctx)
+
+        async def stale(_ctx: TurnContext) -> Ok | Ask | Stop:
+            return Ask(
+                question="Delete stale files?",
+                details={},
+                choices=["keep", "delete"],
+                default_choice="keep",
+            )
+
+        await run_checks(ctx, [("stale", stale)])
+
+
+async def test_prepare_turn_receives_the_callers_on_preflight(tmp_path: Path) -> None:
+    asked: list[str] = []
+
+    async def on_preflight(question: str, _d: dict[str, object], _c: list[str]) -> str:
+        asked.append(question)
+        return "delete"
+
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    fake = _AskingBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = fake
+    session = await tw.create(_VALID_ID, SessionOptions(on_preflight=on_preflight))
+
+    result = await session.run("hi")
+
+    assert result.status == "completed"
+    assert fake.contexts[0].on_preflight is on_preflight
+    assert asked == ["Delete stale files?"]
+    assert fake.contexts[0].preflight == {"stale": "delete"}
+
+
+# --- turn governance: a plain LangChain tool turn through the real runner
+# keeps the same events and mirror rows it had before governance (ruling 4) ---
+
+
+async def test_langchain_plain_tool_turn_events_and_mirror_rows_are_unchanged(
+    tmp_path: Path,
+) -> None:
+    async def handler(**_kwargs: object) -> str:
+        return "ok"
+
+    tool = Tool(name="echo", description="d", input_schema={"type": "object"}, handler=handler)
+    model = _ScriptedChatModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[{"name": "echo", "args": {"a": 1}, "id": "c1", "type": "tool_call"}],
+            ),
+            AIMessage(content="done"),
+        ]
+    )
+
+    def factory(p: Profile, native_config: NativeStoreConfig) -> Backend:
+        return LangchainBackend(p, native_config, chat_model_factory=lambda _spec: model)
+
+    tw = Tradewind(_config(tmp_path, _profile()), backend_factories={"langchain": factory})
+    session = await tw.create(_VALID_ID, SessionOptions(tools=[tool]))
+
+    events = [e async for e in session.stream("go")]
+
+    conn = cast(Any, tw._store)._conn
+    rows = [
+        (role, kind, json.loads(content))
+        for role, kind, content in conn.execute(
+            "SELECT role, kind, content_json FROM messages WHERE session_id = ? ORDER BY seq",
+            (_VALID_ID,),
+        )
+    ]
+    # Literals captured from the pre-governance adapter (same script).
+    assert [type(e).__name__ for e in events] == [
+        "TurnStarted",
+        "ItemCompleted",
+        "ItemCompleted",
+        "TextDelta",
+        "ItemCompleted",
+        "TurnCompleted",
+    ]
+    assert rows == [
+        ("user", "text", {"text": "go"}),
+        ("assistant", "tool_use", {"id": "c1", "name": "echo", "input": {"a": 1}}),
+        ("tool", "tool_result", {"tool_use_id": "c1", "content": "ok", "is_error": False}),
+        ("assistant", "text", {"text": "done"}),
+    ]

@@ -89,7 +89,15 @@ class Backend(ABC):
         # supports_system_prompt, supports_structured_output,
         # supports_interactive_permissions, supports_in_process_tools,
         # supports_native_resume, supports_fork, supports_transcript_read,
-        # supports_tool_round_cap (FR-8)
+        # supports_tool_round_cap (FR-8), supports_engine_auto,
+        # supports_work_supervisor, supports_action_policy (FR-11)
+
+    async def prepare_turn(self, ctx: TurnContext) -> None: ...
+        # default no-op; runs ordered preflight checks before TurnStarted (FR-11.5)
+
+    def floor_rules(self) -> list[Rule]: ...
+    def default_rules(self) -> list[Rule]: ...
+        # the backend's policy rules (FR-11.1); uses_result_tool: ClassVar[bool] (FR-11.7)
 
     @abstractmethod
     async def run(
@@ -124,6 +132,12 @@ Rules:
   reversible: the Cursor system-prompt emulation writes only
   `.cursor/rules/tradewind-session.mdc` — never `AGENTS.md` or any existing
   file — and falls back to first-message prompt folding when it cannot write.
+- **R-1a** Turn governance (ADR-0004, `docs/components/05-turn-governance.md`):
+  `TurnContext` carries `policy` (`gate`, `observe`), `work`, `timeout_reason`
+  and `preflight`; adapters map engine messages onto them and declare rules,
+  and make no policy decision themselves. Setting `permission_mode` or
+  `policy_rules` on a backend whose flags deny it raises `Unsupported` from one
+  runner check before `prepare_turn`.
 - **R-2** The same shape applies to the other two ports: `SessionStorePort`
   (SQLite now, Postgres later — P-4) and `ToolHost` (in-process handler vs.
   stdio MCP shim are two renderings behind one registry). One interface, N
@@ -142,7 +156,7 @@ this list.
 
 | Event | Emitted when | claude | langchain |
 |---|---|---|---|
-| `TurnStarted` | Always, the first event of every turn. | yes | yes |
+| `TurnStarted` | The first event of every turn that reaches the engine; a stop, limit or error before `run()` gets there ends the turn with a terminal record and no `TurnStarted` (FR-7.3). | yes | yes |
 | `TextDelta` | A streamed text chunk, ahead of the `ItemCompleted` it assembles into. | no (SDK hands messages over whole, not incrementally) | yes |
 | `ItemCompleted` | One normalized message (`text`/`thinking`/`tool_use`/`tool_result` — and, since FR-5.8/FR-6.6, a `kind="compaction"` checkpoint record or a `kind="event"` notice: compaction failure or a scheduled retry (`retry_scheduled`)) is complete and mirrored. Compaction deliberately rides THIS member rather than adding `CompactionStarted/Completed` events, so the frozen taxonomy gains zero members. | yes | yes |
 | `PermissionRequested` | A tool call's broker verdict is `"deny"` — **deny-only, by design**: an `"allow"` verdict has no side effect distinct from the call itself proceeding, so it is not separately eventized. Carries the broker's `reason` (FR-4.4) on every consulted path, including backends whose engines cannot show it to the model. | yes | yes |

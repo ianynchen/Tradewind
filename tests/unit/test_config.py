@@ -12,7 +12,7 @@ from pydantic import SecretStr
 
 from tradewind import Tradewind
 from tradewind.adapters.sqlite_store import SqliteSessionStore
-from tradewind.application.config import TradewindConfig
+from tradewind.application.config import TradewindConfig, TurnDefaults
 from tradewind.domain.errors import ConfigError, SessionNotFound
 from tradewind.domain.models import ApiKeyAuth, ModelSpec, Profile, SessionOptions
 
@@ -149,3 +149,28 @@ async def test_two_tradewind_instances_on_two_sqlite_files_coexist(tmp_path: Pat
 
     await tw_a.aclose()
     await tw_b.aclose()
+
+
+# --- TurnDefaults limits must be positive (FR-6.6, 05 §3.2) ---
+
+
+@pytest.mark.parametrize(
+    "key", ["model_silence_timeout_s", "work_silence_timeout_s", "request_timeout_s"]
+)
+@pytest.mark.parametrize("value", [0, -1.5])
+def test_turn_defaults_limit_must_be_positive(tmp_path: Path, key: str, value: float) -> None:
+    with pytest.raises(ConfigError, match=key):
+        TurnDefaults(**{key: value})
+    with pytest.raises(ConfigError, match=key):
+        TradewindConfig(
+            profiles={"p": _profile()},
+            default_profile="p",
+            store=_store_config(tmp_path),
+            defaults={key: value},  # type: ignore[arg-type]
+        )
+
+
+def test_turn_defaults_accepts_positive_limits_and_no_hard_cap() -> None:
+    d = TurnDefaults(model_silence_timeout_s=1, work_silence_timeout_s=2.5, request_timeout_s=None)
+    assert (d.model_silence_timeout_s, d.request_timeout_s) == (1.0, None)
+    assert TurnDefaults(request_timeout_s=10).request_timeout_s == 10.0

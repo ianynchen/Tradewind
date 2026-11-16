@@ -153,6 +153,69 @@ the adapter never has to import `application.turn_runner` itself — and default
 whichever broker is or isn't configured. See README.md's "Security defaults" section for the
 caller-facing summary.
 
+### Claude turn governance findings (claude-agent-sdk 0.2.151, CLI 2.1.258; task 8)
+
+- **engine_auto is not enabled on Claude.** The SDK's `auto` permission mode lets a model
+  classifier approve tool calls; `can_use_tool` is "not invoked for tool calls already
+  permitted by ... `permission_mode`" (`claude_agent_sdk/types.py:2110-2125`) and
+  `set_permission_mode` documents `'auto'` as "A model classifier approves or denies each
+  tool call" (`claude_agent_sdk/client.py:294`). Setting it would let caller tools bypass the
+  policy gate, so the adapter never sets `permission_mode`; `supports_engine_auto` stays
+  `False` for Claude (05 §2.5).
+- **Slash commands: prefix rule, not the CLI flag.** The CLI's `--disable-slash-commands`
+  ("Disable all skills") still intercepts built-ins: `claude -p --disable-slash-commands
+  "/cost"` answered "/cost isn't available in this environment." with `num_turns=0` and no
+  model call. So a prompt whose first non-whitespace character is `/` is sent as
+  `Message: <prompt>` (05 §5).
+- **Process report reads a private PID.** The CLI's PID is reachable only through private
+  attributes (`ClaudeSDKClient._transport._process`,
+  `_internal/transport/subprocess_cli.py:233,853`); the adapter reads it with one guarded
+  accessor, and a unit test fails if an SDK upgrade moves it (then the adapter logs
+  "process report unavailable" and the turn runs without a report). The CLI is spawned
+  without a new session, so it shares the caller's process group: the process group step
+  of 05 §3.4 is skipped and only the tree walk from the CLI is used, which never includes
+  the caller or its ancestors.
+- **Late engine output after settle reaches the mirror only through reconcile.** The model's
+  reply to an injected task-notification turn that arrives after the turn has settled, and
+  later `ResultMessage`s read while settling, are not mirrored live; they reach the mirror
+  through reconcile at the next turn (the native session id is unchanged within one client
+  connection).
+
+### Codex turn governance findings (openai-codex / app-server 0.147.0; task 9)
+
+- **engine_auto = Codex's auto-reviewer.** `permission_mode="engine_auto"` starts or resumes
+  the thread with `approvals_reviewer=ApprovalsReviewer.auto_review`
+  (`openai_codex/generated/v2_all.py:235-238`; it is the value the SDK's own
+  `ApprovalMode.auto_review` maps to, `openai_codex/_approval_mode.py:29-33`) with the
+  `workspace-write` sandbox, also when no broker is set. Approval requests that still reach
+  the client go through the gate. Without engine_auto nothing changed: `user` reviewer, and
+  `read-only` when no broker is configured.
+- **Write narrow `shell` / `file_write` rules.** Observe sees only a completed command or file
+  change that had no approval request. A broad caller rule such as `shell → ask` therefore
+  stops a turn after any sandboxed command Codex ran without asking (e.g. `ls`).
+- **A file-change approval request carries no changes.** `FileChangeRequestApprovalParams`
+  has only ids, `reason` and `grant_root` (app-server-protocol `v2/item.rs:1521-1535`); core
+  emits the item's `item/started` (with its changes) before it asks
+  (`core/src/tools/handlers/apply_patch.rs:553`). The adapter takes the changes from that
+  start (`ApprovalLedger`, a bounded 2 s wait). The broker still gets today's
+  `{"changes": params.get("changes")}`, which is `None` on 0.147.0; the real changes are in
+  the `tradewind` action.
+- **`/` prompts are not expanded** by the app-server: `turn/start` maps text input straight
+  to core input (`app-server/src/request_processors/turn_processor.rs:512-516`,
+  app-server-protocol `v2/turn.rs:328-336`); slash commands are a TUI feature. The prompt is
+  sent unchanged.
+- **Process report reads a private PID.** The `codex app-server` process is held only in the
+  private `CodexClient._proc` (`openai_codex/client.py:222,259`); the adapter reads it with
+  one guarded accessor, pinned by a unit test. It is spawned without a new session, so, as
+  on Claude, the process group step is skipped and only the tree walk is used.
+
+### Known limits of turn governance (PR 1)
+
+- `in_workspace` on file actions is lexical; symlinks are not resolved.
+- Cursor supports none of the governance features (`supports_action_policy`,
+  `supports_work_supervisor`, `supports_engine_auto` are all False).
+- The Antigravity mapping (`04-antigravity-adapter.md`) is PR 2 and is not implemented.
+
 ### Env gates for integration/live runs
 
 | Variable | Gates | Notes |

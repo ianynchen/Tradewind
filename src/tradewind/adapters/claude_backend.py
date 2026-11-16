@@ -31,9 +31,11 @@ serve every call, through two SDK-provided seams:
     subprocess connecting to those servers itself) isn't wired -- flagged
     for controller confirmation in the task-10 report.
   - `can_use_tool` (`ClaudeAgentOptions.can_use_tool`) bridges every tool
-    call the CLI is about to make -- built-in or MCP -- to `ctx.broker.
-    decide()`, and `PermissionRequested` fires on "deny" exactly like
-    `LangchainBackend`'s tool loop does (FR-4.1).
+    call the CLI is about to make -- built-in or MCP -- to `ctx.policy.
+    gate()` as a `caller_tool` action (05-turn-governance §2.1), which asks
+    the broker with today's name and input when the rules say `ask`;
+    `PermissionRequested` fires on "deny" exactly like `LangchainBackend`'s
+    tool loop does (FR-4.1).
   - `ClaudeAgentOptions.tools=[]` disables the CLI's own built-in dev tools
     (Bash, Read, Edit, ...) entirely: Tradewind's whole premise (module
     docstring, `tradewind/__init__.py`) is a caller-declared, broker-gated
@@ -89,12 +91,14 @@ points above.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, ClassVar, cast
 
 import anyio
 from claude_agent_sdk import (
+    TERMINAL_TASK_STATUSES,
     AssistantMessage,
     CanUseTool,
     ClaudeAgentOptions,
@@ -112,6 +116,11 @@ from claude_agent_sdk import (
     ResultMessage,
     SdkMcpTool,
     SessionMessage,
+    StreamEvent,
+    TaskNotificationMessage,
+    TaskProgressMessage,
+    TaskStartedMessage,
+    TaskUpdatedMessage,
     TextBlock,
     ThinkingBlock,
     ToolPermissionContext,
@@ -123,9 +132,12 @@ from claude_agent_sdk import (
 )
 
 from tradewind.application.config import NativeStoreConfig
+from tradewind.application.policy_gate import PolicyGate, caller_tool_source
 from tradewind.application.ports import Backend, TurnContext
+from tradewind.application.supervisor import WorkSupervisor
 from tradewind.application.tool_host import ToolHost
 from tradewind.domain.compaction import compose_replay_prompt
+from tradewind.domain.errors import Unsupported
 from tradewind.domain.events import (
     Event,
     ItemCompleted,
@@ -139,17 +151,29 @@ from tradewind.domain.models import (
     Capabilities,
     EndReason,
     NormalizedMessage,
-    PermissionBroker,
     Profile,
     SessionRow,
     TurnResult,
     engine_compaction_record,
-    normalize_decision,
     resume_degraded_notice,
     retry_notice,
 )
+from tradewind.domain.policy import Action, TurnVars, floor_tradewind
 
 _logger = logging.getLogger(__name__)
+
+
+def _engine_pid(client: ClaudeSDKClient) -> int | None:
+    """The CLI process's PID, for the process report (05 §3.4). The SDK
+    keeps it private (`ClaudeSDKClient._transport._process`, pinned by a
+    unit test); when it is missing, one WARNING and no report."""
+    transport = getattr(client, "_transport", None)
+    pid = getattr(getattr(transport, "_process", None), "pid", None)
+    if not isinstance(pid, int):
+        _logger.warning("process report unavailable: claude SDK has no _transport._process.pid")
+        return None
+    return pid
+
 
 # `ResultMessage.terminal_reason` values that mean "this turn was ended by
 # `ClaudeSDKClient.interrupt()`, not a genuine completion or failure"
@@ -629,18 +653,109 @@ class _CallerRoundCap:
         return self._round_of_call[tool_use_id] > self.cap
 
 
+def message_prompt(prompt: str) -> str:
+    """05 §5 (owner M11): a prompt is always a message to the model. The
+    bundled CLI expands a leading `/` as a slash command, and its only
+    switch, `--disable-slash-commands` ("Disable all skills"), still
+    intercepts built-in commands (live check, CLI 2.1.258: `-p
+    --disable-slash-commands "/cost"` answers "/cost isn't available in this
+    environment." with no model call). So a prompt whose first
+    non-whitespace character is `/` is sent as `Message: <prompt>`; the
+    mirror keeps the caller's original (the runner records `ctx.prompt`'s
+    source, never this)."""
+    return f"Message: {prompt}" if prompt.lstrip().startswith("/") else prompt
+
+
+def report_work(work: WorkSupervisor, message: object) -> None:
+    """Map one SDK message onto work signals (05 §7, Claude row). Signals
+    only -- nothing here becomes an event or a mirror item.
+
+    - `StreamEvent` (`include_partial_messages`) -> `model_active`;
+    - tool-use block -> `started(id, "tool")`; tool-result block ->
+      `ended(tool_use_id)`;
+    - `TaskStartedMessage` -> `started(task_id, "background")`;
+      `TaskProgressMessage` -> `active`; `TaskNotificationMessage`, or a
+      `TaskUpdatedMessage` whose `patch.status` is terminal -> `ended`;
+    - a message with `parent_tool_use_id` (a subagent's traffic) ->
+      `active` of that spawning call;
+    - `ResultMessage` -> `engine_done`.
+    Claude streams no tool output, so work silence on Claude is time since
+    the last tool start or end (05 §7)."""
+    if isinstance(message, StreamEvent):
+        work.model_active()
+        return
+    if isinstance(message, TaskStartedMessage):
+        work.started(message.task_id, "background", message.description)
+    elif isinstance(message, TaskProgressMessage):
+        work.active(message.task_id)
+    elif isinstance(message, TaskNotificationMessage):
+        work.ended(message.task_id)
+    elif isinstance(message, TaskUpdatedMessage):
+        if message.patch.get("status") in TERMINAL_TASK_STATUSES:
+            work.ended(message.task_id)
+    elif isinstance(message, AssistantMessage):
+        for block in message.content:
+            if isinstance(block, ToolUseBlock):
+                work.started(block.id, "tool", block.name)
+    elif isinstance(message, UserMessage):
+        if not isinstance(message.content, str):
+            for block in message.content:
+                if isinstance(block, ToolResultBlock):
+                    work.ended(block.tool_use_id)
+    elif isinstance(message, ResultMessage):
+        work.engine_done()
+    if isinstance(message, AssistantMessage | UserMessage) and message.parent_tool_use_id:
+        work.active(message.parent_tool_use_id)
+
+
+def _direct_policy(ctx: TurnContext, pending_events: list[Event]) -> PolicyGate:
+    """The gate for a `TurnContext` built without the runner (`ctx.policy`
+    unset -- direct construction, as in unit tests): broker mode with no
+    caller or default rules, so every caller tool asks `ctx.broker`, as
+    before turn governance. The runner always sets `ctx.policy`."""
+    return PolicyGate(
+        broker=ctx.broker,
+        backend="claude",
+        floor=floor_tradewind(),
+        caller=[],
+        defaults=[],
+        turn=TurnVars(
+            mode="broker",
+            engine_mode=None,
+            shim_server=None,
+            workspace=ctx.session.cwd,
+            result_tool=None,
+        ),
+        has_broker=not getattr(ctx.broker, "is_default_allow_all", False),
+        emit=pending_events.append,
+    )
+
+
 def _make_can_use_tool(
-    broker: PermissionBroker,
+    policy: PolicyGate,
     pending_events: list[Event],
     terminate_flag: list[bool],
+    stop_reason: list[str | None],
     round_cap: _CallerRoundCap | None = None,
 ) -> CanUseTool:
+    """The permission bridge: every caller tool call goes through
+    `policy.gate` (05 §2.1) as a `caller_tool` action; the broker, when the
+    rules say `ask`, gets today's bare tool name and input (05 §1.1).
+    `stop_reason[0]` is set when the gate stops the turn (05 §2.6)."""
+
     async def can_use_tool(
         tool_name: str, tool_input: dict[str, Any], context: ToolPermissionContext
     ) -> PermissionResult:
+        input_dict = cast("dict[str, object]", tool_input)
         if tool_name == _STRUCTURED_OUTPUT_TOOL:
-            # FR-1.3: the CLI's own structured-output tool is plumbing, not
-            # a caller tool -- the broker never sees it.
+            # FR-1.3 / 05 §2.3: the CLI's own structured-output tool is the
+            # result tool -- a structural pass-through, never asked.
+            await policy.gate(
+                _caller_tool_action(tool_name, input_dict),
+                broker_name=tool_name,
+                broker_args=input_dict,
+                pass_through=True,
+            )
             return PermissionResultAllow()
         if round_cap is not None and await round_cap.is_over_cap(context.tool_use_id):
             # FR-6.5: the caller's cap, enforced here exactly (not a
@@ -652,24 +767,54 @@ def _make_can_use_tool(
                 message=f"max_tool_rounds ({round_cap.cap}) reached", interrupt=True
             )
         bare_name = _strip_server_prefix(tool_name)
-        input_dict = cast("dict[str, object]", tool_input)
-        decision = await broker.decide(bare_name, input_dict)
-        verdict, reason, terminate = normalize_decision(decision)
-        if verdict == "deny":
+        decision = await policy.gate(
+            _caller_tool_action(bare_name, input_dict),
+            broker_name=bare_name,
+            broker_args=input_dict,
+        )
+        if decision.outcome == "stop":
+            # 05 §2.6: cancel and end the turn with `TurnFailed(reason)`;
+            # `_drive_client` maps the aborted result.
+            reason = decision.reason or f"turn stopped by policy at {bare_name!r}"
+            stop_reason[0] = reason
+            # FR-4.1: reported as a denial, as Codex's shim path does.
             pending_events.append(
                 PermissionRequested(
                     tool_name=bare_name, tool_input=input_dict, verdict="deny", reason=reason
                 )
             )
-            if terminate:
+            return PermissionResultDeny(message=reason, interrupt=True)
+        if decision.outcome == "deny":
+            pending_events.append(
+                PermissionRequested(
+                    tool_name=bare_name,
+                    tool_input=input_dict,
+                    verdict="deny",
+                    reason=decision.reason,
+                )
+            )
+            if decision.terminate:
                 # Native terminate (FR-4.4): `interrupt=True` ends the CLI's
                 # query loop after this denial; `_drive_client` reclassifies
                 # the resulting aborted ResultMessage as broker_terminated.
                 terminate_flag[0] = True
-            return PermissionResultDeny(message=reason or "permission denied", interrupt=terminate)
+            return PermissionResultDeny(
+                message=decision.reason or "permission denied", interrupt=decision.terminate
+            )
         return PermissionResultAllow()
 
     return can_use_tool
+
+
+def _caller_tool_action(name: str, args: dict[str, object]) -> Action:
+    return Action(
+        kind="caller_tool",
+        fields={"name": name, "args": args, "source": caller_tool_source(name)},
+        backend="claude",
+        native_name=name,
+        native_args=args,
+        summary=name,
+    )
 
 
 class ClaudeBackend(Backend):
@@ -694,6 +839,10 @@ class ClaudeBackend(Backend):
         # `take_native_session_id`'s docstring for why it also pops rather
         # than just reads.
         self._native_ids: dict[str, str] = {}
+        # Set by `interrupt()` for the session's turn in flight, so a turn
+        # waiting for open work to settle (05 §3.3) ends at a caller stop
+        # even when the engine sends nothing more. Keyed like `_clients`.
+        self._stop_requests: dict[str, asyncio.Event] = {}
 
     def take_native_session_id(self, session_id: str) -> str | None:
         """Pop and return the native session id `session_id`'s most recent
@@ -731,6 +880,14 @@ class ClaudeBackend(Backend):
             supports_turn_retry=False,
             # FR-4.4: PermissionResultDeny.message is native.
             supports_deny_reason=True,
+            # 05 §3/§7: tool, task and stream signals reach `ctx.work`, so
+            # the inactivity limits apply and there is no default hard cap.
+            supports_work_supervisor=True,
+            # The SDK's auto mode bypasses `can_use_tool` (RUNBOOK, task-8
+            # finding), so `run()` refuses engine_auto; caller tools go
+            # through `can_use_tool` and the gate.
+            supports_engine_auto=False,
+            supports_action_policy=True,
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -765,6 +922,9 @@ class ClaudeBackend(Backend):
         return native_transcript_items(entries, after_native_id)
 
     async def interrupt(self, session_id: str) -> None:
+        stop_request = self._stop_requests.get(session_id)
+        if stop_request is not None:
+            stop_request.set()
         client = self._clients.get(session_id)
         if client is None:
             return
@@ -797,6 +957,7 @@ class ClaudeBackend(Backend):
         ctx: TurnContext,
         pending_events: list[Event],
         terminate_flag: list[bool],
+        stop_reason: list[str | None],
         round_cap: _CallerRoundCap | None = None,
     ) -> ClaudeAgentOptions:
         system_prompt = (
@@ -804,10 +965,23 @@ class ClaudeBackend(Backend):
             if ctx.system_prompt is not None
             else None
         )
+        policy = ctx.policy if ctx.policy is not None else _direct_policy(ctx, pending_events)
+        # `permission_mode` is never set (and `run()` refuses engine_auto):
+        # the SDK's `auto` mode lets a model classifier approve tool calls
+        # without `can_use_tool` (`ClaudeAgentOptions.can_use_tool` docstring: not
+        # invoked for calls "already permitted by ... permission_mode";
+        # `ClaudeSDKClient.set_permission_mode`: "'auto': A model classifier
+        # approves or denies each tool call"), which would bypass the gate
+        # (task-8 finding, RUNBOOK). Built-ins stay off (`tools=[]`).
         return ClaudeAgentOptions(
             tools=[],
             mcp_servers=cast("dict[str, Any]", _build_mcp_servers(ctx.tools)),
-            can_use_tool=_make_can_use_tool(ctx.broker, pending_events, terminate_flag, round_cap),
+            can_use_tool=_make_can_use_tool(
+                policy, pending_events, terminate_flag, stop_reason, round_cap
+            ),
+            # 05 §7: `StreamEvent`s feed model activity only (`report_work`);
+            # `_drive_client` never maps them to events or the mirror.
+            include_partial_messages=True,
             hooks={"PreCompact": [HookMatcher(hooks=[_make_precompact_hook(pending_events)])]},
             system_prompt=cast(Any, system_prompt),
             model=ctx.model_spec.model,
@@ -842,6 +1016,12 @@ class ClaudeBackend(Backend):
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        if ctx.session.options_snapshot.get("permission_mode") == "engine_auto":
+            # Raised before `TurnStarted` (`supports_engine_auto=False`).
+            raise Unsupported(
+                'permission_mode="engine_auto" is not supported on the claude backend: '
+                "the SDK's auto mode approves tool calls without can_use_tool"
+            )
         async for event in self._run_turn(ctx):
             yield event
 
@@ -863,20 +1043,33 @@ class ClaudeBackend(Backend):
                     "rendered mirror transcript injected into a fresh native session"
                 )
             )
+        # 05 §5: after any replay preamble, so only a prompt that itself
+        # leads with `/` is prefixed (the preamble never does).
+        effective_prompt = message_prompt(effective_prompt)
         pending_events: list[Event] = []
         terminate_flag = [False]
+        stop_reason: list[str | None] = [None]
         # FR-6.5: whenever a cap is set, the adapter enforces it exactly
         # (`_CallerRoundCap`); `max_turns` is only a backstop.
         round_cap = (
             _CallerRoundCap(ctx.max_tool_rounds) if ctx.max_tool_rounds is not None else None
         )
         client = ClaudeSDKClient(
-            self._build_options(ctx, pending_events, terminate_flag, round_cap)
+            self._build_options(ctx, pending_events, terminate_flag, stop_reason, round_cap)
         )
         self._clients[session_id] = client
+        stop_request = asyncio.Event()
+        self._stop_requests[session_id] = stop_request
         try:
             async for event in self._drive_client(
-                client, ctx, effective_prompt, pending_events, terminate_flag, round_cap
+                client,
+                ctx,
+                effective_prompt,
+                pending_events,
+                terminate_flag,
+                round_cap,
+                stop_reason=stop_reason,
+                stop_request=stop_request,
             ):
                 yield event
         except Exception as exc:
@@ -890,15 +1083,22 @@ class ClaudeBackend(Backend):
             # the registry, leaving its own future `interrupt()` a no-op.
             if self._clients.get(session_id) is client:
                 self._clients.pop(session_id, None)
+            if self._stop_requests.get(session_id) is stop_request:
+                self._stop_requests.pop(session_id, None)
             try:
-                await client.disconnect()
-            except Exception:
-                # Cleanup-only failure (subprocess already gone, etc.): must
-                # never mask a result already yielded above, so it is
-                # logged, not raised (GUIDELINES §9).
-                _logger.exception(
-                    "ClaudeSDKClient.disconnect() failed", extra={"turn_id": ctx.turn_id}
-                )
+                # 05 §3.4: the CLI's descendants, while they can still be
+                # found; a cancel here still reaches the disconnect below.
+                await asyncio.to_thread(ctx.engine_closing)
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    # Cleanup-only failure (subprocess already gone, etc.):
+                    # must never mask a result already yielded above, so it
+                    # is logged, not raised (GUIDELINES §9).
+                    _logger.exception(
+                        "ClaudeSDKClient.disconnect() failed", extra={"turn_id": ctx.turn_id}
+                    )
 
     async def _drive_client(
         self,
@@ -908,6 +1108,9 @@ class ClaudeBackend(Backend):
         pending_events: list[Event],
         terminate_flag: list[bool],
         round_cap: _CallerRoundCap | None = None,
+        *,
+        stop_reason: list[str | None] | None = None,
+        stop_request: asyncio.Event | None = None,
     ) -> AsyncIterator[Event]:
         # FR-6.6 pre-turn retry: connect/spawn failures are the one class
         # provably free of duplicated tool side effects (nothing ran yet).
@@ -934,6 +1137,10 @@ class ClaudeBackend(Backend):
                     )
                 )
                 await anyio.sleep(delay)
+        # 05 §3.4: the runner records the CLI process for the process report.
+        engine_pid = _engine_pid(client)
+        if engine_pid is not None:
+            await asyncio.to_thread(ctx.engine_started, engine_pid)
         # The CLI's StructuredOutput pair (FR-1.3) is hidden from the stream;
         # its ids carry from the call's message to the result's.
         hidden_ids: set[str] = set()
@@ -952,6 +1159,8 @@ class ClaudeBackend(Backend):
             for event in pending_events:
                 yield event
             pending_events.clear()
+            if ctx.work is not None:
+                report_work(ctx.work, message)
             if isinstance(message, AssistantMessage):
                 if round_cap is not None:
                     round_cap.observe(message)
@@ -974,6 +1183,11 @@ class ClaudeBackend(Backend):
             elif isinstance(message, ResultMessage):
                 self._native_ids[ctx.session.session_id] = message.session_id
                 if is_aborted_result(message):
+                    if stop_reason is not None and stop_reason[0] is not None:
+                        # 05 §2.6: OUR policy stop -- a failed turn naming
+                        # the reason, never a caller interrupt.
+                        yield TurnFailed(turn_id=ctx.turn_id, error=stop_reason[0])
+                        return
                     if terminate_flag[0]:
                         # FR-4.4: this abort was OUR PermissionResultDeny(
                         # interrupt=True) -- the broker ending the turn, not
@@ -1023,6 +1237,8 @@ class ClaudeBackend(Backend):
                     # error, but that cap only exists because the caller
                     # set `ctx.max_tool_rounds` -- it completes honestly
                     # with `end_reason="max_tool_rounds"` instead (FR-6.5).
+                    # Never held for open work: the error reaches the
+                    # caller now, not after a work-silence timeout.
                     yield TurnFailed(turn_id=ctx.turn_id, error=_result_error(message))
                     return
                 result = turn_result_from_result_message(message, ctx.turn_id)
@@ -1052,7 +1268,110 @@ class ClaudeBackend(Backend):
                     # it. No valid result leaves it None -- still a
                     # completion, text kept (module docstring).
                     result.structured_output = cast("dict[str, object]", message.structured_output)
-                yield TurnCompleted(result=result)
+                terminal = TurnCompleted(result=result)
+                # 05 §3.3: the turn ends when the engine is done AND no work
+                # is open; meanwhile the engine is still read.
+                settled = [True]
+                async for event in self._settle(
+                    client, ctx, pending_events, hidden_ids, stop_request, settled
+                ):
+                    yield event
+                if settled[0]:
+                    yield terminal
                 return
         for event in pending_events:
             yield event
+
+    async def _settle(
+        self,
+        client: ClaudeSDKClient,
+        ctx: TurnContext,
+        pending_events: list[Event],
+        hidden_ids: set[str],
+        stop_request: asyncio.Event | None,
+        settled: list[bool],
+    ) -> AsyncIterator[Event]:
+        """Wait, before the terminal event, until no work is open (05 §3.3).
+
+        A no-op unless background or subagent work is open at the engine's
+        result (so for every plain turn), or when `ctx.work` is unset; never
+        run for an error result, which fails at once. Otherwise reads on through
+        `receive_messages()` -- `receive_response()` stops at the result,
+        but a background task's end arrives after it -- reporting work
+        signals and mirroring what arrives, until `ctx.work.settled()`
+        wakes. `settled[0]` is then its answer: False (a limit fired, or
+        the runner cancelled the supervisor) means the caller yields no
+        terminal and the runner's timeout path records the turn. A caller
+        `interrupt()` (`stop_request`) also ends the wait with
+        `settled[0] = False`, so the runner records `interrupted`.
+
+        Plain `asyncio` futures, raced with `asyncio.wait`, keep this
+        generator free of cancel scopes across its yields (the 0.5.0
+        pitfall class the runner's supervisor task also avoids).
+        """
+        work = ctx.work
+        if work is None or not any(
+            item.kind in ("background", "subagent") for item in work.open_items()
+        ):
+            # Only background or subagent work outlives the engine's result;
+            # a tool item it left open (no tool result) must not hold a
+            # finished turn for the work-silence limit.
+            return
+        messages = client.receive_messages()
+        waits: dict[str, asyncio.Future[Any]] = {
+            "settled": asyncio.ensure_future(work.settled()),
+            "message": asyncio.ensure_future(anext(messages)),
+        }
+        if stop_request is not None:
+            waits["stop"] = asyncio.ensure_future(stop_request.wait())
+        try:
+            while True:
+                await asyncio.wait(waits.values(), return_when=asyncio.FIRST_COMPLETED)
+                # A message that finished in the same step as `settled()` or
+                # a stop is still reported and mirrored first.
+                read_next = False
+                message_wait = waits.get("message")
+                if message_wait is not None and message_wait.done():
+                    del waits["message"]
+                    try:
+                        message = message_wait.result()
+                    except StopAsyncIteration:
+                        # The engine's stream ended; only the supervisor (or
+                        # a stop) can end the wait now.
+                        message = None
+                    if message is not None:
+                        read_next = True
+                        for event in pending_events:
+                            yield event
+                        pending_events.clear()
+                        report_work(work, message)
+                        for event in _settle_phase_events(message, hidden_ids):
+                            yield event
+                if "stop" in waits and waits["stop"].done():
+                    settled[0] = False
+                    return
+                if waits["settled"].done():
+                    settled[0] = cast(bool, waits["settled"].result())
+                    return
+                if read_next:
+                    waits["message"] = asyncio.ensure_future(anext(messages))
+        finally:
+            # Cancelled, not awaited (as in `WorkSupervisor._wait`): awaiting
+            # them and suppressing their CancelledError would also swallow a
+            # cancellation of this task.
+            for wait in waits.values():
+                wait.cancel()
+
+
+def _settle_phase_events(message: object, hidden_ids: set[str]) -> list[Event]:
+    """The mirror items of a message read after the engine's result while
+    open work settles (`ClaudeBackend._settle`): the same items the main
+    stream yields, StructuredOutput still hidden. A later `ResultMessage`
+    (an injected turn's) adds no terminal -- the turn has one already."""
+    if isinstance(message, AssistantMessage):
+        items = assistant_message_items(message)
+    elif isinstance(message, UserMessage):
+        items = user_message_items(message)
+    else:
+        return []
+    return [ItemCompleted(message=item) for item in _without_structured_output(items, hidden_ids)]

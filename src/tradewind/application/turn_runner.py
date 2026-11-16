@@ -32,9 +32,17 @@ from typing import ClassVar, Protocol, cast
 import anyio
 
 from tradewind.application.config import TradewindConfig
+from tradewind.application.policy_gate import PolicyGate
 from tradewind.application.ports import Backend, SessionStorePort, TurnContext
+from tradewind.application.process_report import (
+    EngineWatch,
+    ProcInfo,
+    log_report,
+    report_event,
+)
 from tradewind.application.resume import ResumePlanner
-from tradewind.application.tool_host import ToolHost
+from tradewind.application.supervisor import WorkSupervisor
+from tradewind.application.tool_host import RESULT_TOOL_NAME, SHIM_MODULE, ToolHost
 from tradewind.domain.errors import (
     ConfigError,
     SessionNotFound,
@@ -54,7 +62,10 @@ from tradewind.domain.models import (
     TurnResult,
     TurnStatus,
     Verdict,
+    timeout_notice,
 )
+from tradewind.domain.policy import Rule, TurnVars, floor_tradewind
+from tradewind.domain.supervision import Limits
 
 _logger = logging.getLogger(__name__)
 
@@ -261,19 +272,142 @@ def _fold_child_history(
     return merged
 
 
-def _effective_request_timeout(overrides: dict[str, object], default: float) -> float:
+def _effective_request_timeout(overrides: dict[str, object], default: float | None) -> float | None:
     """Validate the per-call `request_timeout_s` override (FR-6.6);
-    falls back to `TurnDefaults.request_timeout_s`.
+    falls back to `TurnDefaults.request_timeout_s`. `None` means the
+    backend default (`_effective_limits`).
 
     Failure modes:
         ConfigError: the value is not a positive number (bool excluded).
     """
-    value = overrides.get("request_timeout_s")
+    return _effective_seconds(overrides, "request_timeout_s", default)
+
+
+def _effective_seconds(
+    overrides: dict[str, object], key: str, default: float | None
+) -> float | None:
+    """Validate one per-call limit override in seconds; absent (or None)
+    falls back to `default`.
+
+    Failure modes:
+        ConfigError: the value is not a positive number (bool excluded).
+    """
+    value = overrides.get(key)
     if value is None:
         return default
     if type(value) not in (int, float) or cast(float, value) <= 0:
-        raise ConfigError(f"request_timeout_s must be a positive number, got {value!r}")
+        raise ConfigError(f"{key} must be a positive number, got {value!r}")
     return float(cast(float, value))
+
+
+# The hard cap of a backend that cannot report work (05 §3.2): today's
+# FR-6.6 wall-clock deadline, kept unchanged for it.
+_UNSUPERVISED_HARD_CAP_S = 600.0
+
+# How long the turn waits for the interrupt a fired limit sent (05 §3.4:
+# the 15 s grace for an engine interrupt). A limit often fires because the
+# engine hangs, and its interrupt() can hang too; past the grace the turn
+# ends anyway. The same grace decides whether an interrupt of a turn with
+# an engine process was answered (`EngineWatch.interrupting`).
+# Module-level so tests can shorten it.
+_INTERRUPT_GRACE_S = 15.0
+
+# How long the process report waits, at a turn end that kills nothing, for
+# the engine's descendants to exit after the engine closed (an MCP server
+# ends shortly after its engine); only paid while one is still alive. The
+# terminal is held for this wait and for the adapter's engine close, which
+# is bounded by the SDK (Claude's disconnect escalates to kill; Codex
+# terminates, waits 2 s, then kills).
+# Module-level so tests can shorten it.
+_REPORT_SETTLE_S = 1.0
+
+
+def _is_shim(proc: ProcInfo) -> bool:
+    """The Tradewind stdio shim, which the process report excludes."""
+    return f"-m {SHIM_MODULE}" in proc.command
+
+
+async def _engine_report(
+    watch: EngineWatch,
+    ctx: TurnContext,
+    *,
+    backend: str,
+    timed_out: bool,
+    interrupted: bool,
+) -> ItemCompleted | None:
+    """End the engine watch and build the process report (05 §3.4).
+
+    A fired limit, or an interrupt not answered within the grace, kills the
+    recorded tree first. The report (one WARNING log entry, and the event
+    returned here) is made on a fired limit, on an interrupt, or when a
+    recorded process is still alive; otherwise None. A failure to list or
+    end processes is logged and gives no report: it never fails the turn.
+    """
+    try:
+        alive = await watch.finish(kill=timed_out, settle_s=_REPORT_SETTLE_S)
+    except Exception:
+        _logger.exception("process report failed", extra={"turn_id": ctx.turn_id})
+        return None
+    if not (alive or timed_out or interrupted):
+        return None
+    work, policy = ctx.work, ctx.policy
+    timeout_reason = cast("dict[str, float | str] | None", ctx.timeout_reason)
+    open_items = [*work.open_items(), *work.closed_after_done()] if work else []
+    last_action = policy.last_action if policy else None
+    log_report(
+        turn_id=ctx.turn_id,
+        session_id=ctx.session.session_id,
+        backend=backend,
+        timeout_reason=timeout_reason,
+        open_items=open_items,
+        alive=alive,
+        last_action=last_action,
+    )
+    return report_event(
+        turn_id=ctx.turn_id,
+        session_id=ctx.session.session_id,
+        backend=backend,
+        timeout_reason=timeout_reason,
+        open_items=open_items,
+        alive=alive,
+        last_action=last_action,
+    )
+
+
+async def _await_interrupt(interrupt_task: asyncio.Future[None], session_id: str) -> None:
+    """Wait up to `_INTERRUPT_GRACE_S` for a fired limit's interrupt.
+
+    Failure modes:
+        Whatever `interrupt()` raised, re-raised here. Past the grace the
+        task is cancelled, a WARNING is logged and this returns normally.
+    """
+    done, _ = await asyncio.wait({interrupt_task}, timeout=_INTERRUPT_GRACE_S)
+    if not done:
+        _logger.warning(
+            "interrupt after a fired limit did not finish within the grace; turn ends anyway",
+            extra={"session_id": session_id, "grace_s": _INTERRUPT_GRACE_S},
+        )
+        interrupt_task.cancel()
+        return
+    interrupt_task.result()
+
+
+def _effective_limits(
+    model_silence_s: float,
+    work_silence_s: float,
+    request_timeout_s: float | None,
+    *,
+    supports_work_supervisor: bool,
+) -> Limits:
+    """The turn's supervisor limits: `request_timeout_s=None` is the
+    backend default hard cap -- none with the work supervisor, 600 s
+    without it."""
+    hard_cap_s = request_timeout_s
+    if hard_cap_s is None and not supports_work_supervisor:
+        hard_cap_s = _UNSUPERVISED_HARD_CAP_S
+    return Limits(
+        model_silence_s=model_silence_s, work_silence_s=work_silence_s, hard_cap_s=hard_cap_s
+    )
 
 
 def _effective_output_schema(
@@ -374,6 +508,38 @@ def _emulate_system_prompt(
     return _fold_system_prompt(system_prompt, prompt)
 
 
+def _stored_governance(snapshot: dict[str, object]) -> tuple[str | None, list[Rule]]:
+    """The session's `permission_mode` and caller `policy_rules`, read from
+    its stored options snapshot (`SessionOptions.snapshot()`)."""
+    mode = cast("str | None", snapshot.get("permission_mode"))
+    rules = cast("list[dict[str, object]]", snapshot.get("policy_rules") or [])
+    return mode, [Rule.from_dict(rule) for rule in rules]
+
+
+def _check_governance_support(
+    backend: Backend, permission_mode: str | None, policy_rules: list[Rule]
+) -> None:
+    """Refuse, before `prepare_turn` and `TurnStarted`, a policy setting the
+    backend's flags deny (05 §2.5, §2.7). Adapters keep their own checks as
+    defence in depth.
+
+    Failure modes:
+        Unsupported: `permission_mode="engine_auto"` without
+            `supports_engine_auto`; or `permission_mode` or `policy_rules`
+            set without `supports_action_policy`.
+    """
+    caps = backend.capabilities()
+    if not caps.supports_action_policy and (permission_mode is not None or policy_rules):
+        raise Unsupported(
+            f"policy_rules and permission_mode are not supported on backend {backend.name!r}: "
+            "it cannot put tool calls through the policy gate"
+        )
+    if permission_mode == "engine_auto" and not caps.supports_engine_auto:
+        raise Unsupported(
+            f'permission_mode="engine_auto" is not supported on backend {backend.name!r}'
+        )
+
+
 class TurnRunner:
     """Orchestrates one turn per `execute()` call (see module docstring)."""
 
@@ -398,6 +564,9 @@ class TurnRunner:
         # `compact()` and a turn from interleaving mirror writes. Same
         # single-process assumption as the store's own seq serialization.
         self._busy: set[str] = set()
+        # session_id -> its in-flight turn's engine watch (05 §3.4), so
+        # `request_stop` records the engine's tree before it interrupts.
+        self._watches: dict[str, EngineWatch] = {}
 
     async def request_stop(self, session_id: str, backend: Backend) -> None:
         """`Session.stop()`'s implementation: record that this session's
@@ -405,6 +574,10 @@ class TurnRunner:
         the backend to cancel it. A no-op at the backend level when no turn
         is in flight (`Backend.interrupt` contract)."""
         self._interrupt_requested.add(session_id)
+        watch = self._watches.get(session_id)
+        if watch is not None:
+            # 05 §3.4: the tree before the interrupt, and the grace after it.
+            await watch.interrupting(_INTERRUPT_GRACE_S)
         await backend.interrupt(session_id)
 
     def _tap(self, event: Event, turn_id: str) -> None:
@@ -457,6 +630,18 @@ class TurnRunner:
         request_timeout_s = _effective_request_timeout(
             overrides, self._config.defaults.request_timeout_s
         )
+        model_silence_s = cast(
+            float,
+            _effective_seconds(
+                overrides, "model_silence_timeout_s", self._config.defaults.model_silence_timeout_s
+            ),
+        )
+        work_silence_s = cast(
+            float,
+            _effective_seconds(
+                overrides, "work_silence_timeout_s", self._config.defaults.work_silence_timeout_s
+            ),
+        )
 
         turn_id = str(uuid.uuid4())
         self._interrupt_requested.discard(session_id)
@@ -470,7 +655,36 @@ class TurnRunner:
         terminal_status: TurnStatus | None = None
         final_text: str | None = None
         structured_output: dict[str, object] | None = None
-        watchdog_task: asyncio.Task[None] | None = None
+        supervisor_task: asyncio.Task[None] | None = None
+        # The interrupt a fired limit sent: kept so the turn awaits it (and
+        # its error surfaces here) even when the supervisor was cancelled
+        # while the interrupt was still running.
+        interrupt_task: asyncio.Future[None] | None = None
+        # One gate per turn; events it emits (and the supervisor's timeout
+        # notice) are buffered here and drained into the store and stream
+        # by the event loop below.
+        gate_events: list[Event] = []
+        # 05 §3.4: the engine process of a backend that reports one
+        # (`ctx.engine_started`); untracked otherwise, and then nothing
+        # below changes the turn's events.
+        watch = EngineWatch(exclude=_is_shim)
+        report_ctx: TurnContext | None = None
+        # A terminal held back until the engine is closed and its process
+        # report is out (the report precedes the terminal).
+        held_terminal: Event | None = None
+
+        async def drain_gate_events() -> list[Event]:
+            """Persist and tap the buffered gate and timeout notices; the
+            caller yields them."""
+            drained, gate_events[:] = list(gate_events), []
+            for gate_event in drained:
+                if isinstance(gate_event, ItemCompleted):
+                    await anyio.to_thread.run_sync(
+                        self._store.append_message, session_id, turn_id, gate_event.message
+                    )
+                self._tap(gate_event, turn_id)
+            return drained
+
         timed_out = [False]
         usage: dict[str, object] | None = None
         cost_usd: float | None = None
@@ -483,6 +697,13 @@ class TurnRunner:
         # the next `sweep_stale_turns` (session open).
         try:
             backend = self._resolve_backend(session_row.profile, profile)
+            # 05 §2: the stored snapshot is the source of truth for the
+            # session's policy, mode and the gate's workspace (`cwd`) (a
+            # bare `resume()` passes empty live options;
+            # `resume(options=...)` rewrites the snapshot), as it is for
+            # the adapters that read it.
+            permission_mode, policy_rules = _stored_governance(snapshot)
+            _check_governance_support(backend, permission_mode, policy_rules)
             # FR-6.1 resume routing (Phase 4, closes P-7): probe only where
             # it is real and cheap (claude's local-jsonl existence check;
             # other backends return truthy-id probes), then let the planner
@@ -569,13 +790,45 @@ class TurnRunner:
             # for them too would consult it twice per tool call -- harmless
             # for a stateless allow/deny broker, but wrong for "ask"
             # semantics (blocks on a human; must not be asked twice).
-            tool_host_broker = broker if backend.name == "codex" else None
+            output_schema = _effective_output_schema(snapshot, overrides)
+            # 05 §6: engines with no output-schema support get the result
+            # tool instead; `$turn.result_tool` names it on such a turn.
+            uses_result_tool = backend.uses_result_tool and output_schema is not None
+            gate = PolicyGate(
+                broker=broker,
+                floor=[*floor_tradewind(), *backend.floor_rules()],
+                caller=policy_rules,
+                defaults=backend.default_rules(),
+                turn=TurnVars(
+                    mode="engine_auto" if permission_mode == "engine_auto" else "broker",
+                    engine_mode=None,
+                    shim_server=None,
+                    workspace=cast("str | None", snapshot.get("cwd")),
+                    result_tool=RESULT_TOOL_NAME if uses_result_tool else None,
+                ),
+                has_broker=not getattr(broker, "is_default_allow_all", False),
+                emit=gate_events.append,
+                backend=backend.name,
+            )
+            supervisor = WorkSupervisor(
+                _effective_limits(
+                    model_silence_s,
+                    work_silence_s,
+                    request_timeout_s,
+                    supports_work_supervisor=backend.capabilities().supports_work_supervisor,
+                ),
+                reports_work=backend.capabilities().supports_work_supervisor,
+            )
+            # Broker questions pause every limit (05 §3.2).
+            gate.on_approval_change = supervisor.approvals_changed
+            tool_host_broker = gate.as_broker() if backend.name == "codex" else None
             async with ToolHost(
                 options.tools,
                 options.mcp_servers,
                 self._resolve_ref,
                 socket_dir=self._config.tool_host.socket_dir,
                 broker=tool_host_broker,
+                result_schema=output_schema if uses_result_tool else None,
             ) as tool_host:
                 # The prompt is this turn's own input, not something a
                 # backend "completes" as an `ItemCompleted` event, so
@@ -654,9 +907,10 @@ class TurnRunner:
                     prompt=backend_prompt,
                     model_spec=model_spec,
                     system_prompt=effective_system_prompt,
-                    output_schema=_effective_output_schema(snapshot, overrides),
+                    output_schema=output_schema,
                     tools=tool_host,
                     broker=broker,
+                    on_preflight=options.on_preflight,
                     load_history=load_history,
                     load_replay_history=load_replay_history,
                     force_replay=forced_replay,
@@ -665,63 +919,149 @@ class TurnRunner:
                     last_turn_usage=last_turn_usage,
                     last_turn_id=last_turn_id,
                     max_tool_rounds=max_tool_rounds,
+                    policy=gate,
+                    work=supervisor,
+                    engine_started=watch.started,
+                    engine_closing=watch.snapshot,
                 )
+                self._watches[session_id] = watch
+                report_ctx = ctx
 
-                # FR-6.6 wall-clock deadline: a watchdog TASK (deliberately
-                # not a cancel scope across this generator's yields -- the
-                # 0.5.0 pitfall class) interrupts the backend at the
-                # deadline; the stream then ends without a terminal event
-                # and the synthesized terminal below reads `timed_out`.
-                async def _watchdog() -> None:
-                    await asyncio.sleep(request_timeout_s)
-                    timed_out[0] = True
-                    await backend.interrupt(session_id)
-
-                watchdog_task = asyncio.get_running_loop().create_task(_watchdog())
-
-                # `aclosing` (not a bare `async for`) so that if THIS
-                # generator (`execute()`) is itself abandoned/aclosed mid-turn
-                # (a consumer `break`s out of `session.stream()` without
-                # calling `stop()`), the backend's own generator is closed
-                # deterministically right here -- rather than left to
-                # whenever the garbage collector happens to finalize it -- so
-                # a backend blocked on e.g. a network call unwinds its
-                # `finally`s (cancel scopes, connections) immediately.
-                # `Backend.run()`'s port signature is the broader
-                # `AsyncIterator[Event]` (ports.py, task-8 brief, not
-                # touched here), but every concrete implementation is an
-                # `async def ... yield ...` generator (an `AsyncGenerator`,
-                # which is what `aclosing` needs -- an `aclose()` method);
-                # the cast reflects that real contract without widening the
-                # port's own.
-                backend_run = cast("AsyncGenerator[Event]", backend.run(ctx))
-                async with aclosing(backend_run) as backend_events:
-                    async for event in backend_events:
-                        if isinstance(event, ItemCompleted):
-                            await anyio.to_thread.run_sync(
-                                self._store.append_message, session_id, turn_id, event.message
+                # 05 §4: `prepare_turn` runs before the supervisor starts
+                # (its time is not counted by any limit) and before `run()`.
+                # A stop requested before or during it ends the turn without
+                # `run()`: the synthesized terminal below records it as
+                # interrupted, with no `TurnStarted`. A `ConfigError` from it
+                # (a preflight `Stop`) fails the turn and propagates.
+                stopped_before_run = session_id in self._interrupt_requested
+                if not stopped_before_run:
+                    await backend.prepare_turn(ctx)
+                    stopped_before_run = session_id in self._interrupt_requested
+                if not stopped_before_run:
+                    # FR-6.6 work supervisor (05 §3): a TASK (deliberately not
+                    # a cancel scope across this generator's yields -- the
+                    # 0.5.0 pitfall class) that, when a limit fires, records
+                    # why, queues one timeout notice (drained before the next
+                    # event, so before any terminal) and interrupts the
+                    # backend; if the stream then ends without a terminal
+                    # event, the synthesized terminal below reads `timed_out`.
+                    async def on_fire(limit: str, value: float, elapsed: float) -> None:
+                        ctx.timeout_reason = {"limit": limit, "value": value, "elapsed": elapsed}
+                        timed_out[0] = True
+                        gate_events.append(
+                            ItemCompleted(
+                                message=timeout_notice(limit=limit, value=value, elapsed=elapsed)
                             )
-                        if isinstance(event, TurnCompleted):
-                            terminal_status = event.result.status
-                            final_text = event.result.final_text
-                            structured_output = event.result.structured_output
-                            usage = cast("dict[str, object]", event.result.usage)
-                            cost_usd = event.result.cost_usd
-                        elif isinstance(event, TurnFailed):
-                            terminal_status = "failed"
-                            error = event.error
-                        self._tap(event, turn_id)
-                        yield event
+                        )
+                        # 05 §3.4: the engine's tree before the interrupt.
+                        await watch.interrupting(_INTERRUPT_GRACE_S)
+                        # Shielded: the backend may answer with its terminal
+                        # while this call is in flight, and the runner then
+                        # cancels this task; the interrupt itself must finish,
+                        # so `stop_supervisor` awaits it.
+                        nonlocal interrupt_task
+                        interrupt_task = asyncio.ensure_future(backend.interrupt(session_id))
+                        await asyncio.shield(interrupt_task)
 
-                watchdog_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await watchdog_task
+                    supervisor_task = asyncio.get_running_loop().create_task(
+                        supervisor.run(on_fire)
+                    )
+
+                    async def stop_supervisor() -> None:
+                        """Cancel the supervisor, then wait for an interrupt it
+                        sent; that interrupt's error is raised here."""
+                        supervisor_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await supervisor_task
+                        if interrupt_task is not None:
+                            await _await_interrupt(interrupt_task, session_id)
+
+                    # `aclosing` (not a bare `async for`) so that if THIS
+                    # generator (`execute()`) is itself abandoned/aclosed mid-turn
+                    # (a consumer `break`s out of `session.stream()` without
+                    # calling `stop()`), the backend's own generator is closed
+                    # deterministically right here -- rather than left to
+                    # whenever the garbage collector happens to finalize it -- so
+                    # a backend blocked on e.g. a network call unwinds its
+                    # `finally`s (cancel scopes, connections) immediately.
+                    # `Backend.run()`'s port signature is the broader
+                    # `AsyncIterator[Event]` (ports.py, task-8 brief, not
+                    # touched here), but every concrete implementation is an
+                    # `async def ... yield ...` generator (an `AsyncGenerator`,
+                    # which is what `aclosing` needs -- an `aclose()` method);
+                    # the cast reflects that real contract without widening the
+                    # port's own.
+                    backend_run = cast("AsyncGenerator[Event]", backend.run(ctx))
+                    async with aclosing(backend_run) as backend_events:
+                        async for event in backend_events:
+                            # Gate notices raised since the last event come first.
+                            for gate_event in await drain_gate_events():
+                                yield gate_event
+                            if isinstance(event, ItemCompleted):
+                                await anyio.to_thread.run_sync(
+                                    self._store.append_message, session_id, turn_id, event.message
+                                )
+                            if isinstance(event, TurnCompleted):
+                                terminal_status = event.result.status
+                                final_text = event.result.final_text
+                                structured_output = event.result.structured_output
+                                usage = cast("dict[str, object]", event.result.usage)
+                                cost_usd = event.result.cost_usd
+                            elif isinstance(event, TurnFailed):
+                                terminal_status = "failed"
+                                error = event.error
+                            if isinstance(event, TurnCompleted | TurnFailed):
+                                # The turn is over: no limit may fire while the
+                                # terminal is consumed or the backend cleans up.
+                                # A notice from a limit that fired just before
+                                # still precedes the terminal.
+                                await stop_supervisor()
+                                for gate_event in await drain_gate_events():
+                                    yield gate_event
+                                if watch.tracked:
+                                    # 05 §3.4: the adapter closes its engine
+                                    # after its terminal; the report, which
+                                    # comes first, is made once it has. The
+                                    # hold relies on the SDK close being
+                                    # bounded (Claude's disconnect escalates
+                                    # to kill; Codex terminates, waits 2 s,
+                                    # then kills).
+                                    held_terminal = event
+                                    continue
+                            self._tap(event, turn_id)
+                            yield event
+
+                    await stop_supervisor()
+                    # A stop from here on finds no watch (05 §3.4: what the
+                    # report names as alive is never killed afterwards).
+                    if self._watches.get(session_id) is watch:
+                        self._watches.pop(session_id, None)
+                    if watch.tracked:
+                        report = await _engine_report(
+                            watch,
+                            ctx,
+                            backend=backend.name,
+                            timed_out=timed_out[0],
+                            interrupted=session_id in self._interrupt_requested,
+                        )
+                        if report is not None:
+                            gate_events.append(report)
+                        for gate_event in await drain_gate_events():
+                            yield gate_event
+                    if held_terminal is not None:
+                        self._tap(held_terminal, turn_id)
+                        yield held_terminal
 
                 if terminal_status is None:
+                    # A notice raised after the last backend event must
+                    # precede the synthesized terminal, which stays last.
+                    for gate_event in await drain_gate_events():
+                        yield gate_event
                     # The backend's iterator ended with neither TurnCompleted
                     # nor TurnFailed -- per `Backend.run`'s contract, this
                     # happens on a mid-turn interrupt: the caller's stop(),
-                    # or the FR-6.6 deadline watchdog.
+                    # or a fired FR-6.6 supervisor limit -- or `run()` was
+                    # never called (a stop around `prepare_turn`, 05 §4).
                     interrupted = timed_out[0] or session_id in self._interrupt_requested
                     terminal_status = "interrupted" if interrupted else "failed"
                     error = None if interrupted else "turn ended without emitting a terminal event"
@@ -812,10 +1152,51 @@ class TurnRunner:
                 error = f"turn runner: unhandled exception: {exc}"
             raise
         finally:
-            if watchdog_task is not None and not watchdog_task.done():
-                watchdog_task.cancel()
+            if supervisor_task is not None and not supervisor_task.done():
+                supervisor_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError), anyio.CancelScope(shield=True):
-                    await watchdog_task
+                    await supervisor_task
+            if interrupt_task is not None and not interrupt_task.done():
+                # An abnormal end (a raising backend, an abandoned stream, a
+                # caller cancel) while a limit's interrupt still runs: let
+                # it finish, within the grace, before the turn is
+                # finalized. Its error is logged, not raised, so it does
+                # not replace the error already in flight.
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await _await_interrupt(interrupt_task, session_id)
+                    except Exception:
+                        _logger.exception(
+                            "interrupt after a fired limit raised", extra={"turn_id": turn_id}
+                        )
+            if self._watches.get(session_id) is watch:
+                self._watches.pop(session_id, None)
+            if report_ctx is not None and watch.tracked and not watch.finished:
+                # An abnormal end (a raising backend, an abandoned stream):
+                # the engine is still ended per 05 §3.4 and its report
+                # stored, though no event can be yielded any more.
+                with anyio.CancelScope(shield=True):
+                    report = await _engine_report(
+                        watch,
+                        report_ctx,
+                        backend=backend.name,
+                        timed_out=timed_out[0],
+                        interrupted=session_id in self._interrupt_requested,
+                    )
+                if report is not None:
+                    gate_events.append(report)
+            if gate_events:
+                # Notices raised before an abnormal end (a raising backend,
+                # an abandoned stream) still reach the store. A failure here
+                # is logged, not raised: it must not replace the error
+                # already in flight nor skip the finalize write below.
+                with anyio.CancelScope(shield=True):
+                    try:
+                        await drain_gate_events()
+                    except Exception:
+                        _logger.exception(
+                            "storing gate notices at turn end failed", extra={"turn_id": turn_id}
+                        )
             if terminal_status is None:
                 # Reached only when the caller abandoned the stream before
                 # a terminal event was produced (GeneratorExit from an

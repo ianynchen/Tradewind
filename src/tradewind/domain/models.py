@@ -11,7 +11,9 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, SecretStr
+from pydantic import BaseModel, ConfigDict, SecretStr, field_validator
+
+from tradewind.domain.policy import Mode, Rule
 
 BackendName = Literal["claude", "codex", "cursor", "langchain"]
 TierName = str
@@ -95,6 +97,20 @@ class Capabilities(BaseModel):
     # recorded in `PermissionRequested.reason` and the mirror everywhere a
     # broker is consulted.
     supports_deny_reason: bool
+    # Whether the adapter reports work and model activity through
+    # `ctx.work` (05-turn-governance §3). False (the default, and Cursor)
+    # means no silence limits apply and the hard cap defaults to 600 s.
+    supports_work_supervisor: bool = False
+    # Whether `permission_mode="engine_auto"` (05 §2.5) is honest here: the
+    # engine has its own auto review and approval requests that still reach
+    # the client go through the policy gate. False raises `Unsupported`
+    # (LangChain has no engine; Claude's SDK auto mode bypasses
+    # `can_use_tool` -- RUNBOOK; Cursor cannot intercept).
+    supports_engine_auto: bool = False
+    # Whether the adapter puts the engine's actions through `ctx.policy`
+    # (05 §2). False (Cursor, 05 §2.7) raises `Unsupported` when
+    # `policy_rules` or `permission_mode` is set.
+    supports_action_policy: bool = False
 
 
 class ModelCostTier(BaseModel):
@@ -250,6 +266,11 @@ class PermissionBroker(Protocol):
         ...
 
 
+# The caller's answer to a preflight question (05-turn-governance §4):
+# `(question, details, choices) -> one of choices`.
+OnPreflight = Callable[[str, dict[str, object], list[str]], Awaitable[str]]
+
+
 _REDACTED_SECRET = "ref:missing"
 
 
@@ -274,9 +295,13 @@ def _redact_secret_map(values: dict[str, str]) -> tuple[dict[str, str], bool]:
 
 
 class SessionOptions(BaseModel):
-    """Declarative parts snapshot into `options_json` (I-2); `tools` and
-    `permission_broker` carry live objects re-supplied by the embedder at
-    resume and are never part of the snapshot."""
+    """Declarative parts snapshot into `options_json` (I-2); `tools`,
+    `permission_broker` and `on_preflight` carry live objects re-supplied
+    by the embedder at resume and are never part of the snapshot.
+
+    `on_preflight(question, details, choices)` answers a preflight `Ask`
+    (05-turn-governance §4) with one of `choices`; None, an error, or an
+    answer not in `choices` means the check's safe default."""
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
@@ -287,12 +312,24 @@ class SessionOptions(BaseModel):
     tier: TierName | None = None
     output_schema: dict[str, Any] | None = None
     permission_broker: PermissionBroker | None = None
+    on_preflight: OnPreflight | None = None
     cwd: Path | None = None
+    permission_mode: Mode | None = None
+    policy_rules: list[Rule] = []
+
+    @field_validator("policy_rules", mode="before")
+    @classmethod
+    def _rules_from_dicts(cls, value: object) -> object:
+        """A rule given as a dict goes through `Rule.from_dict`, so a bad
+        rule raises `ConfigError` here as it does for a `Rule`."""
+        if isinstance(value, list):
+            return [Rule.from_dict(r) if isinstance(r, dict) else r for r in value]
+        return value
 
     def snapshot(self) -> dict[str, Any]:
         """Declarative parts only (I-2): tool names+schemas, redacted MCP
         defs, system_prompt, tier, cwd. Excludes live objects (tool
-        handlers, permission_broker) entirely."""
+        handlers, permission_broker, on_preflight) entirely."""
         has_unrefed_secrets = False
         mcp_servers_snapshot: list[dict[str, Any]] = []
         for server in self.mcp_servers:
@@ -324,6 +361,8 @@ class SessionOptions(BaseModel):
             "tier": self.tier,
             "output_schema": self.output_schema,
             "cwd": str(self.cwd) if self.cwd is not None else None,
+            "permission_mode": self.permission_mode,
+            "policy_rules": [rule.to_dict() for rule in self.policy_rules],
             "has_unrefed_secrets": has_unrefed_secrets,
         }
 
@@ -438,6 +477,64 @@ def retry_notice(
             "max_attempts": max_attempts,
             "delay_s": delay_s,
             "error": error,
+        },
+    )
+
+
+def policy_record_notice(
+    *, action_kind: str, summary: str, outcome: str, rule_ids: list[str]
+) -> NormalizedMessage:
+    """The mirrored `kind="event"` visibility item for a policy decision a
+    rule asked to record (turn governance, same form as `retry_notice`)."""
+    return NormalizedMessage(
+        role="assistant",
+        kind="event",
+        content={
+            "type": "policy_recorded",
+            "action_kind": action_kind,
+            "summary": summary,
+            "outcome": outcome,
+            "rule_ids": rule_ids,
+        },
+    )
+
+
+def timeout_notice(*, limit: str, value: float, elapsed: float) -> NormalizedMessage:
+    """The mirrored `kind="event"` visibility item for a work-supervisor
+    limit that ended the turn (FR-6.6, 05-turn-governance §3.2): which
+    limit, its setting and the active seconds elapsed, all in seconds."""
+    return NormalizedMessage(
+        role="assistant",
+        kind="event",
+        content={"type": "turn_timeout", "limit": limit, "value": value, "elapsed": elapsed},
+    )
+
+
+def process_report_notice(
+    *,
+    turn_id: str,
+    session_id: str,
+    backend: str,
+    limit: dict[str, float | str] | None,
+    open_items: list[dict[str, str]],
+    processes: list[dict[str, str | int]],
+    last_action: str | None,
+) -> NormalizedMessage:
+    """The mirrored `kind="event"` visibility item for the process report
+    (05-turn-governance §3.4): the fired limit (if any), the open work
+    items, the engine processes still alive and the last action."""
+    return NormalizedMessage(
+        role="assistant",
+        kind="event",
+        content={
+            "type": "process_report",
+            "turn_id": turn_id,
+            "session_id": session_id,
+            "backend": backend,
+            "limit": limit,
+            "open_items": open_items,
+            "processes": processes,
+            "last_action": last_action,
         },
     )
 

@@ -338,6 +338,10 @@ def test_capabilities_match_spec_table() -> None:
     assert caps.supports_native_resume is False
     assert caps.supports_fork is False
     assert caps.supports_transcript_read is False
+    # 05 §2.5: no engine of its own to auto-approve; its loop is the gate.
+    assert caps.supports_engine_auto is False
+    assert caps.supports_work_supervisor is True
+    assert caps.supports_action_policy is True
 
 
 async def test_probe_native_always_false() -> None:
@@ -1386,3 +1390,304 @@ async def test_forced_call_may_use_the_slot_after_a_full_tool_loop() -> None:
     assert result.end_reason == "end_turn"
     assert result.final_text == "finally"
     assert result.structured_output == {"answer": 3}
+
+
+# --- turn governance (05 §1.1, §2, §3, §7) ---
+
+
+def _gov_policy(
+    broker: object, *, caller: list[Any] | None = None, emitted: list[object] | None = None
+) -> Any:
+    from tradewind.application.policy_gate import PolicyGate
+    from tradewind.domain.policy import TurnVars, floor_tradewind
+
+    return PolicyGate(
+        broker=cast(Any, broker),
+        backend="langchain",
+        floor=floor_tradewind(),
+        caller=caller or [],
+        defaults=[],
+        turn=TurnVars(
+            mode="broker", engine_mode=None, shim_server=None, workspace=None, result_tool=None
+        ),
+        has_broker=True,
+        emit=(emitted if emitted is not None else []).append,
+    )
+
+
+def _gov_rule(name: str, outcome: str, reason: str = "") -> Any:
+    from tradewind.domain.policy import Matcher, Rule
+
+    return Rule(
+        id=f"caller.{name}.{outcome}",
+        kind="caller_tool",
+        where={"name": Matcher("equals", name)},
+        outcome=cast(Any, outcome),
+        reason=reason,
+    )
+
+
+class _WorkLog:
+    """A `WorkSupervisor` stand-in recording every signal in order."""
+
+    def __init__(self) -> None:
+        self.signals: list[tuple[str, ...]] = []
+
+    def started(self, id: str, kind: str, label: str, _has_end_signal: bool = True) -> None:  # noqa: A002
+        self.signals.append(("started", id, kind, label))
+
+    def active(self, id: str) -> None:  # noqa: A002
+        self.signals.append(("active", id))
+
+    def ended(self, id: str) -> None:  # noqa: A002
+        self.signals.append(("ended", id))
+
+    def model_active(self) -> None:
+        self.signals.append(("model_active",))
+
+    def engine_done(self) -> None:
+        self.signals.append(("engine_done",))
+
+
+def _call_msg(name: str, call_id: str = "c1") -> AIMessage:
+    return AIMessage(
+        content="",
+        tool_calls=[{"name": name, "args": {"a": 1}, "id": call_id, "type": "tool_call"}],
+    )
+
+
+def _echo_host(name: str = "echo") -> ToolHost:
+    async def handler(**_kwargs: object) -> str:
+        return "ok"
+
+    return ToolHost(
+        [Tool(name=name, description="d", input_schema={"type": "object"}, handler=handler)],
+        [],
+        lambda ref: ref,
+    )
+
+
+class _AskRecorder:
+    def __init__(self) -> None:
+        self.asked: list[tuple[str, dict[str, object]]] = []
+
+    async def decide(self, tool_name: str, tool_input: dict[str, object]) -> Verdict:
+        self.asked.append((tool_name, tool_input))
+        return "allow"
+
+
+def _assert_asked_echo(broker: _AskRecorder) -> None:
+    """05 §1.1: today's tool name and input; the shared action vocabulary
+    rides along under `tradewind` only."""
+    [(name, args)] = broker.asked
+    assert name == "echo"
+    assert args["a"] == 1
+    action = cast("dict[str, Any]", args["tradewind"])
+    assert action["kind"] == "caller_tool"
+    assert action["fields"] == {"name": "echo", "args": {"a": 1}, "source": "local"}
+
+
+def test_capabilities_declare_work_supervisor() -> None:
+    caps = _backend(_ScriptedChatModel(responses=[AIMessage(content="x")])).capabilities()
+    assert caps.supports_work_supervisor is True
+
+
+async def test_broker_gets_todays_name_and_input_through_the_gate() -> None:
+    broker = _AskRecorder()
+    model = _ScriptedChatModel(responses=[_call_msg("echo"), AIMessage(content="done")])
+    ctx = _make_ctx(tools=_echo_host(), broker=broker)
+    ctx.policy = _gov_policy(broker)
+
+    events = [e async for e in _backend(model).run(ctx)]
+
+    _assert_asked_echo(broker)
+    assert isinstance(events[-1], TurnCompleted)
+    assert not [e for e in events if isinstance(e, PermissionRequested)]
+
+
+async def test_gate_without_runner_policy_asks_the_broker_directly() -> None:
+    broker = _AskRecorder()
+    model = _ScriptedChatModel(responses=[_call_msg("echo"), AIMessage(content="done")])
+
+    events = [e async for e in _backend(model).run(_make_ctx(tools=_echo_host(), broker=broker))]
+
+    _assert_asked_echo(broker)
+    assert isinstance(events[-1], TurnCompleted)
+
+
+async def test_caller_deny_rule_denies_with_reason_and_does_not_ask() -> None:
+    broker = _NoBroker()
+    model = _ScriptedChatModel(responses=[_call_msg("echo"), AIMessage(content="done")])
+    ctx = _make_ctx(tools=_echo_host(), broker=broker)
+    ctx.policy = _gov_policy(broker, caller=[_gov_rule("echo", "deny", "no echo")])
+
+    events = [e async for e in _backend(model).run(ctx)]
+
+    permission = [e for e in events if isinstance(e, PermissionRequested)]
+    assert permission == [
+        PermissionRequested(tool_name="echo", tool_input={"a": 1}, verdict="deny", reason="no echo")
+    ]
+    result = next(
+        e.message.content
+        for e in events
+        if isinstance(e, ItemCompleted) and e.message.kind == "tool_result"
+    )
+    assert result == {"tool_use_id": "c1", "content": "no echo", "is_error": True}
+    assert cast(TurnCompleted, events[-1]).result.end_reason == "end_turn"
+
+
+async def test_stop_rule_fails_the_turn_with_the_reason() -> None:
+    broker = _NoBroker()
+    model = _ScriptedChatModel(responses=[_call_msg("echo"), AIMessage(content="never")])
+    ctx = _make_ctx(tools=_echo_host(), broker=broker)
+    ctx.policy = _gov_policy(broker, caller=[_gov_rule("echo", "stop", "halt now")])
+
+    events = [e async for e in _backend(model).run(ctx)]
+
+    assert (
+        PermissionRequested(
+            tool_name="echo", tool_input={"a": 1}, verdict="deny", reason="halt now"
+        )
+        in events
+    )
+    assert events[-1] == TurnFailed(turn_id="turn-1", error="halt now")
+    # The stopped call is not answered with a tool_result and nothing runs after it.
+    assert not [e for e in events if isinstance(e, TurnCompleted)]
+
+
+async def test_broker_exception_becomes_a_denial_not_a_failed_turn() -> None:
+    class _Boom:
+        async def decide(self, _tool_name: str, _tool_input: dict[str, object]) -> Verdict:
+            raise RuntimeError("broker down")
+
+    model = _ScriptedChatModel(responses=[_call_msg("echo"), AIMessage(content="done")])
+    ctx = _make_ctx(tools=_echo_host(), broker=_Boom())
+    ctx.policy = _gov_policy(_Boom())
+
+    events = [e async for e in _backend(model).run(ctx)]
+
+    permission = next(e for e in events if isinstance(e, PermissionRequested))
+    assert permission.verdict == "deny"
+    assert permission.reason
+    assert isinstance(events[-1], TurnCompleted)
+
+
+async def test_engine_auto_raises_unsupported_before_turn_started() -> None:
+    ctx = _make_ctx()
+    ctx.session.options_snapshot = {"permission_mode": "engine_auto"}
+    model = _ScriptedChatModel(responses=[AIMessage(content="x")])
+
+    seen: list[object] = []
+    with pytest.raises(Unsupported, match="engine_auto"):
+        async for event in _backend(model).run(ctx):
+            seen.append(event)
+    assert seen == []
+
+
+async def test_work_signals_wrap_tool_execution_and_the_final_response() -> None:
+    work = _WorkLog()
+    broker = _AskRecorder()
+    model = _ScriptedChatModel(responses=[_call_msg("echo"), AIMessage(content="done")])
+    ctx = _make_ctx(tools=_echo_host(), broker=broker)
+    ctx.work = cast(Any, work)
+
+    events = [e async for e in _backend(model).run(ctx)]
+
+    assert isinstance(events[-1], TurnCompleted)
+    kinds = [s[0] for s in work.signals]
+    assert ("started", "c1", "tool", "echo") in work.signals
+    assert work.signals.index(("started", "c1", "tool", "echo")) < work.signals.index(
+        ("ended", "c1")
+    )
+    assert kinds[-1] == "engine_done"
+    assert kinds.count("engine_done") == 1
+    assert "model_active" in kinds
+
+
+async def test_denied_tool_opens_no_work() -> None:
+    work = _WorkLog()
+    broker = _NoBroker()
+    model = _ScriptedChatModel(responses=[_call_msg("echo"), AIMessage(content="done")])
+    ctx = _make_ctx(tools=_echo_host(), broker=broker)
+    ctx.policy = _gov_policy(broker, caller=[_gov_rule("echo", "deny")])
+    ctx.work = cast(Any, work)
+
+    [e async for e in _backend(model).run(ctx)]
+
+    assert not [s for s in work.signals if s[0] in ("started", "ended")]
+
+
+async def test_plain_turn_events_are_unchanged_by_governance_wiring() -> None:
+    def script() -> _ScriptedChatModel:
+        return _ScriptedChatModel(responses=[_call_msg("echo"), AIMessage(content="done")])
+
+    broker = _AskRecorder()
+    plain = [e async for e in _backend(script()).run(_make_ctx(tools=_echo_host(), broker=broker))]
+    governed_ctx = _make_ctx(tools=_echo_host(), broker=broker)
+    governed_ctx.policy = _gov_policy(broker)
+    governed_ctx.work = cast(Any, _WorkLog())
+    governed = [e async for e in _backend(script()).run(governed_ctx)]
+
+    assert governed == plain
+    assert [type(e).__name__ for e in plain] == [
+        "TurnStarted",
+        "ItemCompleted",
+        "ItemCompleted",
+        "TextDelta",
+        "ItemCompleted",
+        "TurnCompleted",
+    ]
+
+
+class _LoggedFlakyChatModel(_FlakyChatModel):
+    """Logs each model call into `log` (shared with a `_WorkLog`)."""
+
+    log: list[object] = Field(default_factory=list)
+
+    def _generate(
+        self,
+        messages: list[BaseMessage],
+        stop: list[str] | None = None,
+        run_manager: CallbackManagerForLLMRun | None = None,
+        **kwargs: object,
+    ) -> ChatResult:
+        self.log.append(("model_call",))
+        return super()._generate(messages, stop=stop, run_manager=run_manager, **kwargs)
+
+
+async def test_overflow_recovery_signals_model_activity_before_the_summarizer_call() -> None:
+    from tradewind.application.config import CompactionSettings
+
+    sid = "11111111-1111-1111-1111-111111111111"
+    history = [
+        StoredMessage(
+            role="user" if n % 2 else "assistant",
+            kind="text",
+            content={"text": f"message {n} " * 30},
+            seq=n,
+            session_id=sid,
+            turn_id=f"t-old-{n // 2}",
+            created_at=f"2026-01-01T00:00:0{n}",
+        )
+        for n in range(1, 5)
+    ]
+    work = _WorkLog()
+    model = _LoggedFlakyChatModel(
+        responses=[AIMessage(content="pad")],
+        script=[
+            _StatusError(400, "prompt is too long for this model"),
+            AIMessage(content="## Goal\ncheckpoint"),
+            AIMessage(content="recovered"),
+        ],
+    )
+    model.log = work.signals  # assigned, not validated: pydantic would copy the list
+    ctx = _retry_ctx(history=history)
+    ctx.compaction = CompactionSettings(auto=False, reserve_tokens=20, keep_recent_tokens=40)
+    ctx.work = cast(Any, work)
+
+    events = [e async for e in _backend(model).run(ctx)]
+
+    assert cast(TurnCompleted, events[-1]).result.final_text == "recovered"
+    calls = [i for i, s in enumerate(work.signals) if s == ("model_call",)]
+    # Call 0 failed, call 1 is the summarizer: a signal sits right before it.
+    assert work.signals[calls[1] - 1] == ("model_active",)

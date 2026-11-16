@@ -71,6 +71,7 @@ from langchain_core.messages.tool import ToolCall
 from langchain_core.messages.tool import tool_call as make_tool_call
 
 from tradewind.application.config import NativeStoreConfig
+from tradewind.application.policy_gate import PolicyGate, caller_tool_source
 from tradewind.application.ports import Backend, TurnContext
 from tradewind.domain.compaction import (
     build_summary_request,
@@ -104,10 +105,10 @@ from tradewind.domain.models import (
     StoredMessage,
     TurnResult,
     calculate_cost,
-    normalize_decision,
     resume_degraded_notice,
     retry_notice,
 )
+from tradewind.domain.policy import Action, TurnVars, floor_tradewind
 
 _MAX_ITERATIONS = 25
 
@@ -122,6 +123,49 @@ _STRUCTURED_OUTPUT_INSTRUCTION = (
 )
 
 ChatModelFactory = Callable[[ModelSpec], BaseChatModel]
+
+
+def _caller_tool_action(name: str, args: dict[str, object]) -> Action:
+    return Action(
+        kind="caller_tool",
+        fields={"name": name, "args": args, "source": caller_tool_source(name)},
+        backend="langchain",
+        native_name=name,
+        native_args=args,
+        summary=name,
+    )
+
+
+def _direct_policy(ctx: TurnContext, pending_events: list[Event]) -> PolicyGate:
+    """The gate for a `TurnContext` built without the runner (`ctx.policy`
+    unset -- direct construction, as in unit tests): broker mode with no
+    caller or default rules, so every caller tool asks `ctx.broker`, as
+    before turn governance. The runner always sets `ctx.policy`."""
+    return PolicyGate(
+        broker=ctx.broker,
+        backend="langchain",
+        floor=floor_tradewind(),
+        caller=[],
+        defaults=[],
+        turn=TurnVars(
+            mode="broker",
+            engine_mode=None,
+            shim_server=None,
+            workspace=ctx.session.cwd,
+            result_tool=None,
+        ),
+        has_broker=not getattr(ctx.broker, "is_default_allow_all", False),
+        emit=pending_events.append,
+    )
+
+
+def _reject_engine_auto(ctx: TurnContext) -> None:
+    """LangChain has no engine of its own (05 §2.5): nothing to auto-approve."""
+    if ctx.session.options_snapshot.get("permission_mode") == "engine_auto":
+        raise Unsupported(
+            'permission_mode="engine_auto" needs an engine with its own approval '
+            "mode; the langchain backend has none"
+        )
 
 
 def _default_chat_model_factory(profile: Profile) -> ChatModelFactory:
@@ -446,6 +490,13 @@ class LangchainBackend(Backend):
             supports_turn_retry=True,
             # FR-4.4: the denial reason is the synthesized tool_result text.
             supports_deny_reason=True,
+            # 05 §3/§7: stream chunks, tool execution and the final response
+            # reach `ctx.work`.
+            supports_work_supervisor=True,
+            # 05 §2.5: no engine of its own (`_reject_engine_auto`); its own
+            # loop gates every call.
+            supports_engine_auto=False,
+            supports_action_policy=True,
         )
 
     async def probe_native(
@@ -470,7 +521,11 @@ class LangchainBackend(Backend):
         if scope is not None:
             scope.cancel()
 
+    async def prepare_turn(self, ctx: TurnContext) -> None:
+        _reject_engine_auto(ctx)
+
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        _reject_engine_auto(ctx)
         session_id = ctx.session.session_id
         scope = anyio.CancelScope()
         self._scopes[session_id] = scope
@@ -534,6 +589,9 @@ class LangchainBackend(Backend):
                 self._scopes.pop(session_id, None)
 
     async def _run_turn(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        work = ctx.work
+        gate_events: list[Event] = []
+        policy = ctx.policy if ctx.policy is not None else _direct_policy(ctx, gate_events)
         yield TurnStarted(turn_id=ctx.turn_id)
         if ctx.force_replay:
             # FR-6.1: cross-backend continuation landed here -- the mirror
@@ -548,7 +606,13 @@ class LangchainBackend(Backend):
             schemas = ctx.tools.schemas()
             bound_model = _bind_tools(chat_model, schemas)
             history = await ctx.load_history()
+            if work is not None:
+                # The in-turn summarizer call is a model call (05 §7): signalled
+                # before and after, so a long compaction is not model silence.
+                work.model_active()
             record, failure_item = await self._maybe_auto_compact(ctx, history)
+            if work is not None:
+                work.model_active()
             if failure_item is not None:
                 # Auto-compaction failed (FR-5.8 hard-fail rule): surfaced
                 # loudly as a mirrored event item, turn proceeds uncompacted.
@@ -594,6 +658,8 @@ class LangchainBackend(Backend):
                     try:
                         gathered: AIMessageChunk | None = None
                         async for chunk in model.astream([*base_messages, *turn_suffix]):
+                            if work is not None:
+                                work.model_active()
                             if forced_call:
                                 # The forced call emits nothing (FR-1.3).
                                 gathered = chunk if gathered is None else gathered + chunk
@@ -621,6 +687,8 @@ class LangchainBackend(Backend):
                                 if ctx.compaction is not None
                                 else 20000
                             )
+                            if work is not None:
+                                work.model_active()
                             try:
                                 recovery_record, _usage = await self._compact(
                                     ctx.model_spec, history, keep_recent_tokens=keep_recent
@@ -630,6 +698,8 @@ class LangchainBackend(Backend):
                                     "context overflow and recovery compaction failed: "
                                     f"{compaction_exc}"
                                 ) from exc
+                            if work is not None:
+                                work.model_active()
                             yield ItemCompleted(message=recovery_record)
                             yield ItemCompleted(
                                 message=retry_notice(
@@ -720,26 +790,45 @@ class LangchainBackend(Backend):
 
                 terminate_requested = False
                 for call in tool_calls:
-                    decision = await ctx.broker.decide(call["name"], call["args"])
-                    verdict, deny_reason, terminate = normalize_decision(decision)
-                    # `PermissionRequested` fires only on "deny", per the task-8
-                    # brief's literal wording ("'deny' -> synthesized error
-                    # ToolMessage + PermissionRequested event with verdict;
-                    # 'allow' -> ToolHost.call") — flagged for controller
-                    # confirmation in the task-8 report, since `Verdict` is
-                    # typed to carry "allow" too.
-                    if verdict == "deny":
+                    call_args = cast("dict[str, object]", call["args"])
+                    decision = await policy.gate(
+                        _caller_tool_action(call["name"], call_args),
+                        broker_name=call["name"],
+                        broker_args=call_args,
+                    )
+                    for gate_event in gate_events:
+                        yield gate_event
+                    gate_events.clear()
+                    if decision.outcome == "stop":
+                        # 05 §2.6: reported as a denial, then the turn ends.
+                        reason = decision.reason or f"turn stopped by policy at {call['name']!r}"
                         yield PermissionRequested(
                             tool_name=call["name"],
                             tool_input=call["args"],
                             verdict="deny",
-                            reason=deny_reason,
+                            reason=reason,
+                        )
+                        yield TurnFailed(turn_id=ctx.turn_id, error=reason)
+                        return
+                    if decision.outcome == "deny":
+                        yield PermissionRequested(
+                            tool_name=call["name"],
+                            tool_input=call["args"],
+                            verdict="deny",
+                            reason=decision.reason,
                         )
                         # FR-4.4: the reason IS what the model reads.
-                        content, is_error = (deny_reason or "permission denied"), True
-                        terminate_requested = terminate_requested or terminate
+                        content, is_error = (decision.reason or "permission denied"), True
+                        terminate_requested = terminate_requested or decision.terminate
                     else:
-                        outcome = await ctx.tools.call(call["name"], call["args"])
+                        work_id = call["id"] or call["name"]
+                        if work is not None:
+                            work.started(work_id, "tool", call["name"])
+                        try:
+                            outcome = await ctx.tools.call(call["name"], call["args"])
+                        finally:
+                            if work is not None:
+                                work.ended(work_id)
                         content, is_error = outcome.content, outcome.is_error
 
                     yield ItemCompleted(
@@ -773,6 +862,8 @@ class LangchainBackend(Backend):
                     end_reason = "broker_terminated"
                     break
 
+            if work is not None:
+                work.engine_done()
             yield TurnCompleted(
                 result=TurnResult(
                     turn_id=ctx.turn_id,

@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, ClassVar
 
 from tradewind.application.tool_host import ToolHost
@@ -16,6 +16,7 @@ from tradewind.domain.models import (
     Capabilities,
     ModelSpec,
     NormalizedMessage,
+    OnPreflight,
     PermissionBroker,
     Profile,
     SessionRow,
@@ -38,6 +39,9 @@ if TYPE_CHECKING:
         NativeStoreConfig,
         RetrySettings,
     )
+    from tradewind.application.policy_gate import PolicyGate
+    from tradewind.application.supervisor import WorkSupervisor
+    from tradewind.domain.policy import Rule
 
 
 class SessionStorePort(ABC):
@@ -287,6 +291,14 @@ class SessionStorePort(ABC):
         ...
 
 
+def _ignore_engine_pid(_pid: int) -> None:
+    """`TurnContext.engine_started`'s default: no process report."""
+
+
+def _no_engine_snapshot() -> None:
+    """`TurnContext.engine_closing`'s default: no process report."""
+
+
 @dataclass
 class TurnContext:
     """Everything a `Backend.run()` needs for one turn, assembled by the
@@ -351,6 +363,26 @@ class TurnContext:
     # `TurnCompleted` carrying `end_reason="max_tool_rounds"`, an honest
     # partial — never `failed`, never a fake clean finish.
     max_tool_rounds: int | None = None
+    # Turn governance (docs/components/05-turn-governance.md §2): the runner
+    # always sets `policy` and `work`; adapters call
+    # `ctx.policy.gate(...)` / `.observe(...)` and report work and model
+    # activity through `ctx.work` (§3.1). The runner sets `timeout_reason`
+    # (limit, value, elapsed) before it interrupts on a fired limit.
+    policy: PolicyGate | None = None
+    work: WorkSupervisor | None = None
+    timeout_reason: dict[str, object] | None = None
+    preflight: dict[str, str] = field(default_factory=dict)
+    # The caller's live `SessionOptions.on_preflight` (05 §4), which
+    # `run_checks` asks; None means every question gets its default.
+    on_preflight: OnPreflight | None = None
+    # The process report (05 §3.4), for a backend that spawns an engine
+    # process: it calls `engine_started(pid)` once the engine is spawned
+    # and `engine_closing()` just before it closes the engine, so the
+    # engine's descendants are recorded while they can still be found.
+    # Both block on `ps`: call them from a worker thread. The defaults do
+    # nothing; the runner sets both.
+    engine_started: Callable[[int], None] = _ignore_engine_pid
+    engine_closing: Callable[[], None] = _no_engine_snapshot
 
 
 class Backend(ABC):
@@ -364,10 +396,41 @@ class Backend(ABC):
     """
 
     name: ClassVar[BackendName]
+    uses_result_tool: ClassVar[bool] = False
 
     def __init__(self, profile: Profile, native_config: NativeStoreConfig) -> None:
         self.profile = profile
         self.native_config = native_config
+
+    async def prepare_turn(self, ctx: TurnContext) -> None:  # noqa: B027
+        """Per-turn setup before `run()` (05-turn-governance §4); the
+        default does nothing.
+
+        The runner awaits this after building `ctx` and before the work
+        supervisor starts and `run()` is called, so its time is not counted
+        by any limit. A backend runs its preflight checks here
+        (`tradewind.application.preflight.run_checks`) and stores answers
+        on `ctx.preflight`; it changes nothing itself -- `run()` applies
+        the answers, before `TurnStarted`.
+
+        A backend registers the turn as in flight for
+        `ctx.session.session_id` from the start of this method, so
+        `interrupt()` reaches a turn that waits here (e.g. on a preflight
+        question) and ends the wait. When a stop was requested before or
+        during this call, the runner does not call `run()`.
+
+        Failure modes:
+            ConfigError: a preflight check returned `Stop`; the turn ends
+                `failed` and the error propagates to the caller.
+        """
+
+    def floor_rules(self) -> list[Rule]:
+        """Backend-specific floor rules (§2.4); none by default."""
+        return []
+
+    def default_rules(self) -> list[Rule]:
+        """Backend-specific default rules (§2.4); none by default."""
+        return []
 
     @abstractmethod
     def capabilities(self) -> Capabilities:
@@ -383,7 +446,13 @@ class Backend(ABC):
     def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
         """Execute one turn, yielding the normalized event stream.
 
-        `TurnStarted` is always the first event. On a clean finish,
+        `TurnStarted` is always the first event, with one exception: a
+        turn stopped, or failed, before `TurnStarted` (a stop around
+        `prepare_turn`, or a stop, limit or error while `run()` is still
+        before `TurnStarted`) gets a terminal record with no `TurnStarted`
+        (05-turn-governance §4). Work `run()` does before `TurnStarted`
+        (e.g. applying `ctx.preflight` answers) may raise `ConfigError`.
+        On a clean finish,
         `TurnCompleted` is the last event; on an unrecoverable error,
         `TurnFailed` is the last event instead. `interrupt()` called for
         `ctx.session.session_id` while this iterator is in flight ends it

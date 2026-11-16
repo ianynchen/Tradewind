@@ -12,7 +12,8 @@
 
 ## Global Constraints
 
-- GUIDELINES.md binds (§1–4, §7, §11, §13.5): no CI change, no package version bump, match existing patterns, no unrequested refactors.
+- GUIDELINES.md binds (§1–4, §7, §11, §13.5): no CI change, match existing patterns, no unrequested refactors.
+- **Version (owner, 2026-11-15):** bump the minor version after implementation: `0.11.2` → `0.12.0` (Task 12).
 - One ADR (`docs/adr/0004-turn-governance.md`); REQUIREMENTS updated in the same PR (05 §Delivery list).
 - `jsonschema` is the only new runtime dependency. Process listing uses `ps`, not `psutil`.
 - Plain turns on Claude, Codex and LangChain emit exactly the same events as before (verified by a test per backend).
@@ -125,10 +126,10 @@
 **Interfaces:**
 - Produces:
   - `domain.supervision.next_deadline(now: float, state: SupervisorState, limits: Limits) -> tuple[float | None, str | None]` returning the next firing time and the limit name (`"model_silence"`, `"work_silence"`, `"hard_cap"`), `None` while approvals are pending.
-  - `class WorkSupervisor:` `started(id: str, kind: Literal["tool","background","subagent"], label: str, has_end_signal: bool = True)`, `active(id: str)`, `ended(id: str)`, `model_active()`, `engine_done()`, `open_items() -> list[WorkItem]`, `async def run(on_fire: Callable[[str, float, float], Awaitable[None]])`, `close_unsignalled_after_done() -> list[WorkItem]`.
+  - `class WorkSupervisor:` `started(id: str, kind: Literal["tool","background","subagent"], label: str, has_end_signal: bool = True)`, `active(id: str)`, `ended(id: str)`, `model_active()`, `engine_done()`, `open_items() -> list[WorkItem]`, `async def run(on_fire: Callable[[str, float, float], Awaitable[None]])`, `async def settled() -> bool` (wakes when `run()` ends: True = normal end, False = a limit fired or `run()` was cancelled; adapters await it before their terminal event while still reading the engine stream), `closed_after_done() -> list[WorkItem]` (read-only), `approvals_changed(count: int)` (wired to `PolicyGate.on_approval_change`).
   - Limits: `Limits(model_silence_s, work_silence_s, hard_cap_s | None)`; backend default for the hard cap: `None` when `capabilities().supports_work_supervisor` else `600.0`.
 - On fire, the runner sets `ctx.timeout_reason = {"limit": name, "value": v, "elapsed": e}`, emits one timeout notice (`ItemCompleted(kind="event")`, written to the store) **before** any terminal event, then calls `backend.interrupt()`; the synthesized terminal keeps `end_reason="timeout"`.
-- `engine_done()` + only unsignalled items open → those close after `work_silence_s` of no activity as a **normal end** (`close_unsignalled_after_done` returns them for the report).
+- `engine_done()` + only unsignalled items open → those close after `work_silence_s` of no activity as a **normal end** (`run()` closes them; `closed_after_done()` returns them for the report).
 
 - [ ] **Step 1: Write failing tests** (fake clock; no real sleeps)
   - `test_model_silence_fires_without_open_work`.
@@ -246,10 +247,17 @@
 - Modify: `docs/REQUIREMENTS.md` (new FRs: action policy, permission modes, preflight, prompt rule; FR-4 vocabulary and broker compatibility; FR-6.6 supervisor, optional hard cap, "every backend"; FR-8.1 new flags; FR-2 terminal record without `TurnStarted`), `docs/ARCHITECTURE.md` (§3.1 port additions), `README.md` (capability matrix, engine-auto strength per engine), `docs/RUNBOOK.md` (05 §Notes; Claude engine_auto finding; Codex slash finding), `CHANGELOG.md`
 - [ ] **Step 1:** Write the ADR (context, decision = 05, consequences, alternatives: per-backend special rules).
 - [ ] **Step 2:** Update the documents; `uv run` any doc checks the repo has.
-- [ ] **Step 3:** Gate && commit `docs: turn governance ADR and requirements`.
+- [ ] **Step 3:** Bump `version` in `pyproject.toml` from `0.11.2` to `0.12.0` (owner); move the CHANGELOG `[Unreleased]` entries under `## [0.12.0] - <date>`; `uv lock`.
+- [ ] **Step 4:** Gate && commit `docs: turn governance ADR and requirements; release 0.12.0`.
 
 ### Task 13: Whole-branch review and PR
 
 - [ ] **Step 1:** Dispatch an independent reviewer on the whole branch diff against `05` and this plan's Review Focus.
 - [ ] **Step 2:** Fix findings (small ones directly; design-sized ones back to the owner).
 - [ ] **Step 3:** Gate && push the branch; open the PR to `main` (body ends with the Claude Code line); link it.
+
+### Task 14: Process report and kill on Claude and Codex (owner ruling B, 2026-11-15)
+
+**Files:** `application/process_report.py` (caller guard; `EngineWatch`), `application/ports.py` (`TurnContext.engine_started` / `engine_closing`), `application/turn_runner.py` (snapshot before every interrupt, 15 s grace, kill on a fired limit or an unanswered interrupt, report before the terminal), `adapters/claude_backend.py`, `adapters/codex_backend.py` (one guarded PID accessor each), fake backend, docs.
+- [ ] **Step 1: Write failing tests**: fake-`ps` caller guard (same group, caller's sibling excluded, engine's grandchild included); runner end to end with the fake backend (normal end reports a live descendant without a kill; a plain turn with none alive is unchanged; a fired limit kills the tree and reports before the terminal; interrupt answered vs unanswered); each adapter reports the SDK's PID; SDK attribute pins.
+- [ ] **Steps 2–5:** run → fail → implement → pass → gate && commit `feat: process report and kill on Claude and Codex`.

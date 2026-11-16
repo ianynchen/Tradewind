@@ -1771,12 +1771,13 @@ wheels = [
 
 [[package]]
 name = "tradewind"
-version = "0.11.2"
+version = "0.12.0"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
     { name = "claude-agent-sdk" },
     { name = "cursor-sdk" },
+    { name = "jsonschema" },
     { name = "langchain-anthropic" },
     { name = "langchain-core" },
     { name = "mcp" },
@@ -1801,6 +1802,7 @@ requires-dist = [
     { name = "anyio", specifier = ">=4" },
     { name = "claude-agent-sdk", specifier = "==0.2.151" },
     { name = "cursor-sdk", specifier = "==1.0.30" },
+    { name = "jsonschema", specifier = ">=4.26,<5" },
     { name = "langchain-anthropic", specifier = "==1.7.0" },
     { name = "langchain-core", specifier = "==1.6.1" },
     { name = "mcp", specifier = "==2.1.1" },

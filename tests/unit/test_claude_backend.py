@@ -10,6 +10,8 @@ a real live session is `tests/conformance/test_claude.py` /
 
 from __future__ import annotations
 
+import logging
+from types import SimpleNamespace
 from typing import Any, cast
 
 import anyio
@@ -21,6 +23,7 @@ from tradewind.adapters.claude_backend import ClaudeBackend
 from tradewind.application.config import NativeStoreConfig
 from tradewind.application.ports import TurnContext
 from tradewind.application.tool_host import ToolHost
+from tradewind.domain.errors import Unsupported
 from tradewind.domain.events import ItemCompleted, PermissionRequested, TurnCompleted, TurnFailed
 from tradewind.domain.models import (
     ModelSpec,
@@ -340,7 +343,7 @@ async def test_can_use_tool_maps_denial_reason_and_terminate_natively() -> None:
 
     pending: list[object] = []
     flag = [False]
-    can_use_tool = _make_can_use_tool(cast(Any, _Broker()), cast(Any, pending), flag)
+    can_use_tool = _make_can_use_tool(_policy(_Broker()), cast(Any, pending), flag, [None])
 
     result = await can_use_tool("mcp__tradewind__probe", {"q": 1}, cast(Any, None))
 
@@ -675,7 +678,7 @@ async def test_structured_output_tool_is_auto_allowed_without_consulting_the_bro
 
     pending: list[object] = []
     flag = [False]
-    can_use_tool = _make_can_use_tool(cast(Any, _NoBroker()), cast(Any, pending), flag)
+    can_use_tool = _make_can_use_tool(_policy(_NoBroker()), cast(Any, pending), flag, [None])
 
     result = await can_use_tool("StructuredOutput", {"answer": 1}, cast(Any, None))
 
@@ -1192,7 +1195,7 @@ async def test_call_without_a_tool_use_id_goes_to_the_broker_uncounted() -> None
             return "allow"
 
     round_cap = _CallerRoundCap(0)
-    can_use_tool = _make_can_use_tool(cast(Any, _RecordingBroker()), [], [False], round_cap)
+    can_use_tool = _make_can_use_tool(_policy(_RecordingBroker()), [], [False], [None], round_cap)
 
     result = await can_use_tool("mcp__tradewind__x", {}, ToolPermissionContext(tool_use_id=None))
 
@@ -1514,3 +1517,658 @@ async def test_block_without_ids_after_an_identified_response_keeps_its_text(
 
     completed = [e for e in events if isinstance(e, TurnCompleted)]
     assert completed[0].result.final_text == "x"
+
+
+# --- turn governance (05-turn-governance §2.1, §2.3, §3.3, §5, §7) ---
+
+
+def _policy(
+    broker: object, *, caller: list[Any] | None = None, emitted: list[object] | None = None
+) -> Any:
+    """A broker-mode `PolicyGate` the way `turn_runner` builds one."""
+    from tradewind.application.policy_gate import PolicyGate
+    from tradewind.domain.policy import TurnVars, floor_tradewind
+
+    return PolicyGate(
+        broker=cast(Any, broker),
+        backend="claude",
+        floor=floor_tradewind(),
+        caller=caller or [],
+        defaults=[],
+        turn=TurnVars(
+            mode="broker", engine_mode=None, shim_server=None, workspace=None, result_tool=None
+        ),
+        has_broker=True,
+        emit=(emitted if emitted is not None else []).append,
+    )
+
+
+def _caller_rule(name: str, outcome: str, reason: str = "") -> Any:
+    from tradewind.domain.policy import Matcher, Rule
+
+    return Rule(
+        id=f"caller.{name}.{outcome}",
+        kind="caller_tool",
+        where={"name": Matcher("equals", name)},
+        outcome=cast(Any, outcome),
+        reason=reason,
+    )
+
+
+class _RecordingArgsBroker:
+    def __init__(self) -> None:
+        self.asked: list[tuple[str, dict[str, object]]] = []
+
+    async def decide(self, tool_name: str, tool_input: dict[str, object]) -> Verdict:
+        self.asked.append((tool_name, tool_input))
+        return "allow"
+
+
+async def test_can_use_tool_goes_through_policy_with_todays_name() -> None:
+    """05 §1.1: existing brokers keep today's bare tool name and arguments;
+    the shared vocabulary rides along under `tradewind` only. A caller MCP
+    tool (`ToolHost` names it `mcp__<server>__<tool>`) is `source:
+    mcp:<server>`; a local `Tool` is `source: local`."""
+    from claude_agent_sdk import PermissionResultAllow, ToolPermissionContext
+
+    from tradewind.adapters.claude_backend import _make_can_use_tool
+
+    broker = _RecordingArgsBroker()
+    can_use_tool = _make_can_use_tool(_policy(broker), [], [False], [None])
+    context = ToolPermissionContext(tool_use_id="t1")
+
+    local = await can_use_tool("mcp__tradewind__probe", {"q": 1}, context)
+    remote = await can_use_tool("mcp__tradewind__mcp__srv__lookup", {}, context)
+
+    assert isinstance(local, PermissionResultAllow)
+    assert isinstance(remote, PermissionResultAllow)
+    (name, args), (remote_name, remote_args) = broker.asked
+    assert name == "probe"
+    assert args["q"] == 1
+    action = cast("dict[str, Any]", args["tradewind"])
+    assert action["kind"] == "caller_tool"
+    assert action["fields"] == {"name": "probe", "args": {"q": 1}, "source": "local"}
+    assert remote_name == "mcp__srv__lookup"
+    assert cast("dict[str, Any]", remote_args["tradewind"])["fields"]["source"] == "mcp:srv"
+
+
+async def test_caller_deny_rule_denies_without_asking_the_broker() -> None:
+    from claude_agent_sdk import PermissionResultDeny, ToolPermissionContext
+
+    from tradewind.adapters.claude_backend import _make_can_use_tool
+
+    broker = _RecordingArgsBroker()
+    pending: list[object] = []
+    policy = _policy(broker, caller=[_caller_rule("merge", "deny", "never merge")])
+    can_use_tool = _make_can_use_tool(policy, cast(Any, pending), [False], [None])
+
+    result = await can_use_tool(
+        "mcp__tradewind__merge", {}, ToolPermissionContext(tool_use_id="t1")
+    )
+
+    assert isinstance(result, PermissionResultDeny)
+    assert result.message == "never merge"
+    assert result.interrupt is False
+    assert broker.asked == []
+    assert [type(e) for e in pending] == [PermissionRequested]
+
+
+async def test_structured_output_pass_through() -> None:
+    """05 §2.3: the result tool is a structural pass-through -- allowed and
+    never asked, even when a caller rule names it, and still hidden."""
+    from claude_agent_sdk import PermissionResultAllow, ToolPermissionContext
+
+    from tradewind.adapters.claude_backend import _make_can_use_tool
+
+    pending: list[object] = []
+    policy = _policy(_NoBroker(), caller=[_caller_rule("StructuredOutput", "stop")])
+    can_use_tool = _make_can_use_tool(policy, cast(Any, pending), [False], [None])
+
+    result = await can_use_tool(
+        "StructuredOutput", {"answer": 1}, ToolPermissionContext(tool_use_id="so")
+    )
+
+    assert isinstance(result, PermissionResultAllow)
+    assert pending == []
+
+
+async def test_policy_stop_interrupts_and_fails_the_turn(monkeypatch: pytest.MonkeyPatch) -> None:
+    """05 §2.6: `stop` cancels and ends the turn with `TurnFailed(reason)`;
+    an adapter-started cancel is never reported as a caller interrupt."""
+    from claude_agent_sdk import PermissionResultDeny
+
+    decisions = _install_cli_like_client(monkeypatch, [[("t1", "mcp__tradewind__drop_db")], []])
+    ctx = _make_ctx(output_schema=None)
+    ctx.policy = _policy(_NoBroker(), caller=[_caller_rule("drop_db", "stop", "dangerous")])
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events = await _collect_bounded(backend.run(ctx))
+
+    assert isinstance(decisions[0], PermissionResultDeny)
+    assert decisions[0].interrupt is True
+    assert isinstance(events[-1], TurnFailed)
+    assert events[-1].error == "dangerous"
+    assert not any(isinstance(e, TurnCompleted) for e in events)
+
+
+def _plain_turn_script() -> list[object]:
+    from claude_agent_sdk import (
+        AssistantMessage,
+        TextBlock,
+        ThinkingBlock,
+        ToolResultBlock,
+        ToolUseBlock,
+        UserMessage,
+    )
+
+    return [
+        AssistantMessage(
+            content=[ThinkingBlock(thinking="hmm", signature="sig")], model="m", uuid="a0"
+        ),
+        AssistantMessage(content=[TextBlock(text="checking")], model="m", uuid="a1"),
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="mcp__tradewind__probe", input={"q": 1})],
+            model="m",
+            uuid="a2",
+        ),
+        UserMessage(content=[ToolResultBlock(tool_use_id="t1", content="42")], uuid="u1"),
+        AssistantMessage(content=[TextBlock(text="it is 42")], model="m", uuid="a3"),
+        _success_result(result="it is 42"),
+    ]
+
+
+def _with_stream_events(script: list[object]) -> list[object]:
+    from claude_agent_sdk import StreamEvent
+
+    interleaved: list[object] = []
+    for index, message in enumerate(script):
+        interleaved.append(
+            StreamEvent(uuid=f"e{index}", session_id="s", event={"type": "content_block_delta"})
+        )
+        interleaved.append(message)
+    return interleaved
+
+
+async def test_plain_turn_events_identical_with_partial_messages(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """05 §7 / acceptance: `include_partial_messages` adds `StreamEvent`s
+    that only feed model activity. The baseline is today's stream (no
+    `StreamEvent`s, as before the flag); the same turn with them
+    interleaved must yield exactly the same events -- and so the same
+    mirror, which is the `ItemCompleted` events."""
+    from tradewind.application.supervisor import WorkSupervisor
+    from tradewind.domain.supervision import Limits
+
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+    ctx = _make_ctx(output_schema=None)
+    ctx.broker = cast(Any, _AllowBroker())
+
+    _install_fake_sdk_client(monkeypatch, _plain_turn_script())
+    baseline = [event async for event in backend.run(ctx)]
+
+    captured = _install_fake_sdk_client(monkeypatch, _with_stream_events(_plain_turn_script()))
+    work = WorkSupervisor(Limits(300.0, 1800.0, None))
+    ctx.work = work
+    with_partials = await _collect_bounded(backend.run(ctx))
+
+    assert cast(Any, captured[0]).include_partial_messages is True
+    assert with_partials == baseline
+    assert [type(e).__name__ for e in baseline] == [
+        "TurnStarted",
+        "ItemCompleted",
+        "ItemCompleted",
+        "ItemCompleted",
+        "ItemCompleted",
+        "ItemCompleted",
+        "TurnCompleted",
+    ]
+    assert work.open_items() == []
+
+
+async def test_engine_auto_raises_unsupported_before_turn_started(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Task-8 finding (RUNBOOK): the SDK's `auto` mode lets a model
+    classifier approve tool calls without `can_use_tool` (types.py
+    `can_use_tool` docstring; client.py `set_permission_mode`), which would
+    bypass the policy gate. So Claude declares `supports_engine_auto=False`
+    and refuses engine_auto instead of ignoring it."""
+    captured = _install_fake_sdk_client(monkeypatch, [_success_result()])
+    ctx = _make_ctx(output_schema=None)
+    ctx.session.options_snapshot["permission_mode"] = "engine_auto"
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    events: list[object] = []
+    with pytest.raises(Unsupported, match="engine_auto"):
+        async for event in backend.run(ctx):
+            events.append(event)
+
+    assert events == []
+    assert captured == []
+
+
+async def test_broker_mode_keeps_the_sdk_default_permission_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The adapter never sets an SDK permission mode: built-ins stay off
+    and every caller tool reaches `can_use_tool`."""
+    captured = _install_fake_sdk_client(monkeypatch, [_success_result()])
+    ctx = _make_ctx(output_schema=None)
+    ctx.session.options_snapshot["permission_mode"] = "broker"
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    [event async for event in backend.run(ctx)]
+
+    options = cast(Any, captured[0])
+    assert options.permission_mode is None
+    assert options.tools == []
+    assert options.can_use_tool is not None
+
+
+def test_capabilities_declare_governance_support() -> None:
+    caps = ClaudeBackend(_profile(), NativeStoreConfig()).capabilities()
+
+    assert caps.supports_engine_auto is False
+    assert caps.supports_work_supervisor is True
+    assert caps.supports_action_policy is True
+
+
+async def test_slash_prompt_reaches_the_engine_as_a_message(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """05 §5: the engine gets `Message: /clear`; the context (and so the
+    runner's mirror) keeps the caller's original prompt."""
+    prompts: list[str] = []
+
+    class _PromptClient:
+        def __init__(self, _options: object) -> None:
+            pass
+
+        async def connect(self, prompt: str) -> None:
+            prompts.append(prompt)
+
+        async def receive_response(self) -> Any:
+            yield _success_result()
+
+        async def disconnect(self) -> None:
+            pass
+
+    monkeypatch.setattr(claude_backend_module, "ClaudeSDKClient", _PromptClient)
+    ctx = _make_ctx(output_schema=None)
+    ctx.prompt = "/clear"
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    [event async for event in backend.run(ctx)]
+
+    assert prompts == ["Message: /clear"]
+    assert ctx.prompt == "/clear"
+
+
+def _install_background_task_client(
+    monkeypatch: pytest.MonkeyPatch, after_result: list[object]
+) -> None:
+    """The turn's response starts a background task and finishes; the task's
+    end (and anything else) arrives only after the `ResultMessage`, through
+    `receive_messages()`."""
+    from claude_agent_sdk import TaskStartedMessage
+
+    class _BackgroundClient:
+        def __init__(self, _options: object) -> None:
+            pass
+
+        async def connect(self, _prompt: str) -> None:
+            pass
+
+        async def receive_response(self) -> Any:
+            yield TaskStartedMessage(
+                subtype="task_started",
+                data={},
+                task_id="bg1",
+                description="long build",
+                uuid="u-start",
+                session_id="s",
+            )
+            yield _success_result(result="started the build")
+
+        async def receive_messages(self) -> Any:
+            for message in after_result:
+                await anyio.sleep(0)
+                yield message
+            await anyio.sleep_forever()
+
+        async def interrupt(self) -> None:
+            pass
+
+        async def disconnect(self) -> None:
+            pass
+
+    monkeypatch.setattr(claude_backend_module, "ClaudeSDKClient", _BackgroundClient)
+
+
+async def test_open_background_task_holds_the_terminal_until_it_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """05 §3.3: the turn ends when the engine is done AND no work is open.
+    The adapter keeps reading the engine (mirroring what arrives) and
+    yields its terminal only once the supervisor settles."""
+    import asyncio
+
+    from claude_agent_sdk import AssistantMessage, TaskNotificationMessage, TextBlock
+
+    from tradewind.application.supervisor import WorkSupervisor
+    from tradewind.domain.supervision import Limits
+
+    _install_background_task_client(
+        monkeypatch,
+        [
+            AssistantMessage(content=[TextBlock(text="build done")], model="m", uuid="late"),
+            TaskNotificationMessage(
+                subtype="task_notification",
+                data={},
+                task_id="bg1",
+                status="completed",
+                output_file="/tmp/o",
+                summary="ok",
+                uuid="u-end",
+                session_id="s",
+            ),
+        ],
+    )
+    work = WorkSupervisor(Limits(300.0, 1800.0, None))
+    ctx = _make_ctx(output_schema=None)
+    ctx.work = work
+
+    async def on_fire(*_: object) -> None:
+        raise AssertionError("no limit may fire")
+
+    supervising = asyncio.ensure_future(work.run(on_fire))
+    events = await _collect_bounded(ClaudeBackend(_profile(), NativeStoreConfig()).run(ctx))
+    supervising.cancel()
+
+    texts = [e.message.content.get("text") for e in events if isinstance(e, ItemCompleted)]
+    assert texts == ["build done"]
+    assert isinstance(events[-1], TurnCompleted)
+    assert events[-1].result.final_text == "started the build"
+    assert work.open_items() == []
+
+
+async def test_unsettled_turn_leaves_the_terminal_to_the_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the supervisor ends without a normal end (a fired limit, or the
+    runner cancelling it), `settled()` is False and the adapter yields no
+    terminal: the runner's timeout path records the turn."""
+    import asyncio
+
+    from tradewind.application.supervisor import WorkSupervisor
+    from tradewind.domain.supervision import Limits
+
+    _install_background_task_client(monkeypatch, [])
+    work = WorkSupervisor(Limits(300.0, 1800.0, None))
+    ctx = _make_ctx(output_schema=None)
+    ctx.work = work
+
+    async def on_fire(*_: object) -> None:
+        pass
+
+    supervising = asyncio.ensure_future(work.run(on_fire))
+
+    async def fire_soon() -> None:
+        await asyncio.sleep(0.05)
+        supervising.cancel()
+
+    firing = asyncio.ensure_future(fire_soon())
+    events = await _collect_bounded(ClaudeBackend(_profile(), NativeStoreConfig()).run(ctx))
+    await firing
+
+    assert not any(isinstance(e, TurnCompleted | TurnFailed) for e in events)
+
+
+async def test_interrupt_while_settling_ends_without_a_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A caller stop while the adapter waits for open work ends the turn
+    with no terminal (`Backend.run` contract: the runner records
+    `interrupted`), even though the supervisor itself never settles."""
+    import asyncio
+
+    from tradewind.application.supervisor import WorkSupervisor
+    from tradewind.domain.supervision import Limits
+
+    _install_background_task_client(monkeypatch, [])
+    work = WorkSupervisor(Limits(300.0, 1800.0, None))
+    ctx = _make_ctx(output_schema=None)
+    ctx.work = work
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    async def stop_soon() -> None:
+        await asyncio.sleep(0.05)
+        await backend.interrupt("s1")
+
+    stopping = asyncio.ensure_future(stop_soon())
+    events = await _collect_bounded(backend.run(ctx))
+    await stopping
+
+    assert not any(isinstance(e, TurnCompleted | TurnFailed) for e in events)
+
+
+# --- review fixes: settle edge cases and PermissionRequested on stop ---
+
+
+class _SettledAtOnceWork:
+    """A `ctx.work` with one open background item whose `settled()` answers
+    True at once -- in the same loop step as the first late message."""
+
+    def __init__(self) -> None:
+        from tradewind.domain.supervision import WorkItem
+
+        self.signals: list[str] = []
+        self._open = [WorkItem("bg1", "background", "build", True)]
+
+    def open_items(self) -> list[Any]:
+        return list(self._open)
+
+    async def settled(self) -> bool:
+        return True
+
+    def __getattr__(self, name: str) -> Any:
+        def signal(*_: object) -> None:
+            self.signals.append(name)
+
+        return signal
+
+
+async def test_message_read_in_the_settling_step_is_still_mirrored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If `settled()` and the next engine message finish in the same step,
+    the message is still reported and mirrored before the terminal."""
+    from claude_agent_sdk import AssistantMessage, TextBlock
+
+    class _ImmediateClient:
+        def __init__(self, _options: object) -> None:
+            pass
+
+        async def connect(self, _prompt: str) -> None:
+            pass
+
+        async def receive_response(self) -> Any:
+            yield _success_result(result="started")
+
+        async def receive_messages(self) -> Any:
+            yield AssistantMessage(content=[TextBlock(text="late text")], model="m", uuid="late")
+            await anyio.sleep_forever()
+
+        async def disconnect(self) -> None:
+            pass
+
+    monkeypatch.setattr(claude_backend_module, "ClaudeSDKClient", _ImmediateClient)
+    ctx = _make_ctx(output_schema=None)
+    work = _SettledAtOnceWork()
+    ctx.work = cast(Any, work)
+
+    events = await _collect_bounded(ClaudeBackend(_profile(), NativeStoreConfig()).run(ctx))
+
+    texts = [e.message.content.get("text") for e in events if isinstance(e, ItemCompleted)]
+    assert texts == ["late text"]
+    assert isinstance(events[-1], TurnCompleted)
+
+
+async def test_policy_stop_reports_the_stopped_call_as_a_denial() -> None:
+    """FR-4.1, as on Codex's shim path: a stopped call is reported as a
+    deny `PermissionRequested` naming the reason."""
+    from claude_agent_sdk import PermissionResultDeny, ToolPermissionContext
+
+    from tradewind.adapters.claude_backend import _make_can_use_tool
+
+    pending: list[object] = []
+    stop_reason: list[str | None] = [None]
+    policy = _policy(_NoBroker(), caller=[_caller_rule("drop_db", "stop", "dangerous")])
+    can_use_tool = _make_can_use_tool(policy, cast(Any, pending), [False], stop_reason)
+
+    result = await can_use_tool(
+        "mcp__tradewind__drop_db", {"t": "x"}, ToolPermissionContext(tool_use_id="t1")
+    )
+
+    assert isinstance(result, PermissionResultDeny)
+    assert result.interrupt is True
+    assert stop_reason == ["dangerous"]
+    [event] = pending
+    assert isinstance(event, PermissionRequested)
+    assert (event.tool_name, event.verdict, event.reason) == ("drop_db", "deny", "dangerous")
+
+
+def _open_tool_then(result: ResultMessage, *, background: bool = False) -> list[object]:
+    from claude_agent_sdk import AssistantMessage, TaskStartedMessage, ToolUseBlock
+
+    script: list[object] = [
+        AssistantMessage(
+            content=[ToolUseBlock(id="t1", name="mcp__tradewind__x", input={})],
+            model="m",
+            uuid="a1",
+        )
+    ]
+    if background:
+        script.append(
+            TaskStartedMessage(
+                subtype="task_started",
+                data={},
+                task_id="bg1",
+                description="build",
+                uuid="u1",
+                session_id="s",
+            )
+        )
+    return [*script, result]
+
+
+@pytest.mark.parametrize("background", [False, True])
+async def test_error_result_fails_at_once_whatever_is_open(
+    monkeypatch: pytest.MonkeyPatch, background: bool
+) -> None:
+    """A failed engine result is never held for open work: the error text
+    reaches the caller at once instead of a work-silence timeout."""
+    from tradewind.application.supervisor import WorkSupervisor
+    from tradewind.domain.supervision import Limits
+
+    failed = _success_result(subtype="error_during_execution", is_error=True, errors=["boom"])
+    _install_fake_sdk_client(monkeypatch, _open_tool_then(failed, background=background))
+    ctx = _make_ctx(output_schema=None)
+    ctx.broker = cast(Any, _AllowBroker())
+    ctx.work = WorkSupervisor(Limits(300.0, 1800.0, None))  # never run: settle would hang
+
+    events = await _collect_bounded(ClaudeBackend(_profile(), NativeStoreConfig()).run(ctx))
+
+    assert isinstance(events[-1], TurnFailed)
+    assert events[-1].error == "boom"
+
+
+async def test_open_plain_tool_item_does_not_hold_the_terminal(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only background or subagent work holds a finished turn (05 §3.3); a
+    tool item the engine left open does not."""
+    from tradewind.application.supervisor import WorkSupervisor
+    from tradewind.domain.supervision import Limits
+
+    _install_fake_sdk_client(monkeypatch, _open_tool_then(_success_result()))
+    ctx = _make_ctx(output_schema=None)
+    ctx.broker = cast(Any, _AllowBroker())
+    ctx.work = WorkSupervisor(Limits(300.0, 1800.0, None))  # never run: settle would hang
+
+    events = await _collect_bounded(ClaudeBackend(_profile(), NativeStoreConfig()).run(ctx))
+
+    assert isinstance(events[-1], TurnCompleted)
+
+
+# --- process report seam (05 §3.4) ---
+
+
+def _install_engine_client(
+    monkeypatch: pytest.MonkeyPatch, order: list[str], *, transport: object
+) -> None:
+    """A fake `ClaudeSDKClient` whose transport holds the CLI process the
+    way the SDK does (`client._transport._process.pid`)."""
+
+    class _EngineClient:
+        def __init__(self, _options: object) -> None:
+            self._transport = transport
+
+        async def connect(self, _prompt: str) -> None:
+            order.append("connect")
+
+        async def receive_response(self) -> Any:
+            yield _success_result()
+
+        async def disconnect(self) -> None:
+            order.append("disconnect")
+
+    monkeypatch.setattr(claude_backend_module, "ClaudeSDKClient", _EngineClient)
+
+
+async def test_run_reports_the_cli_pid_and_snapshots_before_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    process = SimpleNamespace(pid=4242)
+    _install_engine_client(monkeypatch, order, transport=SimpleNamespace(_process=process))
+    ctx = _make_ctx(output_schema=None)
+    ctx.engine_started = lambda pid: order.append(f"started {pid}")
+    ctx.engine_closing = lambda: order.append("closing")
+
+    [event async for event in ClaudeBackend(_profile(), NativeStoreConfig()).run(ctx)]
+
+    assert order == ["connect", "started 4242", "closing", "disconnect"]
+
+
+async def test_run_without_the_sdk_attribute_warns_and_reports_no_pid(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    order: list[str] = []
+    _install_engine_client(monkeypatch, order, transport=SimpleNamespace())
+    ctx = _make_ctx(output_schema=None)
+    ctx.engine_started = lambda pid: order.append(f"started {pid}")
+
+    with caplog.at_level(logging.WARNING):
+        events = [e async for e in ClaudeBackend(_profile(), NativeStoreConfig()).run(ctx)]
+
+    assert isinstance(events[-1], TurnCompleted)
+    assert not any(step.startswith("started") for step in order)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("process report unavailable: claude SDK has no" in w for w in warnings)
+
+
+def test_installed_sdk_keeps_the_cli_process_where_the_adapter_reads_it() -> None:
+    """Pins the private attributes `_engine_pid` reads: an SDK upgrade that
+    moves them fails here, not silently in production."""
+    import inspect
+
+    from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+    from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+
+    options = ClaudeAgentOptions()
+    assert hasattr(ClaudeSDKClient(options), "_transport")
+    assert "self._transport = SubprocessCLITransport(" in inspect.getsource(ClaudeSDKClient)
+    assert hasattr(SubprocessCLITransport(prompt="", options=options), "_process")
+    assert "self._process = await anyio.open_process(" in inspect.getsource(SubprocessCLITransport)

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "tradewind"
-version = "0.11.2"
+version = "0.12.0"
 description = "Agent infrastructure and policy execution engine"
 requires-python = ">=3.12"
 dependencies = [
@@ -17,6 +17,7 @@ dependencies = [
     "openai-codex==0.147.0",
     "cursor-sdk==1.0.30",
     "yoyo-migrations==9.0.0",
+    "jsonschema>=4.26,<5",
 ]
 
 [dependency-groups]
@@ -94,6 +95,16 @@ module = "yoyo.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+# `jsonschema` (05-turn-governance §6, owner-approved runtime dependency)
+# ships no py.typed marker; its stubs are a separate package, which would be
+# a further unapproved dependency. Same resolution as `yoyo` above:
+# `tool_host` keeps jsonschema's types out of its own signatures (it exposes
+# a plain `Callable[[dict[str, object]], list[str]]`), so nothing Any-typed
+# leaks past that module.
+module = "jsonschema.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 # `turn_runner` gained its first direct reads of `StoredMessage.content`
 # (`dict[str, Any]` by the domain's own typing -- see the `tradewind.domain`
 # override's rationale) with FR-9.3's `_render_child_block`: rendering a
@@ -104,6 +115,14 @@ ignore_missing_imports = true
 # `disallow_any_expr`. `disallow_any_explicit` stays on: this module never
 # spells `Any` itself. Narrowed to this module only.
 module = "tradewind.application.turn_runner"
+disallow_any_expr = false
+
+[[tool.mypy.overrides]]
+# `PolicyGate` calls the public `PermissionBroker.decide(str, dict[str, Any])`
+# contract and unpacks its `BrokerDecision`; the flagged expressions are that
+# Any-typed protocol signature itself (same root cause as `turn_runner`).
+# `disallow_any_explicit` stays on. Narrowed to this module only.
+module = "tradewind.application.policy_gate"
 disallow_any_expr = false
 
 [[tool.mypy.overrides]]

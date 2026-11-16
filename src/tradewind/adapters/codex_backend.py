@@ -34,21 +34,27 @@ line -- e.g. the tool call's own `item/completed` -- until this callback
 returns), so a denial's `PermissionRequested` is always enqueued before the
 corresponding tool-result item.
 
-**Approval routing (spike §4-§5, controller ruling).** `_make_approval_handler`
-branches on the JSON-RPC method:
+**Approval routing (spike §4-§5, controller ruling; 05-turn-governance
+§2, §7).** `make_approval_handler` sends every request through
+`ctx.policy.gate()` (the broker is asked when the rules say `ask`, with
+today's names and arguments, 05 §1.1) and branches on the JSON-RPC method:
   - `item/commandExecution/requestApproval` / `item/fileChange/requestApproval`
     (Codex's own built-in shell/apply_patch tools -- left enabled, not
     disabled the way `ClaudeBackend` disables Claude Code's built-ins,
     because the brief asks for these to be broker-*gated*, not removed):
-    broker-mapped 1:1 (`allow`->accept, `deny`->reject +
-    `PermissionRequested`).
+    a `shell` / `file_write` action; `allow`->accept, `deny`->reject +
+    `PermissionRequested`, `stop`->reject + `PermissionRequested`, then the
+    turn is interrupted and fails with the reason. A file-change request
+    carries no changes on app-server 0.147.0, so the action takes them from
+    the item's `item/started` (`ApprovalLedger`).
   - `mcpServer/elicitation/request` with
     `params["_meta"]["codex_approval_kind"] == "mcp_tool_call"` (every
     tradewind-tool call Codex makes through the stdio shim, spike §4 --
     *not* the `item/*/requestApproval` shape despite the naming symmetry
     with the two above): when `params["serverName"]` is tradewind's own
-    shim server (`_SHIM_SERVER_NAME`), auto-accept -- `ToolHost.call()`
-    itself gates authoritatively for this path (`ToolHost.__init__`'s
+    shim server (`_SHIM_SERVER_NAME`), auto-accept as a structural
+    pass-through (05 §2.3) -- `ToolHost.call()` itself gates
+    authoritatively for this path (`ToolHost.__init__`'s
     docstring; wired in by `turn_runner.py` for this backend specifically),
     so no second broker consult is made here (see that docstring for why
     asking the same "ask"-semantics broker twice is a real, not just
@@ -59,8 +65,9 @@ branches on the JSON-RPC method:
     name is extracted via a regex on the human-readable `message` field
     (spike §4.2: not a documented, stable field -- flagged there for
     controller confirmation, carried forward here unresolved) and
-    broker-mapped; **extraction failure denies fail-closed** without
-    consulting the broker at all (nothing to ask it about).
+    gated as an `mcp` action; **extraction failure denies fail-closed**
+    without consulting the broker at all (a missing critical field, which
+    the floor denies).
   - Every other method: `{}`, matching `CodexClient`'s own
     `_default_approval_handler`'s fallback for anything it doesn't
     recognize either -- an implicit no-op/deny shape on the wire, not
@@ -88,7 +95,8 @@ calls succeeds, is what `take_native_session_id` later hands back to
 as `ClaudeBackend`, same rationale: one instance is cached and reused across
 every session on its profile).
 
-**Approval/sandbox defaults.** `ThreadStartParams`/`ThreadResumeParams` are
+**Approval/sandbox defaults.** Outside engine_auto (below),
+`ThreadStartParams`/`ThreadResumeParams` are
 always built with `approvals_reviewer=ApprovalsReviewer.user` (the only
 setting that reaches this adapter's own `approval_handler` at all -- spike
 §2, not optional) and `approval_policy=on-request` (the exact combo verified
@@ -115,6 +123,21 @@ rather than inventing a second one -- an explicit `backend_options["sandbox"]`
 always wins over either default, broker configured or not. See README.md's
 "Security defaults" section for the caller-facing summary and
 `docs/RUNBOOK.md` for more detail.
+
+**Engine auto (05 §2.5).** `permission_mode="engine_auto"` uses Codex's own
+auto-reviewer, `approvals_reviewer=ApprovalsReviewer.auto_review` (the value
+the SDK's `ApprovalMode.auto_review` maps to, `openai_codex/_approval_mode.py`),
+with the workspace-write sandbox (`_thread_settings`); requests that still
+reach this client go through the gate.
+
+**Observe and work signals (05 §2.1, §3, §7).** A completed command or file
+change that had no approval request is observed (record, or an after-the-
+fact stop); `item/started` never is. `report_work` maps items, output and
+progress, auto-review notices, terminal input and model deltas onto
+`ctx.work`; none of it becomes an event. **Process report (05 §3.4): not
+done here** -- the `codex app-server` subprocess is held only in
+`CodexClient._proc` (private; `openai_codex/client.py`), so its PID is not
+reachable through a public API.
 
 **Event mapping** (`thread_item_to_messages`, pure functions, tested in
 `tests/unit/test_codex_mapping.py` against hand-built SDK dataclasses):
@@ -151,6 +174,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import queue
 import re
 import threading
@@ -163,23 +187,33 @@ import anyio
 from openai_codex.api import TurnHandle
 from openai_codex.client import ApprovalHandler, CodexClient, CodexConfig
 from openai_codex.generated.v2_all import (
+    AgentMessageDeltaNotification,
     AgentMessageThreadItem,
     ApprovalsReviewer,
     AskForApproval,
     AskForApprovalValue,
+    CommandExecutionOutputDeltaNotification,
     CommandExecutionThreadItem,
     ContextCompactedNotification,
     DynamicToolCallStatus,
     DynamicToolCallThreadItem,
     FileChangeThreadItem,
+    FileUpdateChange,
     InputTextDynamicToolCallOutputContentItem,
     ItemCompletedNotification,
+    ItemGuardianApprovalReviewCompletedNotification,
+    ItemGuardianApprovalReviewStartedNotification,
+    ItemStartedNotification,
+    McpToolCallProgressNotification,
     McpToolCallStatus,
     McpToolCallThreadItem,
     MessagePhase,
     ReasoningEffort,
+    ReasoningSummaryTextDeltaNotification,
+    ReasoningTextDeltaNotification,
     ReasoningThreadItem,
     SandboxMode,
+    TerminalInteractionNotification,
     TextUserInput,
     ThreadItem,
     ThreadReadResponse,
@@ -197,7 +231,9 @@ from openai_codex.generated.v2_all import (
 from openai_codex.models import JsonObject, Notification
 
 from tradewind.application.config import NativeStoreConfig
+from tradewind.application.policy_gate import GateDecision, PolicyGate, caller_tool_source
 from tradewind.application.ports import Backend, TurnContext
+from tradewind.application.supervisor import WorkSupervisor
 from tradewind.domain.compaction import compose_replay_prompt
 from tradewind.domain.errors import ConfigError, Unsupported
 from tradewind.domain.events import (
@@ -215,17 +251,15 @@ from tradewind.domain.models import (
     McpServerDef,
     ModelSpec,
     NormalizedMessage,
-    PermissionBroker,
     Profile,
     SessionRow,
     TurnResult,
-    Verdict,
     calculate_cost,
     engine_compaction_record,
-    normalize_decision,
     resume_degraded_notice,
     retry_notice,
 )
+from tradewind.domain.policy import Action, TurnVars, floor_tradewind
 
 _logger = logging.getLogger(__name__)
 
@@ -631,7 +665,7 @@ def mcp_server_config_overrides(server: McpServerDef) -> tuple[str, ...]:
     return tuple(overrides)
 
 
-# --- approval handler: JSON-RPC server-request -> broker verdict --------
+# --- approval handler: JSON-RPC server-request -> policy gate ----------
 
 
 def _extract_tool_name(params: JsonObject) -> str | None:
@@ -642,52 +676,267 @@ def _extract_tool_name(params: JsonObject) -> str | None:
     return match.group(1) if match else None
 
 
-def _decide(
-    broker: PermissionBroker,
+# --- turn governance: engine messages -> actions and work signals -------
+# (05-turn-governance §1, §7 Codex row). Pure mapping; the decisions are the
+# policy gate's.
+
+
+def _in_workspace(path: str, workspace: str | None) -> bool:
+    """Whether a patch path is inside `workspace` -- a security field (05
+    §1): a relative path is joined to `workspace` (the thread's cwd) and
+    `..` is resolved lexically (symlinks are not followed), then one
+    `commonpath` check applies to relative and absolute paths alike. An
+    unknown workspace gives False, the narrower answer."""
+    if workspace is None:
+        return False
+    root = os.path.normpath(workspace)
+    target = os.path.normpath(os.path.join(root, path))
+    return os.path.commonpath([root, target]) == root
+
+
+def shell_action(params: JsonObject) -> Action:
+    """`item/commandExecution/requestApproval` params -> a `shell` action
+    (critical field `command`). `sandboxed` is not reported by the request,
+    so it stays `None`."""
+    command = params.get("command")
+    return Action(
+        kind="shell",
+        fields={
+            "command": command,
+            "cwd": params.get("cwd"),
+            "sandboxed": None,
+            "interactive": False,
+        },
+        backend="codex",
+        native_name="shell",
+        native_args=dict(params),
+        summary=command if isinstance(command, str) else "",
+        missing_critical_field=not isinstance(command, str),
+    )
+
+
+def file_write_action(
+    changes: list[FileUpdateChange] | None,
+    *,
+    workspace: str | None,
+    native_args: dict[str, object],
+) -> Action:
+    """A Codex patch -> a `file_write` action: one `{path, change,
+    in_workspace}` per changed file. `changes=None` (not known) marks the
+    critical field missing, which the floor denies (owner M8)."""
+    fields_changes = [
+        {
+            "path": change.path,
+            "change": change.kind.root.type,
+            "in_workspace": _in_workspace(change.path, workspace),
+        }
+        for change in changes or []
+    ]
+    return Action(
+        kind="file_write",
+        fields={"changes": fields_changes},
+        backend="codex",
+        native_name="apply_patch",
+        native_args=native_args,
+        summary=", ".join(str(c["path"]) for c in fields_changes),
+        missing_critical_field=changes is None,
+    )
+
+
+def mcp_action(server: object, tool: str | None, args: dict[str, object]) -> Action:
+    """An MCP call to a server the engine connects to itself -> an `mcp`
+    action; an unreadable tool name marks the critical field missing
+    (today's fail-closed rule, now the floor's)."""
+    return Action(
+        kind="mcp",
+        fields={"server": server, "tool": tool, "args": args},
+        backend="codex",
+        native_name=tool or _UNKNOWN_TOOL_NAME,
+        native_args=args,
+        summary=f"{server}:{tool}",
+        missing_critical_field=tool is None or not isinstance(server, str),
+    )
+
+
+def observed_action(item: ThreadItem, *, workspace: str | None) -> Action | None:
+    """The action of a completed command or file-change item, for
+    `observe` (05 §7); `None` for every other item kind."""
+    root = item.root
+    if isinstance(root, CommandExecutionThreadItem):
+        return shell_action({"command": root.command, "cwd": root.cwd.root})
+    if isinstance(root, FileChangeThreadItem):
+        return file_write_action(
+            root.changes,
+            workspace=workspace,
+            native_args={"changes": [c.model_dump(mode="json") for c in root.changes]},
+        )
+    return None
+
+
+def report_work(work: WorkSupervisor, payload: object) -> None:
+    """Map one notification payload onto work signals (05 §7, Codex row).
+    Signals only -- nothing here becomes an event or a mirror item.
+
+    - `item/started` / `item/completed` -> `started(id, "tool")` / `ended`,
+      except agent-message and reasoning items (model output: `model_active`)
+      and the user's own message (nothing);
+    - command output, terminal input, MCP progress and auto-review notices ->
+      `active` (an auto review names its target item, else its review id);
+    - agent-message and reasoning deltas -> `model_active`;
+    - `turn/completed` -> `engine_done`.
+    """
+    if isinstance(payload, ItemStartedNotification | ItemCompletedNotification):
+        root = payload.item.root
+        if isinstance(root, AgentMessageThreadItem | ReasoningThreadItem):
+            work.model_active()
+        elif isinstance(root, UserMessageThreadItem):
+            return
+        elif isinstance(payload, ItemStartedNotification):
+            work.started(root.id, "tool", root.type)
+        else:
+            work.ended(root.id)
+    elif isinstance(
+        payload,
+        CommandExecutionOutputDeltaNotification
+        | TerminalInteractionNotification
+        | McpToolCallProgressNotification,
+    ):
+        work.active(payload.item_id)
+    elif isinstance(
+        payload,
+        ItemGuardianApprovalReviewStartedNotification
+        | ItemGuardianApprovalReviewCompletedNotification,
+    ):
+        work.active(payload.target_item_id or payload.review_id)
+    elif isinstance(
+        payload,
+        AgentMessageDeltaNotification
+        | ReasoningTextDeltaNotification
+        | ReasoningSummaryTextDeltaNotification,
+    ):
+        work.model_active()
+    elif isinstance(payload, TurnCompletedNotification):
+        work.engine_done()
+
+
+class ApprovalLedger:
+    """What the approval handler (on `CodexClient`'s reader thread) and the
+    turn's stream (worker thread, then the event loop) share about items.
+
+    - Which items had an approval request: `_consume` observes only a
+      completed command or file change that had none (05 §2.1).
+    - The changes of each file-change item, from its `item/started`:
+      app-server 0.147.0's `FileChangeRequestApprovalParams` carries only
+      ids, a reason and `grant_root` (app-server-protocol
+      `v2/item.rs:1521-1535`), while core emits the item's start, with its
+      changes, before it asks (core `tools/handlers/apply_patch.rs:553`, then
+      the orchestrator). The request is read after that start notification,
+      but the worker thread may not have pulled the start yet, so
+      `started_changes` waits for it up to `wait_s`.
+
+    Thread-safe: every method takes the one lock.
+    """
+
+    def __init__(self, wait_s: float = 2.0) -> None:
+        self._wait_s = wait_s
+        self._lock = threading.Condition()
+        self._requested: set[str] = set()
+        self._changes: dict[str, list[FileUpdateChange]] = {}
+
+    def record_started(self, item: ThreadItem) -> None:
+        root = item.root
+        if isinstance(root, FileChangeThreadItem):
+            with self._lock:
+                self._changes[root.id] = list(root.changes)
+                self._lock.notify_all()
+
+    def mark_requested(self, item_id: object) -> None:
+        if isinstance(item_id, str):
+            with self._lock:
+                self._requested.add(item_id)
+
+    def was_requested(self, item_id: str) -> bool:
+        with self._lock:
+            return item_id in self._requested
+
+    def started_changes(self, item_id: object) -> list[FileUpdateChange] | None:
+        """The item's changes, waiting up to `wait_s` for its start; `None`
+        when it does not arrive in time."""
+        if not isinstance(item_id, str):
+            return None
+        with self._lock:
+            self._lock.wait_for(lambda: item_id in self._changes, timeout=self._wait_s)
+            return self._changes.get(item_id)
+
+
+def _gate_sync(
+    policy: PolicyGate,
     loop: asyncio.AbstractEventLoop,
-    tool_name: str,
-    tool_input: dict[str, object],
-) -> tuple[Verdict, str | None, bool]:
+    action: Action,
+    broker_name: str,
+    broker_args: dict[str, object],
+    *,
+    pass_through: bool = False,
+) -> GateDecision:
     """Bridge the sync `approval_handler` callback (running on `CodexClient`'s
-    own reader thread) into `broker.decide()` (an `async def`) via
-    `run_coroutine_threadsafe` against the loop captured before the client
-    started (spike §1) -- blocks this (non-loop) thread until the broker
-    decides, exactly mirroring `PermissionBroker.decide`'s own "ask"
+    own reader thread) into `policy.gate()` (an `async def`, which may ask the
+    broker) via `run_coroutine_threadsafe` against the loop captured before
+    the client started (spike §1) -- blocks this (non-loop) thread until the
+    gate decides, exactly mirroring `PermissionBroker.decide`'s own "ask"
     semantics contract."""
     future = asyncio.run_coroutine_threadsafe(
-        broker.decide(tool_name, cast("dict[str, Any]", tool_input)), loop
+        policy.gate(
+            action, broker_name=broker_name, broker_args=broker_args, pass_through=pass_through
+        ),
+        loop,
     )
-    return normalize_decision(future.result())
+    return future.result()
 
 
-def _decide_exec_or_patch(
-    broker: PermissionBroker,
-    loop: asyncio.AbstractEventLoop,
+def _queue_refusal(
+    decision: GateDecision,
+    out_queue: queue.Queue[object],
+    tool_name: str,
+    tool_input: dict[str, object],
+) -> None:
+    """A deny or stop: `PermissionRequested` (FR-4.1, also on stop, as the
+    Claude adapter does), then the stop or the FR-4.4 terminate request."""
+    out_queue.put(
+        PermissionRequested(
+            tool_name=tool_name,
+            tool_input=cast("dict[str, Any]", tool_input),
+            verdict="deny",
+            # FR-4.4: codex's approval protocol has NO reason channel
+            # (supports_deny_reason=False) -- recorded here and in the
+            # mirror; the model sees only the engine's own denial.
+            reason=decision.reason,
+        )
+    )
+    if decision.outcome == "stop":
+        out_queue.put(
+            _StopRequested(reason=decision.reason or f"turn stopped by policy at {tool_name!r}")
+        )
+    elif decision.terminate:
+        out_queue.put(_TerminateRequested())
+
+
+def _answer_exec_or_patch(
+    decision: GateDecision,
     out_queue: queue.Queue[object],
     tool_name: str,
     tool_input: dict[str, object],
 ) -> JsonObject:
-    verdict, reason, terminate = _decide(broker, loop, tool_name, tool_input)
-    if verdict == "deny":
-        out_queue.put(
-            PermissionRequested(
-                tool_name=tool_name,
-                tool_input=cast("dict[str, Any]", tool_input),
-                verdict="deny",
-                # FR-4.4: codex's approval protocol has NO reason channel
-                # (supports_deny_reason=False) -- recorded here and in the
-                # mirror; the model sees only the engine's own denial.
-                reason=reason,
-            )
-        )
-        if terminate:
-            out_queue.put(_TerminateRequested())
-        return {"decision": "reject"}
-    return {"decision": "accept"}
+    """05 §2.6: allow -> the one-time `accept`; deny and stop -> `reject`
+    (verified live to prevent the action, spike §3), a stop then interrupts
+    the turn. Never `acceptWithExecpolicyAmendment` (it persists)."""
+    if decision.outcome == "allow":
+        return {"decision": "accept"}
+    _queue_refusal(decision, out_queue, tool_name, tool_input)
+    return {"decision": "reject"}
 
 
 def _decide_mcp_elicitation(
-    broker: PermissionBroker,
+    policy: PolicyGate,
     loop: asyncio.AbstractEventLoop,
     out_queue: queue.Queue[object],
     params: JsonObject,
@@ -701,63 +950,77 @@ def _decide_mcp_elicitation(
         return {}
     server_name = params.get("serverName")
     tool_input = cast("dict[str, object]", meta_dict.get("tool_params", {}))
-    if server_name == _SHIM_SERVER_NAME:
-        # Every tradewind-tool call Codex makes goes through this branch.
-        # `ToolHost.call()` itself gates authoritatively for this path
-        # (`ToolHost.__init__`'s docstring; `turn_runner.py` wires the
-        # broker into this backend's `ToolHost` specifically) -- consulting
-        # the broker a second time here would ask an "ask"-semantics broker
-        # the same question twice, so this branch does not.
-        return {"action": "accept", "content": {}}
     bare_name = _extract_tool_name(params)
-    if bare_name is None:
-        # Fail-closed (controller ruling): can't identify which tool this
-        # is, so there is nothing to ask the broker about -- deny rather
-        # than guess.
-        out_queue.put(
-            PermissionRequested(
-                tool_name=_UNKNOWN_TOOL_NAME,
-                tool_input=cast("dict[str, Any]", tool_input),
-                verdict="deny",
-            )
+    if server_name == _SHIM_SERVER_NAME:
+        # Every tradewind-tool call Codex makes goes through this branch: a
+        # structural pass-through (05 §2.3). `ToolHost.call()` gates it once
+        # as a `caller_tool` (`turn_runner.py` hands this backend's
+        # `ToolHost` the gate as its broker) -- gating here too would ask an
+        # "ask"-semantics broker the same question twice.
+        name = bare_name or _UNKNOWN_TOOL_NAME
+        _gate_sync(
+            policy,
+            loop,
+            Action(
+                kind="caller_tool",
+                fields={"name": name, "args": tool_input, "source": caller_tool_source(name)},
+                backend="codex",
+                native_name=name,
+                native_args=tool_input,
+                summary=name,
+            ),
+            name,
+            tool_input,
+            pass_through=True,
         )
-        return {"action": "decline", "content": {}}
-    verdict, reason, terminate = _decide(broker, loop, bare_name, tool_input)
-    if verdict == "deny":
-        out_queue.put(
-            PermissionRequested(
-                tool_name=bare_name,
-                tool_input=cast("dict[str, Any]", tool_input),
-                verdict="deny",
-                reason=reason,  # recorded only; no codex reason channel (FR-4.4)
-            )
-        )
-        if terminate:
-            out_queue.put(_TerminateRequested())
-        return {"action": "decline", "content": {}}
-    return {"action": "accept", "content": {}}
+        return {"action": "accept", "content": {}}
+    # Fail-closed (controller ruling, kept): an unreadable tool name is a
+    # missing critical field, which the floor denies without asking.
+    broker_name = bare_name if bare_name is not None else _UNKNOWN_TOOL_NAME
+    decision = _gate_sync(
+        policy, loop, mcp_action(server_name, bare_name, tool_input), broker_name, tool_input
+    )
+    if decision.outcome == "allow":
+        return {"action": "accept", "content": {}}
+    _queue_refusal(decision, out_queue, broker_name, tool_input)
+    return {"action": "decline", "content": {}}
 
 
 def make_approval_handler(
-    broker: PermissionBroker,
+    policy: PolicyGate,
     loop: asyncio.AbstractEventLoop,
     out_queue: queue.Queue[object],
+    ledger: ApprovalLedger,
+    workspace: str | None = None,
 ) -> ApprovalHandler:
     """Build the sync `CodexClient(approval_handler=...)` callback (module
-    docstring's approval-routing section)."""
+    docstring's approval-routing section): every request goes through
+    `policy.gate` (05 §2.1); the broker, when the rules say `ask`, gets
+    today's `"shell"` / `"apply_patch"` names and arguments (05 §1.1)."""
 
     def handler(method: str, params: JsonObject | None) -> JsonObject:
         params_dict: JsonObject = params or {}
+        # 05 §2.6: every request's full option list is logged.
+        _logger.debug(
+            "codex approval request",
+            extra={"method": method, "available_decisions": params_dict.get("availableDecisions")},
+        )
         if method == "item/commandExecution/requestApproval":
-            return _decide_exec_or_patch(
-                broker, loop, out_queue, "shell", {"command": params_dict.get("command")}
-            )
+            ledger.mark_requested(params_dict.get("itemId"))
+            tool_input: dict[str, object] = {"command": params_dict.get("command")}
+            decision = _gate_sync(policy, loop, shell_action(params_dict), "shell", tool_input)
+            return _answer_exec_or_patch(decision, out_queue, "shell", tool_input)
         if method == "item/fileChange/requestApproval":
-            return _decide_exec_or_patch(
-                broker, loop, out_queue, "apply_patch", {"changes": params_dict.get("changes")}
+            item_id = params_dict.get("itemId")
+            ledger.mark_requested(item_id)
+            tool_input = {"changes": params_dict.get("changes")}
+            action = file_write_action(
+                ledger.started_changes(item_id), workspace=workspace, native_args=dict(params_dict)
             )
+            decision = _gate_sync(policy, loop, action, "apply_patch", tool_input)
+            return _answer_exec_or_patch(decision, out_queue, "apply_patch", tool_input)
         if method == "mcpServer/elicitation/request":
-            return _decide_mcp_elicitation(broker, loop, out_queue, params_dict)
+            return _decide_mcp_elicitation(policy, loop, out_queue, params_dict)
         return {}
 
     return handler
@@ -787,6 +1050,30 @@ def _sandbox_mode_from_options(
     default = _SAFE_DEFAULT_SANDBOX_NO_BROKER if allow_all_broker else _DEFAULT_SANDBOX
     value = backend_options.get("sandbox", default.value)
     return SandboxMode(value)
+
+
+def _thread_settings(
+    backend_options: dict[str, Any], *, allow_all_broker: bool, engine_auto: bool
+) -> tuple[SandboxMode, ApprovalsReviewer]:
+    """The thread's sandbox and approvals reviewer (05 §2.5).
+
+    `engine_auto`: Codex's own auto-reviewer -- `ApprovalsReviewer.
+    auto_review`, the value the SDK's own `ApprovalMode.auto_review` maps to
+    (`openai_codex/_approval_mode.py`, `_approval_mode_settings`) -- with the
+    workspace-write sandbox, also when no broker is set; requests that still
+    reach this client go through the gate. Otherwise `ApprovalsReviewer.user`
+    (every request reaches this adapter) and the sandbox defaults of
+    `_sandbox_mode_from_options`, unchanged. An explicit
+    `backend_options["sandbox"]` always wins."""
+    if engine_auto:
+        return (
+            SandboxMode(backend_options.get("sandbox", _DEFAULT_SANDBOX.value)),
+            ApprovalsReviewer.auto_review,
+        )
+    return (
+        _sandbox_mode_from_options(backend_options, allow_all_broker=allow_all_broker),
+        ApprovalsReviewer.user,
+    )
 
 
 def _approval_policy_value_from_options(backend_options: dict[str, Any]) -> AskForApprovalValue:
@@ -832,6 +1119,15 @@ class _TerminateRequested:
 
 
 @dataclass
+class _StopRequested:
+    """Queue payload: the policy gate's `stop` for a request (05 §2.6). The
+    action was rejected; `_consume` interrupts the turn and ends it with
+    `TurnFailed(reason)` -- never reported as a caller interrupt."""
+
+    reason: str
+
+
+@dataclass
 class _ConnectRetryNotice:
     """Queue payload from `_drive_turn`'s worker thread: one scheduled
     pre-turn connect retry (FR-6.6), mapped by `_consume` to the mirrored
@@ -853,11 +1149,13 @@ def _drive_turn(
     system_prompt: str | None,
     sandbox: SandboxMode,
     approval_policy_value: AskForApprovalValue,
+    approvals_reviewer: ApprovalsReviewer,
     out_queue: queue.Queue[object],
     record_native_id: Callable[[str], None],
     record_handle: Callable[[TurnHandle], None],
     retry_max: int,
     retry_delay_s: float,
+    ledger: ApprovalLedger,
 ) -> None:
     """Runs entirely on its own `threading.Thread` (module docstring): starts
     `client`, opens/resumes the thread, starts the turn, and pumps every
@@ -906,7 +1204,7 @@ def _drive_turn(
                         model=model,
                         sandbox=sandbox,
                         approval_policy=approval_policy,
-                        approvals_reviewer=ApprovalsReviewer.user,
+                        approvals_reviewer=approvals_reviewer,
                         base_instructions=system_prompt,
                     ),
                 )
@@ -923,7 +1221,7 @@ def _drive_turn(
                         model=model,
                         sandbox=sandbox,
                         approval_policy=approval_policy,
-                        approvals_reviewer=ApprovalsReviewer.user,
+                        approvals_reviewer=approvals_reviewer,
                         base_instructions=system_prompt,
                     )
                 )
@@ -935,7 +1233,7 @@ def _drive_turn(
                     model=model,
                     sandbox=sandbox,
                     approval_policy=approval_policy,
-                    approvals_reviewer=ApprovalsReviewer.user,
+                    approvals_reviewer=approvals_reviewer,
                     base_instructions=system_prompt,
                 )
             )
@@ -969,12 +1267,97 @@ def _drive_turn(
         handle = TurnHandle(client, thread_id, turn_started.turn.id)
         record_handle(handle)
         for notification in handle.stream():
+            if isinstance(notification.payload, ItemStartedNotification):
+                # Before the queue: the approval handler may be waiting for
+                # this item's changes (`ApprovalLedger`).
+                ledger.record_started(notification.payload.item)
             out_queue.put(notification)
     except BaseException as exc:  # forwarded across the thread boundary, never swallowed
         out_queue.put(exc)
     finally:
         client.close()
         out_queue.put(_DONE)
+
+
+def _engine_pid(client: CodexClient) -> int | None:
+    """The app-server process's PID, for the process report (05 §3.4). The
+    SDK keeps it private (`CodexClient._proc`, pinned by a unit test); when
+    it is missing, one WARNING and no report."""
+    pid = getattr(getattr(client, "_proc", None), "pid", None)
+    if not isinstance(pid, int):
+        _logger.warning("process report unavailable: codex SDK has no _proc.pid")
+        return None
+    return pid
+
+
+class _EngineReportingClient(CodexClient):
+    """A turn's `CodexClient` that reports its app-server process to the
+    runner (05 §3.4): the PID once started, and a snapshot request just
+    before it is closed. Both run on `_drive_turn`'s worker thread, where
+    blocking on `ps` is fine."""
+
+    def __init__(
+        self,
+        config: CodexConfig | None = None,
+        approval_handler: ApprovalHandler | None = None,
+        *,
+        engine_started: Callable[[int], None],
+        engine_closing: Callable[[], None],
+    ) -> None:
+        super().__init__(config=config, approval_handler=approval_handler)
+        self._engine_started = engine_started
+        self._engine_closing = engine_closing
+
+    def start(self) -> None:
+        super().start()
+        pid = _engine_pid(self)
+        if pid is not None:
+            self._engine_started(pid)
+
+    def close(self) -> None:
+        self._engine_closing()
+        super().close()
+
+
+async def _interrupt_for_stop(
+    request_interrupt: Callable[[], Awaitable[None]] | None, turn_id: str
+) -> None:
+    """Interrupt the turn for a policy stop (05 §2.6). A failed interrupt is
+    logged, not raised, so the stop reason still ends the turn as
+    `TurnFailed(reason)` (the engine may already have finished the turn)."""
+    if request_interrupt is None:
+        return
+    try:
+        await request_interrupt()
+    except Exception:
+        _logger.warning(
+            "interrupt for a policy stop failed", exc_info=True, extra={"turn_id": turn_id}
+        )
+
+
+def _direct_policy(ctx: TurnContext, out_queue: queue.Queue[object]) -> PolicyGate:
+    """The gate for a `TurnContext` built without the runner (`ctx.policy`
+    unset -- direct construction, as in unit tests): broker mode with no
+    caller or default rules, so every request asks `ctx.broker`, as before
+    turn governance (as `ClaudeBackend`'s `_direct_policy`). Its record
+    notices go through the turn's queue. The runner always sets
+    `ctx.policy`."""
+    return PolicyGate(
+        broker=ctx.broker,
+        backend="codex",
+        floor=floor_tradewind(),
+        caller=[],
+        defaults=[],
+        turn=TurnVars(
+            mode="broker",
+            engine_mode=None,
+            shim_server=None,
+            workspace=ctx.session.cwd,
+            result_tool=None,
+        ),
+        has_broker=not getattr(ctx.broker, "is_default_allow_all", False),
+        emit=out_queue.put,
+    )
 
 
 class CodexBackend(Backend):
@@ -1023,6 +1406,13 @@ class CodexBackend(Backend):
             supports_turn_retry=False,
             # FR-4.4: verified -- the approval protocol has no reason channel.
             supports_deny_reason=False,
+            # 05 §3/§7: item, delta and turn signals reach `ctx.work`, so the
+            # inactivity limits apply and there is no default hard cap.
+            supports_work_supervisor=True,
+            # 05 §2.5: Codex's own auto-reviewer; approval requests that
+            # still reach the client, and the shim, go through the gate.
+            supports_engine_auto=True,
+            supports_action_policy=True,
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -1114,7 +1504,10 @@ class CodexBackend(Backend):
         session_id = ctx.session.session_id
         out_queue: queue.Queue[object] = queue.Queue()
         loop = asyncio.get_running_loop()
-        approval_handler = make_approval_handler(ctx.broker, loop, out_queue)
+        policy = ctx.policy if ctx.policy is not None else _direct_policy(ctx, out_queue)
+        ledger = ApprovalLedger()
+        workspace = ctx.session.cwd
+        approval_handler = make_approval_handler(policy, loop, out_queue, ledger, workspace)
         try:
             shim_def = await ctx.tools.shim_server_def()
             config = CodexConfig(
@@ -1123,7 +1516,12 @@ class CodexBackend(Backend):
             )
 
             def make_client() -> CodexClient:
-                return CodexClient(config=config, approval_handler=approval_handler)
+                return _EngineReportingClient(
+                    config=config,
+                    approval_handler=approval_handler,
+                    engine_started=ctx.engine_started,
+                    engine_closing=ctx.engine_closing,
+                )
 
             backend_options = self.profile.backend_options
             # Duck-typed marker check (module docstring, item 3a) -- see
@@ -1131,7 +1529,11 @@ class CodexBackend(Backend):
             # comment for why this is `getattr`, not an `isinstance` check
             # against a class this adapter never imports.
             allow_all_broker = cast(bool, getattr(ctx.broker, "is_default_allow_all", False))
-            sandbox = _sandbox_mode_from_options(backend_options, allow_all_broker=allow_all_broker)
+            sandbox, approvals_reviewer = _thread_settings(
+                backend_options,
+                allow_all_broker=allow_all_broker,
+                engine_auto=ctx.session.options_snapshot.get("permission_mode") == "engine_auto",
+            )
             approval_policy_value = _approval_policy_value_from_options(backend_options)
             effort = _reasoning_effort(ctx.model_spec.effort)
 
@@ -1170,11 +1572,13 @@ class CodexBackend(Backend):
                     ctx.system_prompt,
                     sandbox,
                     approval_policy_value,
+                    approvals_reviewer,
                     out_queue,
                     record_native_id,
                     record_handle,
                     ctx.retry.max_attempts if ctx.retry is not None else 0,
                     ctx.retry.base_delay_s if ctx.retry is not None else 0.0,
+                    ledger,
                 ),
                 daemon=True,
             )
@@ -1204,6 +1608,10 @@ class CodexBackend(Backend):
                     _request_interrupt,
                     _build_replay_prompt,
                     has_output_schema=ctx.output_schema is not None,
+                    work=ctx.work,
+                    policy=policy,
+                    ledger=ledger,
+                    workspace=workspace,
                 ):
                     if isinstance(event, (TurnCompleted, TurnFailed)):
                         terminal_event_observed = True
@@ -1248,6 +1656,28 @@ class CodexBackend(Backend):
             # double-handle those.
             yield TurnFailed(turn_id=ctx.turn_id, error=str(exc))
 
+    @staticmethod
+    def _observe(
+        item: ThreadItem,
+        policy: PolicyGate | None,
+        ledger: ApprovalLedger | None,
+        workspace: str | None,
+    ) -> str | None:
+        """Observe a completed command or file change that had no approval
+        request (05 §2.1, §7): `item/started` comes before a possible
+        request, so only the completion is observed, and a requested item is
+        decided at the gate only. Returns the stop reason, or `None`."""
+        if policy is None or ledger is None:
+            return None
+        action = observed_action(item, workspace=workspace)
+        if action is None or ledger.was_requested(item.root.id):
+            return None
+        observation = policy.observe(action)
+        if observation.outcome == "allow":
+            return None
+        stopped = f"turn stopped by policy after {action.kind} {action.summary!r}"
+        return f"{stopped}: {observation.reason}" if observation.reason else stopped
+
     async def _consume(
         self,
         turn_id: str,
@@ -1257,16 +1687,36 @@ class CodexBackend(Backend):
         build_replay_prompt: Callable[[], Awaitable[str]] | None = None,
         *,
         has_output_schema: bool = False,
+        work: WorkSupervisor | None = None,
+        policy: PolicyGate | None = None,
+        ledger: ApprovalLedger | None = None,
+        workspace: str | None = None,
     ) -> AsyncIterator[Event]:
+        """Drain `out_queue` into events. With `work`, every notification also
+        feeds the work supervisor (`report_work`, never an event); with
+        `policy` and `ledger`, a completed command or file change that had no
+        approval request is observed (05 §2.1), and an observed `stop` -- or
+        a gate `stop` (`_StopRequested`) -- interrupts the turn and ends it
+        with `TurnFailed(reason)`. No settle wait (05 §3.3): every Codex item
+        is `tool` work that ends inside the engine's turn, so no background
+        or subagent work outlives `turn/completed`."""
         agent_messages: list[AgentMessageThreadItem] = []
         usage: ThreadTokenUsage | None = None
         broker_terminated = False
+        stop_reason: str | None = None
         while True:
             item = await anyio.to_thread.run_sync(out_queue.get)
             if item is _DONE:
                 return
-            if isinstance(item, PermissionRequested):
+            if isinstance(item, PermissionRequested | ItemCompleted):
+                # `ItemCompleted` here: a record notice of a gate built
+                # without the runner (`_direct_policy`).
                 yield item
+                continue
+            if isinstance(item, _StopRequested):
+                if stop_reason is None:
+                    stop_reason = item.reason
+                    await _interrupt_for_stop(request_interrupt, turn_id)
                 continue
             if isinstance(item, _ReplayPromptRequest):
                 # FR-6.1 reactive degrade: the worker classified the
@@ -1305,6 +1755,8 @@ class CodexBackend(Backend):
                 return
             notification = cast(Notification, item)
             payload = notification.payload
+            if work is not None:
+                report_work(work, payload)
             if isinstance(payload, ItemCompletedNotification):
                 agent = _as_agent_message(payload.item)
                 if agent is not None:
@@ -1314,6 +1766,10 @@ class CodexBackend(Backend):
                     yield permission_event
                 for message in thread_item_to_messages(payload.item):
                     yield ItemCompleted(message=message)
+                observed_stop = self._observe(payload.item, policy, ledger, workspace)
+                if observed_stop is not None and stop_reason is None:
+                    stop_reason = observed_stop
+                    await _interrupt_for_stop(request_interrupt, turn_id)
             elif isinstance(payload, ContextCompactedNotification):
                 # The engine compacted its OWN context (FR-5.8
                 # observability). Codex encrypts the summary
@@ -1326,6 +1782,12 @@ class CodexBackend(Backend):
                 usage = payload.token_usage
             elif isinstance(payload, TurnCompletedNotification):
                 turn = payload.turn
+                if stop_reason is not None:
+                    # 05 §2.6: OUR policy stop -- a failed turn naming the
+                    # reason, never a caller interrupt (even when the engine
+                    # finished before the interrupt reached it).
+                    yield TurnFailed(turn_id=turn_id, error=stop_reason)
+                    return
                 if turn.status == TurnStatus.interrupted:
                     if broker_terminated:
                         # FR-4.4: this interrupt was OUR terminate
