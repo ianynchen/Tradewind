@@ -200,6 +200,11 @@ caller-facing summary.
   start (`ApprovalLedger`, a bounded 2 s wait). The broker still gets today's
   `{"changes": params.get("changes")}`, which is `None` on 0.147.0; the real changes are in
   the `tradewind` action.
+- **Confirmed live (2026-11-15, `gpt-5.6-sol`, `read-only` sandbox).**
+  `tests/integration/test_codex_governance_live.py`: 2 passed in 32 s.
+  - A `fileChange/requestApproval` found its item's changes. The broker got a `file_write` action with `hello.txt` in
+    `changes`, and there was no `missing_critical_field` deny.
+  - A command approval reached the broker as a `shell` action.
 - **`/` prompts are not expanded** by the app-server: `turn/start` maps text input straight
   to core input (`app-server/src/request_processors/turn_processor.rs:512-516`,
   app-server-protocol `v2/turn.rs:328-336`); slash commands are a TUI feature. The prompt is
@@ -221,7 +226,7 @@ caller-facing summary.
 | Variable | Gates | Notes |
 |---|---|---|
 | `TRADEWIND_RUN_CLAUDE_INTEGRATION=1` | `tests/conformance/test_claude.py`, `tests/integration/test_claude_live.py` | Requires a real Claude Code subscription login on the machine; real, billed-by-subscription API calls (~40s for the full matrix). |
-| `TRADEWIND_RUN_CODEX_INTEGRATION=1` | `tests/conformance/test_codex.py` | Requires a real ChatGPT/Codex subscription login; spawns real `codex app-server` subprocesses (~100s for the full matrix). |
+| `TRADEWIND_RUN_CODEX_INTEGRATION=1` | `tests/conformance/test_codex.py`, `tests/integration/test_codex_governance_live.py` | Requires a real ChatGPT/Codex subscription login; spawns real `codex app-server` subprocesses (~100s for the full matrix). |
 | `TRADEWIND_RUN_LANGCHAIN_INTEGRATION=1` | `tests/conformance/test_langchain_live.py` | Real Anthropic API calls for structured output (FR-1.3): proves the forced schema-tool call is accepted with caller tools bound. Needs `ANTHROPIC_API_KEY` in the operator's environment (read only from there, never from a file); `claude-haiku-4-5`, `max_tokens=256`, 5 model calls in total. |
 | `ANTHROPIC_API_KEY` | `tests/integration/test_langchain_live.py::test_...anthropic` | Real Anthropic API key; ACTIVE — key in git-ignored `.env`, run via `scripts/live-tests.sh`; passed 2026-09-02. |
 | `GROQ_API_KEY` | `tests/integration/test_langchain_live.py::test_...groq` | Free-tier Groq key (`console.groq.com`, `ChatGroq`, `openai/gpt-oss-120b`); ACTIVE — key in git-ignored `.env`, run via `scripts/live-tests.sh`; passed 2026-09-02. |
