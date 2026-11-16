@@ -1,7 +1,9 @@
 # Component: Workspace Safety (customizations, auth environment, engine version, safety suite)
 
 Status: approved by the owner (2026-11-15), with decisions D1–D9. It was
-revised after a first-principles adversarial review. Not implemented.
+revised after a first-principles adversarial review. Implemented in
+0.13.0 (2026-11-15; ADR-0005). Live results: RUNBOOK, "Workspace safety
+suite".
 
 ## Purpose
 
@@ -86,10 +88,10 @@ scanned folder:
 
 | Backend | Pattern | Why it is flagged |
 |---|---|---|
-| Claude | `.claude/settings.json`, `.claude/settings.local.json` | hooks (run code; non-interactive mode skips hook trust); `permissions.allow` rules (the CLI then runs a tool without asking `can_use_tool`); MCP and plugin enablement |
+| Claude | `.claude/settings.json`, `.claude/settings.local.json` | hooks (run code; non-interactive mode skips hook trust; shown live on CLI 2.1.258); MCP and plugin enablement. A `permissions.allow` rule is **not** a reason: live on CLI 2.1.258 a project allow rule did not bypass `can_use_tool`. A guard test in the safety suite watches for a future CLI that does. |
 | Claude | `.claude/hooks/` (every file, recursively) | the scripts that hooks run; the bundled CLI protects this folder next to `settings.json` |
 | Claude | `.mcp.json` | project MCP servers (commands that the engine starts) |
-| Codex | `.codex/config.toml` | project config in a trusted repository: the builder confirms which project-local keys Codex 0.147.0 honors. The binary says that some are "Ignored unsupported project-local config keys". Flag only if a key that runs code or loosens the sandbox or approvals is honored. |
+| Codex | `.codex/config.toml` | project config in a trusted repository. Flagged as a fail-closed ruling (the binary does not list the honored keys). The live run then confirmed that project `mcp_servers` are honored in a trusted folder (they start commands), so the flag is needed. |
 
 These are **not flagged**, after triage:
 
@@ -202,15 +204,22 @@ Neither SDK can remove a variable:
 - Claude builds the env as `{**os.environ, …, **options.env}`.
 - Codex does `os.environ.copy()` and then `update(config.env)`.
 
-So the builder chooses and verifies the removal mechanism (see "Left to
-the builder").
+**As built:** the mechanism is an empty value (`NAME=""`) for both
+engines. Both treat an empty value as unset (Claude: truthy and `trim() ||
+void 0` checks; Codex: `read_non_empty_env_var`). A process that the engine
+starts (a hook, an MCP server, a shell command) sees `NAME=""`, not the
+variable missing. The live suite confirmed that a subscription turn
+completes with the scrub and fails without it (RUNBOOK). Evidence:
+`.superpowers/sdd/2026-11-15-workspace-safety/task-4-report.md`.
 
 ### 5. Engine version on each turn
 
 - Claude: `claude_agent_sdk._cli_version.__cli_version__`. The adapter
   uses the bundled CLI.
-- Codex: `serverInfo.version` from the app-server `initialize` reply, which
-  each turn receives already.
+- Codex: `importlib.metadata.version("openai-codex-cli-bin")`. **Ruling
+  (replaces `serverInfo.version` from the `initialize` reply):** the
+  package version is known before the engine starts, so the runner can log
+  it at turn start as required below. Both gave 0.147.0.
 - Read on each turn, with no cache (GUIDELINES §8). Logged at INFO **at
   turn start**, with the turn and session ids, so failed turns have it too.
   Also set on `TurnResult.engine_version: str | None` (`None` for LangChain
@@ -234,8 +243,10 @@ pass.
   - A project hook in `.claude/settings.json` runs on a `proceed` turn (the
     control: the marker is present). After `delete`, it does not run. This
     proves that the flagged file is really loaded.
-  - A project `permissions.allow` rule makes a caller MCP tool skip
-    `can_use_tool` (the control). This proves the flag is needed.
+  - A project `permissions.allow` rule must not make a caller MCP tool
+    skip `can_use_tool`. Live result: it does not (CLI 2.1.258), so the
+    test is a regression guard that fails if a future CLI bypasses the
+    broker.
   - The env scrub: with a deliberately invalid `ANTHROPIC_API_KEY` and no
     scrub, the turn fails or reports API-key auth (the control). With the
     scrub, the turn succeeds on the subscription.

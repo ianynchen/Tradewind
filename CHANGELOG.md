@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.13.0] - 2026-11-15
+
+### Added
+
+- Workspace safety (ADR-0005, `docs/components/06-workspace-safety.md`; FR-12, NFR-7, NFR-8):
+  - `session.scan_customizations()`, `CustomizationDecision` and the `customizations=` keyword on `run`, `stream` and `spawn`. Claude flags `.claude/settings.json`, `.claude/settings.local.json`, `.claude/hooks/**` and `.mcp.json`; Codex flags `.codex/config.toml`. Cursor's `.cursor/` is not checked.
+  - `TradewindConfig.customization_backup_dir` (where `delete` backs files up; required for `delete`).
+  - `TurnResult.engine_version`.
+  - `Backend.customization_patterns()`, `Backend.auth_env_vars()` and `Backend.engine_version()`.
+  - The `tests/safety/` suite (`TRADEWIND_RUN_SAFETY=1`), run on demand only.
+
+### Changed
+
+- On Claude and Codex, a turn in a folder with flagged files now raises `ConfigError` unless the caller passes a matching `CustomizationDecision` (a behaviour change for existing callers).
+- Subscription profiles get the auth variables blanked (set to the empty value) in the engine environment, so a process the engine starts sees `NAME=""`. API-key profiles are unchanged.
+- A backend-factory error now raises before a turn row is created.
+
+### Moved
+
+- `tests/integration/test_codex_governance_live.py` is now `tests/safety/test_codex_safety.py` (gate `TRADEWIND_RUN_SAFETY=1`, not `TRADEWIND_RUN_CODEX_INTEGRATION=1`).
+
 ## [0.12.0] - 2026-11-15
 
 ### Changed

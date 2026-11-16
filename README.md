@@ -516,6 +516,60 @@ none of this, and `policy_rules` or `permission_mode` raise `Unsupported` there.
 observe sees only completed commands that had no approval request, so write narrow `shell` /
 `file_write` rules.
 
+## Workspace safety — scan and decide
+
+Design: `docs/components/06-workspace-safety.md`, decision: `docs/adr/0005-workspace-safety.md`.
+
+A repository can carry agent configuration that the engine loads and that runs code
+or loosens permissions with no broker question (for example a pull request branch
+that adds a `.claude/settings.json` hook). On `claude` and `codex`, a turn in a folder
+with such files raises `ConfigError` unless the caller passes a decision.
+
+- **Flagged files.** Claude: `.claude/settings.json`, `.claude/settings.local.json`,
+  `.claude/hooks/` (every file), `.mcp.json`. Codex: `.codex/config.toml`. The scan covers
+  the session's working folder, the repository root (a `.git` file or folder) and every
+  folder between. Instruction files (`CLAUDE.md`, `AGENTS.md`) are text and are not flagged.
+  `langchain` loads no workspace files. **`cursor` loads `.cursor/` configuration and
+  Tradewind does not check it.**
+- **Decision.** `CustomizationDecision(action, fingerprint)`, with `action` one of `"stop"`
+  (raise), `"delete"` (back up to `TradewindConfig.customization_backup_dir`, then delete the
+  scanned files; the turn runs) or `"proceed"` (load the files; a notice is emitted). It is a
+  keyword of `run`, `stream` and `spawn` and is never stored by Tradewind. If the files
+  changed since the scan, the turn raises `ConfigError("customizations changed since the scan")`.
+- **`proceed` trusts the checkout, not only the flagged files.** The fingerprint covers the
+  flagged files. A flagged file can point to others (an MCP command `node scripts/server.js`),
+  and Tradewind does not parse command lines. Key your stored decision on the git commit (or
+  tree) as well as the fingerprint.
+
+A Meridian-style flow. The caller stores decisions, keyed on the commit and the fingerprint:
+
+```python
+from tradewind import CustomizationDecision
+
+scan = session.scan_customizations()
+if scan.files:
+    key = (git_head_commit(workdir), scan.fingerprint)
+    action = decisions.get(key)                      # the caller's own store
+    if action is None:
+        action = await ask_human(                    # show scan.files (path, kind, sha256)
+            [f.path for f in scan.files], choices=["stop", "delete", "proceed"]
+        )
+        decisions.put(key, action)
+    result = await session.run(
+        "Review this change.",
+        customizations=CustomizationDecision(action, scan.fingerprint),
+    )
+else:
+    result = await session.run("Review this change.")
+```
+
+With a subscription profile, the engine process also gets the auth variables blanked
+(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and the other names each backend declares), so a
+variable in the environment cannot switch the turn to an API key. Each turn also records
+the engine version: `TurnResult.engine_version` (`None` on `langchain` and `cursor`).
+Run one checkout per concurrent session. An on-demand live suite checks the engine facts
+after an upgrade (`TRADEWIND_RUN_SAFETY=1`, see `docs/RUNBOOK.md`).
+
 ## Resume & recovery
 
 Resume is three-valued (`NATIVE → REPLAY → FRESH`) and never loses the conversation:
@@ -615,6 +669,7 @@ None of these are read by the library itself — only by the test suite, and onl
 |---|---|
 | `TRADEWIND_RUN_CLAUDE_INTEGRATION=1` | Live conformance + smoke tests against a real Claude Code subscription. |
 | `TRADEWIND_RUN_CODEX_INTEGRATION=1` | Live conformance against a real Codex/ChatGPT subscription. |
+| `TRADEWIND_RUN_SAFETY=1` | The on-demand live safety suite (`tests/safety/`, real Claude and Codex subscription calls). Run it after an engine upgrade. |
 | `ANTHROPIC_API_KEY` | Live langchain tests against the real Anthropic API. |
 | `GROQ_API_KEY` | Live langchain tests against the free-tier Groq API (`ChatGroq`). |
 | `ANTHROPIC_API_KEY` (same var) | Also gates the Phase-2c live compaction validation (`tests/integration/test_compaction_live.py`): a long real session that must compact twice and recall a summarized-away fact. |
