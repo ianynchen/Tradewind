@@ -2638,6 +2638,10 @@ class _RecordingNoticeBackend(_ToolCallingBackend):
         super().__init__(profile, native_config, "my_tool", {})
         self._terminal = terminal
 
+    def capabilities(self) -> Capabilities:
+        # It puts its action through `ctx.policy`, so caller rules apply.
+        return super().capabilities().model_copy(update={"supports_action_policy": True})
+
     def _notice(self, ctx: TurnContext) -> None:
         assert ctx.policy is not None
         ctx.policy.observe(

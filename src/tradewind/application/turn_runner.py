@@ -58,7 +58,7 @@ from tradewind.domain.models import (
     Verdict,
     timeout_notice,
 )
-from tradewind.domain.policy import TurnVars, floor_tradewind
+from tradewind.domain.policy import Rule, TurnVars, floor_tradewind
 from tradewind.domain.supervision import Limits
 
 _logger = logging.getLogger(__name__)
@@ -439,6 +439,38 @@ def _emulate_system_prompt(
     return _fold_system_prompt(system_prompt, prompt)
 
 
+def _stored_governance(snapshot: dict[str, object]) -> tuple[str | None, list[Rule]]:
+    """The session's `permission_mode` and caller `policy_rules`, read from
+    its stored options snapshot (`SessionOptions.snapshot()`)."""
+    mode = cast("str | None", snapshot.get("permission_mode"))
+    rules = cast("list[dict[str, object]]", snapshot.get("policy_rules") or [])
+    return mode, [Rule.from_dict(rule) for rule in rules]
+
+
+def _check_governance_support(
+    backend: Backend, permission_mode: str | None, policy_rules: list[Rule]
+) -> None:
+    """Refuse, before `prepare_turn` and `TurnStarted`, a policy setting the
+    backend's flags deny (05 §2.5, §2.7). Adapters keep their own checks as
+    defence in depth.
+
+    Failure modes:
+        Unsupported: `permission_mode="engine_auto"` without
+            `supports_engine_auto`; or `permission_mode` or `policy_rules`
+            set without `supports_action_policy`.
+    """
+    caps = backend.capabilities()
+    if not caps.supports_action_policy and (permission_mode is not None or policy_rules):
+        raise Unsupported(
+            f"policy_rules and permission_mode are not supported on backend {backend.name!r}: "
+            "it cannot put tool calls through the policy gate"
+        )
+    if permission_mode == "engine_auto" and not caps.supports_engine_auto:
+        raise Unsupported(
+            f'permission_mode="engine_auto" is not supported on backend {backend.name!r}'
+        )
+
+
 class TurnRunner:
     """Orchestrates one turn per `execute()` call (see module docstring)."""
 
@@ -581,6 +613,12 @@ class TurnRunner:
         # the next `sweep_stale_turns` (session open).
         try:
             backend = self._resolve_backend(session_row.profile, profile)
+            # 05 §2: the stored snapshot is the source of truth for the
+            # session's policy (a bare `resume()` passes empty live options;
+            # `resume(options=...)` rewrites the snapshot), as it is for
+            # the adapters that read it.
+            permission_mode, policy_rules = _stored_governance(snapshot)
+            _check_governance_support(backend, permission_mode, policy_rules)
             # FR-6.1 resume routing (Phase 4, closes P-7): probe only where
             # it is real and cheap (claude's local-jsonl existence check;
             # other backends return truthy-id probes), then let the planner
@@ -670,10 +708,10 @@ class TurnRunner:
             gate = PolicyGate(
                 broker=broker,
                 floor=[*floor_tradewind(), *backend.floor_rules()],
-                caller=options.policy_rules,
+                caller=policy_rules,
                 defaults=backend.default_rules(),
                 turn=TurnVars(
-                    mode="engine_auto" if options.permission_mode == "engine_auto" else "broker",
+                    mode="engine_auto" if permission_mode == "engine_auto" else "broker",
                     engine_mode=None,
                     shim_server=None,
                     workspace=str(options.cwd) if options.cwd is not None else None,

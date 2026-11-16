@@ -25,7 +25,7 @@ from pydantic import SecretStr
 
 from tradewind import Tradewind
 from tradewind.application.config import NativeStoreConfig, TradewindConfig
-from tradewind.domain.errors import ConfigError
+from tradewind.domain.errors import ConfigError, Unsupported
 from tradewind.domain.events import (
     Event,
     ItemCompleted,
@@ -318,7 +318,8 @@ async def test_result_tool_via_the_shim_records_the_last_valid_result(tmp_path: 
     result = await session.run("go")
 
     assert fake.result_replies[1:] == ["Result recorded.", "Result recorded.", "No more attempts."]
-    assert fake.result_replies[0] not in ("Result recorded.", "No more attempts.")
+    # The invalid call is answered with the schema error itself.
+    assert fake.result_replies[0] == "1 is not of type 'string'"
     assert result.structured_output == {"answer": "second"}
     # A structural pass-through: the broker is never asked.
     assert broker.calls == []
@@ -329,3 +330,87 @@ async def test_result_tool_via_the_shim_records_the_last_valid_result(tmp_path: 
         ).fetchone()
     )
     assert json.loads(row[0]) == {"answer": "second"}
+
+
+# --- the stored snapshot is the source of truth; one capability check ----
+
+
+async def test_a_bare_resume_keeps_the_stored_caller_rules(tmp_path: Path) -> None:
+    read = action("file_read", path="a.txt", in_workspace=True)
+    tw, fake = _tradewind(tmp_path, [Request(read)])
+    deny = Rule(id="caller.no-read", kind="file_read", where={}, outcome="deny")
+    await tw.create(_ID, SessionOptions(policy_rules=[deny]))
+
+    resumed = await tw.resume(_ID)
+    await resumed.run("go")
+
+    assert fake.decisions == [("file_read", "deny")]
+
+
+async def test_a_bare_resume_keeps_the_stored_permission_mode(tmp_path: Path) -> None:
+    shell = action("shell", command="ls", sandboxed=True)
+    tw, fake = _tradewind(tmp_path, [Request(shell)])
+    # Matches only in engine_auto mode, so the deny proves the stored mode
+    # reached the gate.
+    auto_only = Rule(
+        id="caller.auto-no-shell",
+        kind="shell",
+        where={},
+        outcome="deny",
+        modes=frozenset({"engine_auto"}),
+    )
+    await tw.create(_ID, SessionOptions(permission_mode="engine_auto", policy_rules=[auto_only]))
+
+    resumed = await tw.resume(_ID)
+    await resumed.run("go")
+
+    assert fake.decisions == [("shell", "deny")]
+
+
+@pytest.mark.parametrize(
+    ("flags", "options", "match"),
+    [
+        (
+            {"engine_auto": False},
+            SessionOptions(permission_mode="engine_auto"),
+            "engine_auto",
+        ),
+        (
+            {"action_policy": False},
+            SessionOptions(permission_mode="broker"),
+            "permission_mode",
+        ),
+        (
+            {"action_policy": False},
+            SessionOptions(policy_rules=[Rule(id="r", kind="shell", where={}, outcome="deny")]),
+            "policy_rules",
+        ),
+    ],
+)
+async def test_the_runner_refuses_governance_the_backend_cannot_honor(
+    tmp_path: Path, flags: dict[str, bool], options: SessionOptions, match: str
+) -> None:
+    tw, fake = _tradewind(tmp_path, [Say("ok")], **flags)
+    session = await tw.create(_ID, options)
+
+    events: list[Event] = []
+    with pytest.raises(Unsupported, match=match):
+        async for event in session.stream("go"):
+            events.append(event)
+
+    assert events == []
+    assert fake.calls == []
+    conn = cast(Any, tw._store)._conn
+    rows = await anyio.to_thread.run_sync(
+        lambda: conn.execute("SELECT status FROM turns WHERE session_id = ?", (_ID,)).fetchall()
+    )
+    assert rows == [("failed",)]
+
+
+async def test_governance_without_flags_off_is_not_refused(tmp_path: Path) -> None:
+    tw, _fake = _tradewind(tmp_path, [Say("ok")], engine_auto=False)
+    session = await tw.create(_ID, SessionOptions(permission_mode="broker"))
+
+    result = await session.run("go")
+
+    assert result.status == "completed"

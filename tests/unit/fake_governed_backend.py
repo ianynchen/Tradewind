@@ -121,7 +121,9 @@ class FakeGovernedBackend(Backend):
     Recorded: `calls` (`prepare_turn`, `run`), `contexts`, `decisions`
     (`(kind, outcome)` per gated or observed action), `result_replies`
     (the shim's answer to each result-tool call) and `deleted` (files a
-    `delete` preflight answer removed).
+    `delete` preflight answer removed). `engine_auto` and `action_policy`
+    set the matching capability flags; `run()` itself never checks them,
+    so a refusal proves the runner's check.
     """
 
     name: ClassVar[BackendName] = "codex"
@@ -135,11 +137,15 @@ class FakeGovernedBackend(Backend):
         *,
         customizations: list[str] | None = None,
         logged_in: bool = True,
+        engine_auto: bool = True,
+        action_policy: bool = True,
     ) -> None:
         super().__init__(profile, native_config)
         self._script = script
         self._customizations = customizations or []
         self._logged_in = logged_in
+        self._engine_auto = engine_auto
+        self._action_policy = action_policy
         self._interrupts: dict[str, asyncio.Event] = {}
         self.calls: list[str] = []
         self.contexts: list[TurnContext] = []
@@ -160,9 +166,9 @@ class FakeGovernedBackend(Backend):
             supports_tool_round_cap=False,
             supports_turn_retry=False,
             supports_deny_reason=False,
-            supports_engine_auto=True,
+            supports_engine_auto=self._engine_auto,
             supports_work_supervisor=True,
-            supports_action_policy=True,
+            supports_action_policy=self._action_policy,
         )
 
     def floor_rules(self) -> list[Rule]:
