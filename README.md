@@ -498,8 +498,10 @@ One set of mechanisms holds on every backend that declares the flag (design:
   terminal event, and a process report when engine processes are involved.
 - **Preflight.** `SessionOptions.on_preflight(question, details, choices)` answers a check's
   question; a check that stops the turn raises `ConfigError` before `TurnStarted`.
-- **Prompts are messages.** A prompt starting with `/` is sent as `Message: <prompt>`, so
-  slash commands are never expanded.
+- **Prompts are messages.** A prompt is never expanded as a slash command. `claude` sends a
+  prompt starting with `/` as `Message: <prompt>`; `codex` (app-server passes text as-is) and
+  `langchain` (no slash parsing) send it unchanged; `cursor` also sends it unchanged
+  (unverified).
 
 Known limits: Claude and Codex process reports are skipped (no public engine pid); the
 `in_workspace` field of a file action is lexical (no symlink resolution); `cursor` supports

@@ -72,9 +72,10 @@ Antigravity mapping is PR 2 (future work).
 - Behaviour changes (all in CHANGELOG 0.12.0): a broker that raises now
   gives `deny`; the hard cap pauses during a broker question on all
   backends and the default is now `None`; `turn_timeout` notice before the
-  terminal event; Codex brokers get the extra `tradewind` key; prompts are
-  sent as a message (`Message: ` prefix) so slash commands are not
-  expanded.
+  terminal event; Codex brokers get the extra `tradewind` key; a prompt is
+  always treated as a message: `claude` adds a `Message: ` prefix to a
+  prompt starting with `/`; `codex` and `langchain` do not expand slash
+  commands and send it unchanged; `cursor` is unchanged and unverified.
 - One new runtime dependency: `jsonschema>=4.26,<5` (it was already in the
   lock through `mcp`). Process listing uses `ps`; no `psutil`.
 - A turn can now end with a terminal record and no `TurnStarted` (stop,
