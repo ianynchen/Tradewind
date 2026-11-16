@@ -30,7 +30,7 @@ Commands:
 bash scripts/check.sh                                                        # hermetic; includes langchain conformance
 TRADEWIND_RUN_CLAUDE_INTEGRATION=1 uv run pytest tests/conformance/test_claude.py -v -m integration
 TRADEWIND_RUN_CODEX_INTEGRATION=1  uv run pytest tests/conformance/test_codex.py  -v -m integration
-TRADEWIND_RUN_CODEX_INTEGRATION=1  timeout 300 uv run pytest tests/integration/test_codex_governance_live.py -v -m integration
+TRADEWIND_RUN_SAFETY=1  timeout 1500 uv run pytest tests/safety -v -rP -m integration  # on demand only; includes the Codex governance tests
 TRADEWIND_RUN_LANGCHAIN_INTEGRATION=1 uv run pytest tests/conformance/test_langchain_live.py -v -m integration  # ANTHROPIC_API_KEY from the operator's environment
 uv run pytest tests/conformance/test_cursor.py -v      # always self-skips; no env gate exists
 ```
@@ -202,7 +202,7 @@ caller-facing summary.
   `{"changes": params.get("changes")}`, which is `None` on 0.147.0; the real changes are in
   the `tradewind` action.
 - **Confirmed live (2026-11-15, `gpt-5.6-sol`, `read-only` sandbox).**
-  `tests/integration/test_codex_governance_live.py`, about 30 s for both tests.
+  `tests/integration/test_codex_governance_live.py` (now in `tests/safety/test_codex_safety.py`), about 30 s for both tests.
   - A `fileChange/requestApproval` found its item's changes. The broker got a `file_write` action with `hello.txt` in
     `changes`, and there was no `missing_critical_field` deny.
   - A command approval reached the broker as a `shell` action. This passed 5 of 6 runs. In the one failure,
@@ -227,12 +227,61 @@ caller-facing summary.
   Google's terms do not permit a subscription `agy` as a backend worker. Use Gemini through
   LangChain with an API key.
 
+### Workspace safety suite (ADR-0005; `tests/safety/`)
+
+On-demand only; it is never in `check.sh` or CI. Run it once after every engine upgrade (Claude CLI
+through `claude-agent-sdk`, Codex through `openai-codex`) and before a release that changes workspace
+safety. It makes real subscription calls with the cheapest models.
+
+```bash
+TRADEWIND_RUN_SAFETY=1 timeout 1500 uv run pytest tests/safety -v -rP -m integration
+```
+
+`-rP` prints the engine versions of the run. After an upgrade: run the command, compare each row below,
+then add a new dated table. A row that changes means the engine changed a fact that the flags or the scrub
+depend on (see "What a failure means"). Do not edit a past table.
+
+**Live results, 2026-11-15** (owner-approved; claude-cli 2.1.258 with `claude_agent_sdk` 0.2.151; codex
+app-server 0.147.0; models `haiku` and `gpt-5.6-sol`; 78 s in total). Command as above.
+
+| Test | Result | Evidence |
+|---|---|---|
+| Claude `test_project_hook_runs_on_proceed_not_after_delete` | pass | hook marker present on `proceed`; absent after `delete`; backup made |
+| Claude `test_project_allow_rule` | finding, then regression guard (pass) | a project `permissions.allow` rule (`mcp__tradewind__probe_tool`) did NOT bypass `can_use_tool`: the broker was still asked (`['probe_tool']`). The first run failed as "skips `can_use_tool`"; the test now guards against a future bypass |
+| Claude `test_env_scrub_keeps_subscription` | pass | control (invalid `ANTHROPIC_API_KEY`, no scrub): "Invalid API key"; the scrubbed run completed on the subscription |
+| Claude `test_caller_mcp_tool_reaches_broker` | pass | |
+| Codex `test_shell_reaches_broker` | pass | |
+| Codex `test_file_write_reaches_broker_with_changes` | pass | |
+| Codex `test_env_scrub_keeps_subscription` | pass | control: "401 Unauthorized: Missing bearer or basic authentication" |
+| Codex `test_project_config_keys_honored` | honored: yes | project `mcp_servers` started in a temp folder that a per-process `--config` override marked trusted (nothing written to `~/.codex`) |
+
+What the results mean:
+
+- `.claude/settings.json` stays flagged because hooks run in non-interactive mode. The allow-rule bypass did
+  not happen on 2.1.258. The guard test fails if a future CLI skips `can_use_tool` for an allow rule.
+- `.codex/config.toml` stays flagged: project `mcp_servers` are honored in a trusted project.
+- The env scrub is an empty value (`NAME=""`) for both engines, and both treat it as unset. A process the
+  engine starts (a hook, an MCP server, a shell command) therefore sees `NAME=""`, not a missing variable.
+  This follows from the mechanism; the live suite did not inspect it.
+- Not checked live: the Claude `Skill` tool being absent with `tools=[]` (verified in the bundle only), and
+  Cursor `.cursor/` configuration (not scanned; no Cursor subscription).
+
+What a failure means: a `proceed` hook that does not run means the file is no longer loaded (the flag may be
+too wide); an allow-rule test that fails means the CLI now bypasses the broker (treat `permissions.allow` as
+a flagged risk and tell the owner); a scrub test whose control does not show an auth failure is
+"inconclusive", not a pass.
+
+**One checkout per concurrent session.** A scan and the engine start are not atomic. A process that writes
+into the checkout between them is the owner's own exposure (direct `claude` or `codex` use has the same).
+Tradewind adds no lock. Give each concurrent session its own checkout or worktree.
+
 ### Env gates for integration/live runs
 
 | Variable | Gates | Notes |
 |---|---|---|
 | `TRADEWIND_RUN_CLAUDE_INTEGRATION=1` | `tests/conformance/test_claude.py`, `tests/integration/test_claude_live.py` | Requires a real Claude Code subscription login on the machine; real, billed-by-subscription API calls (~40s for the full matrix). |
-| `TRADEWIND_RUN_CODEX_INTEGRATION=1` | `tests/conformance/test_codex.py`, `tests/integration/test_codex_governance_live.py` | Requires a real ChatGPT/Codex subscription login; spawns real `codex app-server` subprocesses (~100s for the full matrix; ~30s for the governance test). |
+| `TRADEWIND_RUN_CODEX_INTEGRATION=1` | `tests/conformance/test_codex.py` | Requires a real ChatGPT/Codex subscription login; spawns real `codex app-server` subprocesses (~100s for the full matrix). The governance tests moved to `tests/safety/test_codex_safety.py` (gate `TRADEWIND_RUN_SAFETY=1`). |
+| `TRADEWIND_RUN_SAFETY=1` | `tests/safety/` (Claude and Codex workspace safety and governance tests) | Real subscription logins for both engines; about 80 s; on demand only, after an engine upgrade. See "Workspace safety suite". |
 | `TRADEWIND_RUN_LANGCHAIN_INTEGRATION=1` | `tests/conformance/test_langchain_live.py` | Real Anthropic API calls for structured output (FR-1.3): proves the forced schema-tool call is accepted with caller tools bound. Needs `ANTHROPIC_API_KEY` in the operator's environment (read only from there, never from a file); `claude-haiku-4-5`, `max_tokens=256`, 5 model calls in total. |
 | `ANTHROPIC_API_KEY` | `tests/integration/test_langchain_live.py::test_...anthropic` | Real Anthropic API key; ACTIVE — key in git-ignored `.env`, run via `scripts/live-tests.sh`; passed 2026-09-02. |
 | `GROQ_API_KEY` | `tests/integration/test_langchain_live.py::test_...groq` | Free-tier Groq key (`console.groq.com`, `ChatGroq`, `openai/gpt-oss-120b`); ACTIVE — key in git-ignored `.env`, run via `scripts/live-tests.sh`; passed 2026-09-02. |

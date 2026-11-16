@@ -37,6 +37,7 @@ from tradewind.application.ports import Backend, TurnContext
 from tradewind.application.preflight import Ask, Ok, Stop, run_checks
 from tradewind.application.process_report import report_event
 from tradewind.application.tool_host import RESULT_TOOL_NAME
+from tradewind.application.workspace_scan import CustomizationPattern
 from tradewind.domain.errors import ConfigError, Unsupported
 from tradewind.domain.events import (
     Event,
@@ -128,7 +129,8 @@ class FakeGovernedBackend(Backend):
     (the shim's answer to each result-tool call) and `deleted` (files a
     `delete` preflight answer removed). `engine_auto` and `action_policy`
     set the matching capability flags; `run()` itself never checks them,
-    so a refusal proves the runner's check.
+    so a refusal proves the runner's check. `patterns` are its
+    `customization_patterns()` (06 §1); none by default.
     """
 
     name: ClassVar[BackendName] = "codex"
@@ -147,6 +149,7 @@ class FakeGovernedBackend(Backend):
         engine_pid: int | None = None,
         on_engine_closed: Callable[[], None] | None = None,
         answers_interrupt: bool = True,
+        patterns: list[CustomizationPattern] | None = None,
     ) -> None:
         super().__init__(profile, native_config)
         self._script = script
@@ -157,6 +160,7 @@ class FakeGovernedBackend(Backend):
         self._engine_pid = engine_pid
         self._on_engine_closed = on_engine_closed
         self._answers_interrupt = answers_interrupt
+        self._patterns = patterns or []
         self._interrupts: dict[str, asyncio.Event] = {}
         self.calls: list[str] = []
         self.contexts: list[TurnContext] = []
@@ -202,6 +206,9 @@ class FakeGovernedBackend(Backend):
                 reason="browser subagents are not supported",
             ),
         ]
+
+    def customization_patterns(self) -> list[CustomizationPattern]:
+        return list(self._patterns)
 
     def default_rules(self) -> list[Rule]:
         return [

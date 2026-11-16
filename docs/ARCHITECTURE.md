@@ -95,6 +95,13 @@ class Backend(ABC):
     async def prepare_turn(self, ctx: TurnContext) -> None: ...
         # default no-op; runs ordered preflight checks before TurnStarted (FR-11.5)
 
+    def customization_patterns(self) -> list[CustomizationPattern]: ...
+    def auth_env_vars(self) -> frozenset[str]: ...
+    def engine_version(self) -> str | None: ...
+        # workspace safety (FR-12, NFR-7, NFR-8, ADR-0005): files to flag, auth
+        # variables to blank for subscription profiles, engine version of this turn;
+        # defaults [] / frozenset() / None
+
     def floor_rules(self) -> list[Rule]: ...
     def default_rules(self) -> list[Rule]: ...
         # the backend's policy rules (FR-11.1); uses_result_tool: ClassVar[bool] (FR-11.7)
@@ -138,6 +145,12 @@ Rules:
   and make no policy decision themselves. Setting `permission_mode` or
   `policy_rules` on a backend whose flags deny it raises `Unsupported` from one
   runner check before `prepare_turn`.
+- **R-1b** Workspace safety (ADR-0005, `docs/components/06-workspace-safety.md`):
+  the Turn Runner checks workspace customizations once, before `begin_turn`, using the
+  backend's `customization_patterns()` and the caller's per-call `CustomizationDecision`.
+  A refused turn raises `ConfigError` and leaves no turn row. This amends the preflight
+  placement in `05` §4 for this check only. The auth scrub and engine version use the
+  backend's `auth_env_vars()` and `engine_version()`.
 - **R-2** The same shape applies to the other two ports: `SessionStorePort`
   (SQLite now, Postgres later — P-4) and `ToolHost` (in-process handler vs.
   stdio MCP shim are two renderings behind one registry). One interface, N

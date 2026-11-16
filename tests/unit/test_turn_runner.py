@@ -138,11 +138,12 @@ async def test_unregistered_backend_raises_config_error_via_real_registry(
     with pytest.raises(ConfigError, match="no backend factory registered"):
         await session.run("hello")
 
-    # The turn must not be left dangling `in_progress` (fix round 1 bug fix:
-    # backend resolution moved inside try/finally) -- `sweep_stale_turns`
-    # returning 0 proves nothing in_progress remains for this session.
+    # Backend resolution runs before `begin_turn` (06 §3: the workspace
+    # check needs the backend's patterns), so a factory error opens no turn
+    # at all -- nothing is left `in_progress` and no turn row exists.
     swept = await anyio.to_thread.run_sync(tw._store.sweep_stale_turns, _VALID_ID)
     assert swept == 0
+    assert await anyio.to_thread.run_sync(tw._store.turn_usages, _VALID_ID) == []
 
 
 # --- (1b) LangchainBackend built through the real registered factory ---

@@ -122,6 +122,9 @@ class TradewindConfig(BaseModel):
     defaults: TurnDefaults = TurnDefaults()
     on_event: EventHook | None = None
     secret_refs: dict[str, SecretStr] = {}
+    # Where a `delete` customization decision copies files before removing
+    # them. No default: `delete` without it raises ConfigError.
+    customization_backup_dir: Path | None = None
 
     def model_post_init(self, _context: Any, /) -> None:
         if not self.profiles:

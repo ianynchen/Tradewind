@@ -93,10 +93,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, ClassVar, cast
 
 import anyio
+import claude_agent_sdk._cli_version
 from claude_agent_sdk import (
     TERMINAL_TASK_STATUSES,
     AssistantMessage,
@@ -132,10 +134,12 @@ from claude_agent_sdk import (
 )
 
 from tradewind.application.config import NativeStoreConfig
+from tradewind.application.engine_env import engine_env
 from tradewind.application.policy_gate import PolicyGate, caller_tool_source
 from tradewind.application.ports import Backend, TurnContext
 from tradewind.application.supervisor import WorkSupervisor
 from tradewind.application.tool_host import ToolHost
+from tradewind.application.workspace_scan import CustomizationPattern
 from tradewind.domain.compaction import compose_replay_prompt
 from tradewind.domain.errors import Unsupported
 from tradewind.domain.events import (
@@ -858,6 +862,38 @@ class ClaudeBackend(Backend):
         """
         return self._native_ids.pop(session_id, None)
 
+    def customization_patterns(self) -> list[CustomizationPattern]:
+        # 06 §1. Skills, agents and commands are not flagged: `tools=[]`
+        # reaches the CLI as `--tools ""` (claude_agent_sdk subprocess_cli.py
+        # `_build_command`), which turns off every built-in tool.
+        return [
+            CustomizationPattern(".claude/settings.json", "claude-settings", False),
+            CustomizationPattern(".claude/settings.local.json", "claude-settings", False),
+            CustomizationPattern(".claude/hooks", "claude-hook", True),
+            CustomizationPattern(".mcp.json", "claude-mcp", False),
+        ]
+
+    def auth_env_vars(self) -> frozenset[str]:
+        # 06 §4 (CLI 2.1.258). Explicit names only: a `CLAUDE_CODE_USE_*`
+        # prefix rule would also match feature switches.
+        return frozenset(
+            {
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_USE_BEDROCK",
+                "CLAUDE_CODE_USE_VERTEX",
+                "CLAUDE_CODE_USE_FOUNDRY",
+                "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+                "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+                "CLAUDE_CODE_USE_MANTLE",
+                "CLAUDE_CODE_USE_GATEWAY",
+            }
+        )
+
+    def engine_version(self) -> str | None:
+        # 06 §5: the adapter runs the SDK's bundled CLI. Read per call.
+        return claude_agent_sdk._cli_version.__cli_version__
+
     def capabilities(self) -> Capabilities:
         # Exactly the table in the task-10 brief, plus structured output
         # via the SDK's native `output_format` (module docstring).
@@ -1008,6 +1044,12 @@ class ClaudeBackend(Backend):
                 else ctx.max_tool_rounds + (2 if ctx.output_schema is not None else 1)
             ),
             resume=ctx.session.native_session_id,
+            # 06 §4: on a subscription profile, "" for each auth variable
+            # the caller has set (the SDK cannot remove one). If
+            # `session_store` is ever set, the SDK's `_copy_auth_files` reads
+            # `opt_env.get(...) or os.environ.get(...)`: "" falls back to the
+            # real key and skips the Keychain copy, so that path fails closed.
+            env=engine_env(self.profile.auth, self.auth_env_vars(), os.environ).overrides,
             output_format=(
                 {"type": "json_schema", "schema": ctx.output_schema}
                 if ctx.output_schema is not None

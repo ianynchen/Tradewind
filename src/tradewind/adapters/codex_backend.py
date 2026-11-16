@@ -172,6 +172,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import importlib.metadata
 import json
 import logging
 import os
@@ -231,9 +232,11 @@ from openai_codex.generated.v2_all import (
 from openai_codex.models import JsonObject, Notification
 
 from tradewind.application.config import NativeStoreConfig
+from tradewind.application.engine_env import engine_env
 from tradewind.application.policy_gate import GateDecision, PolicyGate, caller_tool_source
 from tradewind.application.ports import Backend, TurnContext
 from tradewind.application.supervisor import WorkSupervisor
+from tradewind.application.workspace_scan import CustomizationPattern
 from tradewind.domain.compaction import compose_replay_prompt
 from tradewind.domain.errors import ConfigError, Unsupported
 from tradewind.domain.events import (
@@ -1385,6 +1388,34 @@ class CodexBackend(Backend):
         popping, not just reading, matters)."""
         return self._native_ids.pop(session_id, None)
 
+    def customization_patterns(self) -> list[CustomizationPattern]:
+        # 06 §1, Step 0 (static, codex 0.147.0 binary): `strings` shows
+        # "Ignored unsupported project-local config keys in ... manually set
+        # them in your user-level config.toml" and "Trusting the directory
+        # allows project-local config, hooks, and exec policies to load".
+        # The list of honored keys is not recoverable from the binary, so a
+        # dangerous key (sandbox_mode, approval_policy, notify, hooks) cannot
+        # be ruled out. Controller ruling (fix round 1): fail closed, flag it.
+        # Exec policies: the same trust line names them; they are `.rules`
+        # files (e.g. `default.rules`) in a `rules` folder of each config
+        # layer. An allow rule can let an escalated command run with no
+        # approval request. Controller ruling (final review): flag the
+        # folder, fail closed.
+        return [
+            CustomizationPattern(".codex/config.toml", "codex-config", False),
+            CustomizationPattern(".codex/rules", "codex-exec-policy", True),
+        ]
+
+    def auth_env_vars(self) -> frozenset[str]:
+        # 06 §4. Explicit names only.
+        return frozenset({"OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"})
+
+    def engine_version(self) -> str | None:
+        # 06 §5, plan ruling: the bundled app-server package's version (the
+        # same value as `serverInfo.version`), known before spawn so the
+        # runner can log it at turn start. Read per call, no cache.
+        return importlib.metadata.version("openai-codex-cli-bin")
+
     def capabilities(self) -> Capabilities:
         # Exactly the table in the task-14 brief/controller ruling.
         return Capabilities(
@@ -1425,11 +1456,17 @@ class CodexBackend(Backend):
         # not this cheap check's.
         return session.native_session_id is not None
 
-    def _reader_config(self) -> CodexConfig:
-        return CodexConfig(env=_codex_env(self.native_config))
+    def _engine_config(self, config_overrides: tuple[str, ...] = ()) -> CodexConfig:
+        """The `codex app-server` launch config, for turns and transcript
+        reads alike: the `CODEX_HOME` isolation (DR-3), plus "" for each
+        auth variable a subscription profile must not pass on (06 §4; the
+        SDK cannot remove one)."""
+        scrub = engine_env(self.profile.auth, self.auth_env_vars(), os.environ).overrides
+        env = {**(_codex_env(self.native_config) or {}), **scrub}
+        return CodexConfig(config_overrides=config_overrides, env=env or None)
 
     def _read_thread_sync(self, native_session_id: str) -> ThreadReadResponse:
-        client = CodexClient(config=self._reader_config())
+        client = CodexClient(config=self._engine_config())
         try:
             client.start()
             client.initialize()
@@ -1510,10 +1547,7 @@ class CodexBackend(Backend):
         approval_handler = make_approval_handler(policy, loop, out_queue, ledger, workspace)
         try:
             shim_def = await ctx.tools.shim_server_def()
-            config = CodexConfig(
-                config_overrides=mcp_server_config_overrides(shim_def),
-                env=_codex_env(self.native_config),
-            )
+            config = self._engine_config(mcp_server_config_overrides(shim_def))
 
             def make_client() -> CodexClient:
                 return _EngineReportingClient(

@@ -29,9 +29,14 @@ from tradewind.application.config import (
     TurnDefaults,
 )
 from tradewind.application.ports import Backend, SessionStorePort
-from tradewind.domain.models import Profile
+from tradewind.application.workspace_scan import (
+    CustomizationPattern,
+    CustomizationScan,
+    FoundFile,
+)
+from tradewind.domain.models import CustomizationDecision, Profile
 
-__version__ = "0.12.0"
+__version__ = "0.13.0"
 
 
 def _build_default_store(path: Path) -> SessionStorePort:
@@ -65,7 +70,11 @@ _client._set_backend_factories(
 )
 
 __all__ = [
+    "CustomizationDecision",
+    "CustomizationPattern",
+    "CustomizationScan",
     "EventHook",
+    "FoundFile",
     "NativeStoreConfig",
     "Session",
     "ToolHostConfig",

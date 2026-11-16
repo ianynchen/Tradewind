@@ -296,6 +296,10 @@ Check(id) -> Ok | Ask(question, details, choices, default_choice) | Stop(reason)
   answer, spawning the engine) may still raise `ConfigError`; after
   `TurnStarted`, failures end the turn with `TurnFailed`.
 
+> Amended by ADR-0005 (`06-workspace-safety.md` §3): the workspace
+> customization check is a runner check before `begin_turn`, not a
+> `prepare_turn` check, and it does not use `on_preflight`.
+
 ## 5. Prompt rule (owner M11)
 
 A prompt is always treated as a message to the model, never expanded as a slash command, on every backend. The rule applies to an engine that expands slash commands: today Claude, which sends a prompt whose first non-whitespace character is `/` with the prefix `Message: ` (the CLI's own flag does not stop built-in commands). Codex's app-server (it passes text as-is; slash commands are a TUI feature) and LangChain (no slash parsing) do not expand slash commands, so they send the prompt unchanged; Cursor sends it unchanged too (tradewind adds no handling there, and the Cursor SDK's behaviour is not verified). The mirror keeps the caller's original prompt.

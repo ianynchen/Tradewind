@@ -209,6 +209,17 @@ class Profile(BaseModel):
     backend_options: dict[str, Any] = {}
 
 
+class CustomizationDecision(BaseModel):
+    """The caller's per-turn answer to a customization scan
+    (docs/components/06-workspace-safety.md §3). `fingerprint` is the one
+    from the scan. Never stored by Tradewind (D4)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    action: Literal["stop", "delete", "proceed"]
+    fingerprint: str
+
+
 class Tool(BaseModel):
     """A live, callable tool. Never serialized whole (I-2): `snapshot()`
     emits only name/description/input_schema; the handler is re-supplied by
@@ -407,6 +418,10 @@ class TurnResult:
     # without a schema, and on an honest partial (`max_tool_rounds`,
     # `max_tokens`, `broker_terminated`) that ended before a result existed.
     structured_output: dict[str, object] | None = None
+    # 06 §5: the engine version that ran this turn, set by the turn runner
+    # from `Backend.engine_version()`; None for backends with no separate
+    # engine (LangChain, Cursor).
+    engine_version: str | None = None
 
 
 @dataclass
@@ -536,6 +551,18 @@ def process_report_notice(
             "processes": processes,
             "last_action": last_action,
         },
+    )
+
+
+def customization_notice(*, text: str) -> NormalizedMessage:
+    """The mirrored `kind="event"` visibility item for a `delete` or
+    `proceed` customization decision that applied to found files
+    (docs/components/06-workspace-safety.md §3): `text` names the files
+    (and, after a delete, the backup folder)."""
+    return NormalizedMessage(
+        role="assistant",
+        kind="event",
+        content={"type": "workspace_customizations", "text": text},
     )
 
 
