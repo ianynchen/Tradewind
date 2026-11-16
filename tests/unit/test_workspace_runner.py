@@ -25,7 +25,13 @@ from tradewind.application.config import NativeStoreConfig, TradewindConfig
 from tradewind.application.ports import TurnContext
 from tradewind.application.workspace_scan import CustomizationPattern, CustomizationScan
 from tradewind.domain.errors import ConfigError, Unsupported
-from tradewind.domain.events import Event, ItemCompleted, TurnCompleted, TurnStarted
+from tradewind.domain.events import (
+    Event,
+    ItemCompleted,
+    TurnCompleted,
+    TurnFailed,
+    TurnStarted,
+)
 from tradewind.domain.models import (
     ApiKeyAuth,
     Capabilities,
@@ -82,12 +88,21 @@ class _FailsBeforeStart(FakeGovernedBackend):
         yield  # an async generator, like every real backend
 
 
+class _FailedBeforeStart(FakeGovernedBackend):
+    """Ends with `TurnFailed` and never emits `TurnStarted`."""
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        self.calls.append("run")
+        yield TurnFailed(turn_id=ctx.turn_id, error="engine failed to start")
+
+
 def _tradewind(
     tmp_path: Path,
     *,
     patterns: list[CustomizationPattern] | None = _PATTERNS,
     backup_dir: Path | None = None,
     backend_cls: type[FakeGovernedBackend] = FakeGovernedBackend,
+    tapped: list[Event] | None = None,
 ) -> tuple[Tradewind, FakeGovernedBackend]:
     profile = _profile()
     tw = Tradewind(
@@ -96,6 +111,7 @@ def _tradewind(
             default_profile="default",
             store=tmp_path / "s.db",
             customization_backup_dir=backup_dir,
+            on_event=None if tapped is None else tapped.append,
         )
     )
     fake = backend_cls(profile, NativeStoreConfig(), [Say("done")], patterns=patterns)
@@ -294,15 +310,44 @@ async def test_proceed_logs_a_warning(tmp_path: Path, caplog: pytest.LogCaptureF
     ]
 
 
-async def test_delete_failure_fails_the_turn_before_run(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("where", "message"),
+    [
+        (None, r"needs TradewindConfig\.customization_backup_dir"),
+        ("repo/backups", "inside the scanned area"),
+    ],
+)
+async def test_bad_backup_dir_refused_before_begin_turn(
+    tmp_path: Path, where: str | None, message: str
+) -> None:
     repo = _repo(tmp_path / "repo")
-    tw, fake = _tradewind(tmp_path, backup_dir=None)
+    tw, fake = _tradewind(tmp_path, backup_dir=None if where is None else tmp_path / where)
     session = await tw.create(_ID, SessionOptions(cwd=repo))
     decision = CustomizationDecision(
         action="delete", fingerprint=session.scan_customizations().fingerprint
     )
 
-    with pytest.raises(ConfigError, match="customization_backup_dir"):
+    with pytest.raises(ConfigError, match=message):
+        await session.run("go", customizations=decision)
+
+    # A static config error: refused like the other rows, with no turn row.
+    assert await _turn_rows(tw, _ID) == []
+    assert await tw.history(_ID) == []
+    assert fake.calls == []
+    assert (repo / _SETTINGS).exists()
+
+
+async def test_delete_failure_fails_the_turn_before_run(tmp_path: Path) -> None:
+    repo = _repo(tmp_path / "repo")
+    not_a_folder = tmp_path / "backup"
+    not_a_folder.write_text("a file, so the backup folder cannot be made")
+    tw, fake = _tradewind(tmp_path, backup_dir=not_a_folder)
+    session = await tw.create(_ID, SessionOptions(cwd=repo))
+    decision = CustomizationDecision(
+        action="delete", fingerprint=session.scan_customizations().fingerprint
+    )
+
+    with pytest.raises(ConfigError, match="customization backup failed, nothing deleted"):
         await session.run("go", customizations=decision)
 
     # As a `prepare_turn` ConfigError ends: the turn is finalized as failed.
@@ -468,6 +513,10 @@ async def test_stop_during_delete_ends_the_turn_without_run(
     assert events[-1].result.status == "interrupted"
     assert not (repo / _SETTINGS).exists()
     assert len(await _history_notices(tw, _ID)) == 1
+    # No `TurnStarted`: the notice still reaches the stream, once, before
+    # the synthesized terminal.
+    assert len(_customization_notices(events)) == 1
+    assert _customization_notices(events[-2:-1]) == _customization_notices(events)
 
 
 async def test_no_patterns_and_deleted_process_cwd_still_run(
@@ -514,3 +563,49 @@ async def test_delete_notice_lists_only_the_deleted_files(
     assert notice["text"] == (
         f"workspace customizations deleted: .claude/settings.json; backup at {backup}"
     )
+
+
+async def test_notice_yielded_and_tapped_once_when_backend_fails_before_turn_started(
+    tmp_path: Path,
+) -> None:
+    repo = _repo(tmp_path / "repo")
+    tapped: list[Event] = []
+    tw, fake = _tradewind(
+        tmp_path, backup_dir=tmp_path / "backup", backend_cls=_FailedBeforeStart, tapped=tapped
+    )
+    session = await tw.create(_ID, SessionOptions(cwd=repo))
+    decision = CustomizationDecision(
+        action="delete", fingerprint=session.scan_customizations().fingerprint
+    )
+
+    events = [e async for e in session.stream("go", customizations=decision)]
+
+    assert fake.calls == ["prepare_turn", "run"]
+    assert not any(isinstance(e, TurnStarted) for e in events)
+    assert [type(e).__name__ for e in events] == ["ItemCompleted", "TurnFailed"]
+    [notice] = _customization_notices(events)
+    assert notice["text"].startswith("workspace customizations deleted: .claude/settings.json;")
+    assert _customization_notices(tapped) == [notice]
+    assert [type(e).__name__ for e in tapped] == ["ItemCompleted", "TurnFailed"]
+    # Stored once only.
+    assert await _history_notices(tw, _ID) == [notice]
+
+
+@pytest.mark.parametrize("action", ["proceed", "delete"])
+async def test_notice_yielded_and_tapped_once_on_a_normal_turn(tmp_path: Path, action: str) -> None:
+    repo = _repo(tmp_path / "repo")
+    tapped: list[Event] = []
+    tw, _ = _tradewind(tmp_path, backup_dir=tmp_path / "backup", tapped=tapped)
+    session = await tw.create(_ID, SessionOptions(cwd=repo))
+    decision = CustomizationDecision(
+        action=action, fingerprint=session.scan_customizations().fingerprint
+    )
+
+    events = [e async for e in session.stream("go", customizations=decision)]
+
+    assert isinstance(events[-1], TurnCompleted)
+    [notice] = _customization_notices(events)
+    assert _customization_notices(tapped) == [notice]
+    assert isinstance(events[0], TurnStarted)
+    assert _customization_notices(events[1:2]) == [notice]
+    assert await _history_notices(tw, _ID) == [notice]

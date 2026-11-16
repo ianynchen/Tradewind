@@ -92,6 +92,7 @@ scanned folder:
 | Claude | `.claude/hooks/` (every file, recursively) | the scripts that hooks run; the bundled CLI protects this folder next to `settings.json` |
 | Claude | `.mcp.json` | project MCP servers (commands that the engine starts) |
 | Codex | `.codex/config.toml` | project config in a trusted repository. Flagged as a fail-closed ruling (the binary does not list the honored keys). The live run then confirmed that project `mcp_servers` are honored in a trusted folder (they start commands), so the flag is needed. |
+| Codex | `.codex/rules/` (every file, recursively) | exec policies (`.rules` files, e.g. `default.rules`, in a `rules` folder of each config layer; the 0.147.0 binary: "Trusting the directory allows project-local config, hooks, and exec policies to load"). An exec-policy allow rule can let an escalated command run without an approval request. Flagged as a fail-closed ruling (final review). |
 
 These are **not flagged**, after triage:
 
@@ -116,7 +117,8 @@ scan = session.scan_customizations()
 #   scan.root: Path               # the base for relative paths: the repo root, else the scanned folder
 #   scan.files: list[FoundFile]   # FoundFile(path: Path relative to root, sha256: str, kind: str)
 #   scan.fingerprint: str         # "" when no files
-result = await session.run(prompt, customizations=CustomizationDecision("delete", scan.fingerprint))
+decision = CustomizationDecision(action="delete", fingerprint=scan.fingerprint)
+result = await session.run(prompt, customizations=decision)
 ```
 
 - **One folder.** The scan uses the engine's working folder: the session's

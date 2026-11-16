@@ -12,10 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Workspace safety (ADR-0005, `docs/components/06-workspace-safety.md`; FR-12, NFR-7, NFR-8):
-  - `session.scan_customizations()`, `CustomizationDecision` and the `customizations=` keyword on `run`, `stream` and `spawn`. Claude flags `.claude/settings.json`, `.claude/settings.local.json`, `.claude/hooks/**` and `.mcp.json`; Codex flags `.codex/config.toml`. Cursor's `.cursor/` is not checked.
+  - `session.scan_customizations()`, `CustomizationDecision` and the `customizations=` keyword on `run`, `stream` and `spawn`. Claude flags `.claude/settings.json`, `.claude/settings.local.json`, `.claude/hooks/**` and `.mcp.json`; Codex flags `.codex/config.toml` and `.codex/rules/**` (exec policies). Cursor's `.cursor/` is not checked. `CustomizationDecision` takes keywords only: `CustomizationDecision(action=..., fingerprint=...)`.
   - `TradewindConfig.customization_backup_dir` (where `delete` backs files up; required for `delete`).
   - `TurnResult.engine_version`.
-  - `Backend.customization_patterns()`, `Backend.auth_env_vars()` and `Backend.engine_version()`.
+  - `Backend.customization_patterns()`, `Backend.auth_env_vars()` and `Backend.engine_version()`; `CustomizationPattern` is exported from `tradewind` for third-party backends.
   - The `tests/safety/` suite (`TRADEWIND_RUN_SAFETY=1`), run on demand only.
 
 ### Changed
@@ -23,6 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - On Claude and Codex, a turn in a folder with flagged files now raises `ConfigError` unless the caller passes a matching `CustomizationDecision` (a behaviour change for existing callers).
 - Subscription profiles get each declared auth variable that is set blanked (set to the empty value) in the engine environment; as a consequence of the mechanism (not a live result), a process the engine starts sees `NAME=""`. API-key profiles are unchanged.
 - A backend-factory error now raises before a turn row is created.
+
+### Upgrading from 0.12
+
+- On Claude and Codex, call `session.scan_customizations()` before each turn and pass a `CustomizationDecision(action=..., fingerprint=scan.fingerprint)` when it finds files; with no decision such a turn raises `ConfigError`.
+- Set `TradewindConfig.customization_backup_dir` (outside the repository) to use `delete`; without it a `delete` raises `ConfigError` before the turn starts.
+- `spawn()` children need their own decision (`spawn(..., customizations=...)`); a child never takes the parent's.
+- A personal `.claude/settings.local.json` (often git-ignored) also triggers the check.
 
 ### Moved
 

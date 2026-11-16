@@ -28,7 +28,7 @@ recorded which engine version ran a turn. The stopped Antigravity design
 1. **Detect, then decide (D1, D2).** Each backend declares what to flag
    (`Backend.customization_patterns()`). `session.scan_customizations()`
    returns the files and a fingerprint. The caller passes a
-   `CustomizationDecision("stop" | "delete" | "proceed", fingerprint)` as the
+   `CustomizationDecision(action="stop" | "delete" | "proceed", fingerprint=...)` as the
    `customizations=` keyword of `run`, `stream` and `spawn` (D9). Tradewind
    re-scans at turn start. Files with no decision, or a different
    fingerprint, raise `ConfigError`. `delete` backs files up (to
@@ -56,7 +56,9 @@ recorded which engine version ran a turn. The stopped Antigravity design
    RUNBOOK.
 
 Flagged files: Claude `.claude/settings.json`, `.claude/settings.local.json`,
-`.claude/hooks/**`, `.mcp.json`; Codex `.codex/config.toml`. Not flagged:
+`.claude/hooks/**`, `.mcp.json`; Codex `.codex/config.toml` and `.codex/rules/**`
+(exec policies: an allow rule can let an escalated command run without an
+approval request; flagged fail-closed). Not flagged:
 instruction files and skill/agent/command folders (D5; their actions go
 through the broker), and Codex hooks (the engine's own hash trust is
 stronger).

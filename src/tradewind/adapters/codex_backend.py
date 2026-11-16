@@ -1396,7 +1396,15 @@ class CodexBackend(Backend):
         # The list of honored keys is not recoverable from the binary, so a
         # dangerous key (sandbox_mode, approval_policy, notify, hooks) cannot
         # be ruled out. Controller ruling (fix round 1): fail closed, flag it.
-        return [CustomizationPattern(".codex/config.toml", "codex-config", False)]
+        # Exec policies: the same trust line names them; they are `.rules`
+        # files (e.g. `default.rules`) in a `rules` folder of each config
+        # layer. An allow rule can let an escalated command run with no
+        # approval request. Controller ruling (final review): flag the
+        # folder, fail closed.
+        return [
+            CustomizationPattern(".codex/config.toml", "codex-config", False),
+            CustomizationPattern(".codex/rules", "codex-exec-policy", True),
+        ]
 
     def auth_env_vars(self) -> frozenset[str]:
         # 06 §4. Explicit names only.

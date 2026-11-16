@@ -29,7 +29,11 @@ from tradewind.application.config import (
     TurnDefaults,
 )
 from tradewind.application.ports import Backend, SessionStorePort
-from tradewind.application.workspace_scan import CustomizationScan, FoundFile
+from tradewind.application.workspace_scan import (
+    CustomizationPattern,
+    CustomizationScan,
+    FoundFile,
+)
 from tradewind.domain.models import CustomizationDecision, Profile
 
 __version__ = "0.13.0"
@@ -67,6 +71,7 @@ _client._set_backend_factories(
 
 __all__ = [
     "CustomizationDecision",
+    "CustomizationPattern",
     "CustomizationScan",
     "EventHook",
     "FoundFile",

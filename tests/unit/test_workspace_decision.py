@@ -8,12 +8,17 @@ import os
 import stat
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 from pydantic import ValidationError
 
-from tradewind.application.workspace_decision import DecisionOutcome, apply_delete, resolve
+from tradewind.application.workspace_decision import (
+    DecisionOutcome,
+    apply_delete,
+    check_backup_dir,
+    resolve,
+)
 from tradewind.application.workspace_scan import CustomizationScan, FoundFile
 from tradewind.domain.errors import ConfigError
 from tradewind.domain.models import CustomizationDecision
@@ -180,6 +185,20 @@ def test_backup_dir_missing_or_inside_area_raises(tmp_path: Path) -> None:
     assert (root / ".mcp.json").exists()
 
 
+def test_check_backup_dir_missing_or_inside_area_raises(tmp_path: Path) -> None:
+    root = tmp_path / "repo"
+    root.mkdir()
+    scan = _make_scan(root, ".mcp.json")
+    with pytest.raises(ConfigError, match=r"needs TradewindConfig\.customization_backup_dir"):
+        check_backup_dir(scan, None)
+    for inside in (root, root / "sub" / "backups"):
+        with pytest.raises(ConfigError, match="inside the scanned area"):
+            check_backup_dir(scan, inside)
+    # Outside the area: no error, and nothing is created.
+    check_backup_dir(scan, tmp_path / "backups")
+    assert not (tmp_path / "backups").exists()
+
+
 def test_backup_folder_mode_0700(tmp_path: Path) -> None:
     root, backups = tmp_path / "repo", tmp_path / "backups"
     root.mkdir()
@@ -215,6 +234,18 @@ def test_decision_model_values() -> None:
     import tradewind
 
     assert tradewind.CustomizationDecision is CustomizationDecision
+
+
+def test_readme_keyword_call_works() -> None:
+    from tradewind import CustomizationDecision as PublicDecision
+
+    # As in the README: the action comes from the caller's own store.
+    action: Literal["stop", "delete", "proceed"] = "delete"
+    decision = PublicDecision(action=action, fingerprint="fp1")
+    assert (decision.action, decision.fingerprint) == ("delete", "fp1")
+    # A pydantic model: positional arguments are not accepted.
+    with pytest.raises(TypeError):
+        PublicDecision(action, "fp1")  # type: ignore[misc]
 
 
 def test_outcome_is_frozen_dataclass() -> None:

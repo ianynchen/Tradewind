@@ -526,16 +526,17 @@ that adds a `.claude/settings.json` hook). On `claude` and `codex`, a turn in a 
 with such files raises `ConfigError` unless the caller passes a decision.
 
 - **Flagged files.** Claude: `.claude/settings.json`, `.claude/settings.local.json`,
-  `.claude/hooks/` (every file), `.mcp.json`. Codex: `.codex/config.toml`. The scan covers
-  the session's working folder, the repository root (a `.git` file or folder) and every
-  folder between. Instruction files (`CLAUDE.md`, `AGENTS.md`) are text and are not flagged.
-  `langchain` loads no workspace files. **`cursor` loads `.cursor/` configuration and
-  Tradewind does not check it.**
-- **Decision.** `CustomizationDecision(action, fingerprint)`, with `action` one of `"stop"`
-  (raise), `"delete"` (back up to `TradewindConfig.customization_backup_dir`, then delete the
-  scanned files; the turn runs) or `"proceed"` (load the files; a notice is emitted). It is a
-  keyword of `run`, `stream` and `spawn` and is never stored by Tradewind. If the files
-  changed since the scan, the turn raises `ConfigError("customizations changed since the scan")`.
+  `.claude/hooks/` (every file), `.mcp.json`. Codex: `.codex/config.toml`, `.codex/rules/`
+  (every file: exec policies). The scan covers the session's working folder, the
+  repository root (a `.git` file or folder) and every folder between. Instruction files
+  (`CLAUDE.md`, `AGENTS.md`) are text and are not flagged. `langchain` loads no workspace
+  files. **`cursor` loads `.cursor/` configuration and Tradewind does not check it.**
+- **Decision.** `CustomizationDecision(action=..., fingerprint=...)` (keywords only), with
+  `action` one of `"stop"` (raise), `"delete"` (back up to
+  `TradewindConfig.customization_backup_dir`, then delete the scanned files; the turn runs)
+  or `"proceed"` (load the files; a notice is emitted). It is a keyword of `run`, `stream`
+  and `spawn` and is never stored by Tradewind. If the files changed since the scan, the
+  turn raises `ConfigError("customizations changed since the scan")`.
 - **`proceed` trusts the checkout, not only the flagged files.** The fingerprint covers the
   flagged files. A flagged file can point to others (an MCP command `node scripts/server.js`),
   and Tradewind does not parse command lines. Key your stored decision on the git commit (or
@@ -557,7 +558,7 @@ if scan.files:
         decisions.put(key, action)
     result = await session.run(
         "Review this change.",
-        customizations=CustomizationDecision(action, scan.fingerprint),
+        customizations=CustomizationDecision(action=action, fingerprint=scan.fingerprint),
     )
 else:
     result = await session.run("Review this change.")

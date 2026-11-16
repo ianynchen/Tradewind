@@ -1,8 +1,9 @@
 """Customization decision and delete (docs/components/06-workspace-safety.md §3).
 
-Pure logic: `resolve` applies the decision table to a scan; `apply_delete`
-backs up and removes the scanned files. The turn runner (not this module)
-decides when to call them.
+Pure logic: `resolve` applies the decision table to a scan;
+`check_backup_dir` refuses a missing or misplaced backup folder;
+`apply_delete` backs up and removes the scanned files. The turn runner (not
+this module) decides when to call them.
 """
 
 from __future__ import annotations
@@ -58,6 +59,20 @@ def resolve(scan: CustomizationScan, decision: CustomizationDecision | None) -> 
     )
 
 
+def check_backup_dir(scan: CustomizationScan, backup_dir: Path | None) -> Path:
+    """The static `delete` rules for `backup_dir` (§3); returns it. The
+    runner calls it before `begin_turn`; `apply_delete` calls it again.
+
+    Raises:
+        ConfigError: no `backup_dir`, or `backup_dir` inside the scan area.
+    """
+    if backup_dir is None:
+        raise ConfigError("delete needs TradewindConfig.customization_backup_dir")
+    if backup_dir.resolve().is_relative_to(scan.root.resolve()):
+        raise ConfigError(f"customization_backup_dir {backup_dir} is inside the scanned area")
+    return backup_dir
+
+
 def _mkdir_0700(folder: Path) -> None:
     """Create `folder` and any missing parents, each with mode 0700."""
     missing = [p for p in (folder, *folder.parents) if not p.exists()]
@@ -100,12 +115,8 @@ def apply_delete(
                         f"{link.resolve()}; remove the link and scan again"
                     )
             raise AssertionError(f"scanned path outside the scan root: {f.path}")
-    if backup_dir is None:
-        raise ConfigError("delete needs TradewindConfig.customization_backup_dir")
-    if backup_dir.resolve().is_relative_to(scan.root.resolve()):
-        raise ConfigError(f"customization_backup_dir {backup_dir} is inside the scanned area")
-
-    backup = backup_dir / f"{now.astimezone(UTC).strftime('%Y%m%dT%H%M%SZ')}-{turn_id}"
+    stamp = now.astimezone(UTC).strftime("%Y%m%dT%H%M%SZ")
+    backup = check_backup_dir(scan, backup_dir) / f"{stamp}-{turn_id}"
     present = [f.path for f in scan.files if os.path.lexists(scan.root / f.path)]
     try:
         _mkdir_0700(backup)

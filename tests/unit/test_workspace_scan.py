@@ -198,6 +198,7 @@ def test_backend_patterns() -> None:
     ]
     assert CodexBackend(_profile("codex", sub), native).customization_patterns() == [
         CustomizationPattern(".codex/config.toml", "codex-config", False),
+        CustomizationPattern(".codex/rules", "codex-exec-policy", True),
     ]
     assert CursorBackend(_profile("cursor", sub), native).customization_patterns() == []
     lc = LangchainBackend(
@@ -206,6 +207,25 @@ def test_backend_patterns() -> None:
         chat_model_factory=cast(Any, lambda *_a, **_k: None),
     )
     assert lc.customization_patterns() == []
+
+
+def test_codex_exec_policy_rules_are_flagged(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    _write(root / ".codex" / "rules" / "default.rules")
+    native = NativeStoreConfig()
+    patterns = CodexBackend(_profile("codex", SubscriptionAuth()), native).customization_patterns()
+    result = scan(root, patterns, "codex")
+    assert [(str(f.path), f.kind) for f in result.files] == [
+        (".codex/rules/default.rules", "codex-exec-policy")
+    ]
+
+
+def test_customization_pattern_is_public() -> None:
+    import tradewind
+
+    # Third-party backends implement `customization_patterns()`.
+    assert tradewind.CustomizationPattern is CustomizationPattern
+    assert "CustomizationPattern" in tradewind.__all__
 
 
 def _skip_if_root(path: Path) -> None:

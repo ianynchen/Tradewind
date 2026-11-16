@@ -44,7 +44,7 @@ from tradewind.application.process_report import (
 from tradewind.application.resume import ResumePlanner
 from tradewind.application.supervisor import WorkSupervisor
 from tradewind.application.tool_host import RESULT_TOOL_NAME, SHIM_MODULE, ToolHost
-from tradewind.application.workspace_decision import apply_delete, resolve
+from tradewind.application.workspace_decision import apply_delete, check_backup_dir, resolve
 from tradewind.application.workspace_scan import scan_session
 from tradewind.domain.errors import (
     ConfigError,
@@ -672,6 +672,10 @@ class TurnRunner:
         # is kept: a `delete` removes exactly these files before `run()`.
         customization_scan = await anyio.to_thread.run_sync(scan_session, session_row, backend)
         customization_outcome = resolve(customization_scan, customizations)
+        if customization_outcome.delete:
+            # A missing or misplaced backup folder is a static config error:
+            # refused here, with no turn row (`apply_delete` checks again).
+            check_backup_dir(customization_scan, self._config.customization_backup_dir)
 
         turn_id = str(uuid.uuid4())
         self._interrupt_requested.discard(session_id)
@@ -703,7 +707,7 @@ class TurnRunner:
         # report is out (the report precedes the terminal).
         held_terminal: Event | None = None
         # 06 §3: the `delete`/`proceed` notice, emitted right after the
-        # backend's first `TurnStarted`.
+        # backend's first `TurnStarted` (or before the terminal if none).
         pending_notice: ItemCompleted | None = None
 
         async def drain_gate_events() -> list[Event]:
@@ -989,7 +993,8 @@ class TurnRunner:
                     # notice is stored at once, so the mirror has it even
                     # when no `TurnStarted` follows (a backend that fails
                     # first, a consumer that stops reading); it is yielded
-                    # after `TurnStarted`. A stop during the delete still
+                    # after `TurnStarted`, or before the terminal when no
+                    # `TurnStarted` comes. A stop during the delete still
                     # ends the turn without `run()`.
                     if customization_outcome.delete:
                         backup, deleted = await anyio.to_thread.run_sync(
@@ -1087,6 +1092,16 @@ class TurnRunner:
                             # Gate notices raised since the last event come first.
                             for gate_event in await drain_gate_events():
                                 yield gate_event
+                            if (
+                                isinstance(event, TurnCompleted | TurnFailed)
+                                and pending_notice is not None
+                            ):
+                                # 06 §3: no `TurnStarted` came; the stored
+                                # notice still reaches the stream, once,
+                                # before the terminal.
+                                notice, pending_notice = pending_notice, None
+                                self._tap(notice, turn_id)
+                                yield notice
                             if isinstance(event, ItemCompleted):
                                 await anyio.to_thread.run_sync(
                                     self._store.append_message, session_id, turn_id, event.message
@@ -1153,6 +1168,12 @@ class TurnRunner:
                     # precede the synthesized terminal, which stays last.
                     for gate_event in await drain_gate_events():
                         yield gate_event
+                    if pending_notice is not None:
+                        # 06 §3: no `TurnStarted` came (a stop during the
+                        # delete, or a backend that ended without one).
+                        notice, pending_notice = pending_notice, None
+                        self._tap(notice, turn_id)
+                        yield notice
                     # The backend's iterator ended with neither TurnCompleted
                     # nor TurnFailed -- per `Backend.run`'s contract, this
                     # happens on a mid-turn interrupt: the caller's stop(),
