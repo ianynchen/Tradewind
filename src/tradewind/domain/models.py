@@ -418,6 +418,10 @@ class TurnResult:
     # without a schema, and on an honest partial (`max_tool_rounds`,
     # `max_tokens`, `broker_terminated`) that ended before a result existed.
     structured_output: dict[str, object] | None = None
+    # 06 §5: the engine version that ran this turn, set by the turn runner
+    # from `Backend.engine_version()`; None for backends with no separate
+    # engine (LangChain, Cursor).
+    engine_version: str | None = None
 
 
 @dataclass

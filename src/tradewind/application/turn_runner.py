@@ -729,6 +729,19 @@ class TurnRunner:
         # it `in_progress` until the next `sweep_stale_turns` (session
         # open). The backend is resolved above, for the workspace check.
         try:
+            # 06 §5: read on each turn (no cache) and logged at turn start,
+            # so a failed turn has it too; set on the turn's `TurnResult`.
+            engine_version = backend.engine_version()
+            if engine_version is not None:
+                _logger.info(
+                    "engine version",
+                    extra={
+                        "turn_id": turn_id,
+                        "session_id": session_id,
+                        "backend": backend.name,
+                        "engine_version": engine_version,
+                    },
+                )
             # 05 §2: the stored snapshot is the source of truth for the
             # session's policy, mode and the gate's workspace (`cwd`) (a
             # bare `resume()` passes empty live options;
@@ -1066,6 +1079,11 @@ class TurnRunner:
                     backend_run = cast("AsyncGenerator[Event]", backend.run(ctx))
                     async with aclosing(backend_run) as backend_events:
                         async for event in backend_events:
+                            if isinstance(event, TurnCompleted):
+                                event = replace(
+                                    event,
+                                    result=replace(event.result, engine_version=engine_version),
+                                )
                             # Gate notices raised since the last event come first.
                             for gate_event in await drain_gate_events():
                                 yield gate_event
@@ -1152,6 +1170,7 @@ class TurnRunner:
                                 final_text=None,
                                 usage={},
                                 cost_usd=None,
+                                engine_version=engine_version,
                             )
                         )
                         if interrupted

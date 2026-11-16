@@ -438,6 +438,20 @@ class Backend(ABC):
         permissions without a broker question (06 §1); none by default."""
         return []
 
+    def auth_env_vars(self) -> frozenset[str]:
+        """Environment variables that select a non-subscription auth or
+        provider for this engine (06 §4). On a subscription profile the
+        engine process does not get them
+        (`tradewind.application.engine_env`). Explicit names only; none by
+        default."""
+        return frozenset()
+
+    def engine_version(self) -> str | None:
+        """The version of the engine this backend runs, read on each call
+        with no cache (06 §5); None when there is no separate engine. The
+        runner logs it at turn start and sets it on `TurnResult`."""
+        return None
+
     @abstractmethod
     def capabilities(self) -> Capabilities:
         """This backend's fixed capability flags (FR-8.1).
