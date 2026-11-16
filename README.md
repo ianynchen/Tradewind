@@ -563,8 +563,8 @@ else:
     result = await session.run("Review this change.")
 ```
 
-With a subscription profile, the engine process also gets the auth variables blanked
-(`ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and the other names each backend declares), so a
+With a subscription profile, the engine process also gets each declared auth variable that is set
+blanked (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and the other names each backend declares), so a
 variable in the environment cannot switch the turn to an API key. Each turn also records
 the engine version: `TurnResult.engine_version` (`None` on `langchain` and `cursor`).
 Run one checkout per concurrent session. An on-demand live suite checks the engine facts

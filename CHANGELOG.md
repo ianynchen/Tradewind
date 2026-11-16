@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - On Claude and Codex, a turn in a folder with flagged files now raises `ConfigError` unless the caller passes a matching `CustomizationDecision` (a behaviour change for existing callers).
-- Subscription profiles get the auth variables blanked (set to the empty value) in the engine environment, so a process the engine starts sees `NAME=""`. API-key profiles are unchanged.
+- Subscription profiles get each declared auth variable that is set blanked (set to the empty value) in the engine environment; as a consequence of the mechanism (not a live result), a process the engine starts sees `NAME=""`. API-key profiles are unchanged.
 - A backend-factory error now raises before a turn row is created.
 
 ### Moved

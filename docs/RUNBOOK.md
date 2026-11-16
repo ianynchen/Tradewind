@@ -259,7 +259,8 @@ What the results mean:
   not happen on 2.1.258. The guard test fails if a future CLI skips `can_use_tool` for an allow rule.
 - `.codex/config.toml` stays flagged: project `mcp_servers` are honored in a trusted project.
 - The env scrub is an empty value (`NAME=""`) for both engines, and both treat it as unset. A process the
-  engine starts (a hook, an MCP server, a shell command) sees `NAME=""`, not a missing variable.
+  engine starts (a hook, an MCP server, a shell command) therefore sees `NAME=""`, not a missing variable.
+  This follows from the mechanism; the live suite did not inspect it.
 - Not checked live: the Claude `Skill` tool being absent with `tools=[]` (verified in the bundle only), and
   Cursor `.cursor/` configuration (not scanned; no Cursor subscription).
 

@@ -98,7 +98,7 @@ These are **not flagged**, after triage:
 | What | Why it is a non-issue |
 |---|---|
 | `CLAUDE.md`, `AGENTS.md` | text (D5) |
-| Claude `.claude/skills/`, `.claude/agents/`, `.claude/commands/`; plugin folders | built-in tools are off (`tools=[]` → `--tools ""`), so Skill and Agent cannot run. The prompt rule blocks slash commands. Plugins load only when a settings file enables them, and settings files are flagged. The builder confirms in one no-prompt check that the Skill tool is absent. |
+| Claude `.claude/skills/`, `.claude/agents/`, `.claude/commands/`; plugin folders | built-in tools are off (`tools=[]` → `--tools ""`), so Skill and Agent cannot run. The prompt rule blocks slash commands. Plugins load only when a settings file enables them, and settings files are flagged. The absence of the Skill tool is verified in the bundle only; not checked live. |
 | Codex `.agents/skills/` | text and scripts. A script runs only through Codex's shell, and the broker gates that shell. |
 | Codex hooks | Codex runs a hook only after its hash is trusted ("New hook - review required"). The engine's gate is stronger than a scan. |
 
@@ -207,8 +207,9 @@ Neither SDK can remove a variable:
 **As built:** the mechanism is an empty value (`NAME=""`) for both
 engines. Both treat an empty value as unset (Claude: truthy and `trim() ||
 void 0` checks; Codex: `read_non_empty_env_var`). A process that the engine
-starts (a hook, an MCP server, a shell command) sees `NAME=""`, not the
-variable missing. The live suite confirmed that a subscription turn
+starts (a hook, an MCP server, a shell command) therefore sees `NAME=""`,
+not a missing variable. This is a consequence of the mechanism, not a
+live result. The live suite confirmed that a subscription turn
 completes with the scrub and fails without it (RUNBOOK). Evidence:
 `.superpowers/sdd/2026-11-15-workspace-safety/task-4-report.md`.
 
@@ -258,7 +259,8 @@ pass.
   - Whether project `.codex/config.toml` keys are honored. This decides
     the Codex pattern in §1, and it needs no change to the owner's trust
     settings when the test folder is already trusted. Otherwise it is
-    "inconclusive".
+    "inconclusive". Result (2026-11-15, Codex 0.147.0): honored: yes;
+    project `mcp_servers` started in a trusted folder.
 - Each run prints the engine versions. The results go in RUNBOOK by hand.
 
 ## Interface changes (one ADR; amends `05` §4)
@@ -281,22 +283,21 @@ Meridian's working folders can be anything: a repo root or a subfolder;
 a clone, worktree or submodule; trusted by the engines or not. Meridian
 narrows this down later. The design handles every case.
 
-## Left to the builder
+## Resolved in 0.13.0 (see ADR-0005 and RUNBOOK)
 
-- Confirm the pattern lists against the bundled engines:
-  - the Codex project-local keys that are honored;
-  - that the Claude Skill tool is absent with `tools=[]`.
-- The env removal mechanism for each SDK. Candidates:
-  - an empty value, if the engine treats `""` as unset. JS does; Rust
-    `env::var` gives `Ok("")`, so check Codex;
-  - the launch path: a `cli_path` wrapper for Claude.
-  - For Codex, `launch_args_override` drops `config_overrides`, which
-    carries the MCP shim, so it must not be used as is.
-  - Verify with an integration test that inspects the child's environment.
-- Assert that `delete` never touches a path outside the scan area.
-- Known, out of scope (report separately): the Claude and Codex backends do
-  not pass `ApiKeyAuth.api_key` to the engine, so API-key profiles depend
-  on the ambient environment.
+- Codex project-local keys: project `mcp_servers` are honored in a trusted
+  folder (live), so `.codex/config.toml` stays flagged.
+- Env removal mechanism: an empty value for both engines; an integration
+  test inspects the child's environment (`tests/integration/test_engine_env_child.py`)
+  and the live suite shows a subscription turn working with the scrub.
+- `delete` never touches a path outside the scan area: a symlinked pattern
+  folder that points outside the root raises `ConfigError` before any copy.
+- Out of scope, still true (report separately): the Claude and Codex
+  backends do not pass `ApiKeyAuth.api_key` to the engine, so API-key
+  profiles depend on the ambient environment.
+
+Open: that the Claude Skill tool is absent with `tools=[]` was verified in
+the bundle only; it was not checked live.
 
 ## Acceptance
 

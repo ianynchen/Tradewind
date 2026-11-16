@@ -44,7 +44,8 @@ recorded which engine version ran a turn. The stopped Antigravity design
 4. **Env scrub for subscription profiles only (D6).** Each backend declares
    `Backend.auth_env_vars()`. The engine gets the caller's environment with
    those names set to the empty value. Both engines treat an empty value as
-   unset. A process the engine starts sees `NAME=""`. API-key profiles are
+   unset. A process the engine starts therefore sees `NAME=""`
+   (a consequence of the mechanism, not a live result). API-key profiles are
    unchanged. `os.environ` is never changed.
 5. **Engine version on each turn (D7).** `Backend.engine_version()` is read
    on each turn, logged at INFO at turn start, and set on
