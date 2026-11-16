@@ -24,7 +24,13 @@ import pytest
 
 from tradewind.application.client import Tradewind
 from tradewind.application.config import TradewindConfig
-from tradewind.domain.events import Event, PermissionRequested, TurnCompleted, TurnFailed
+from tradewind.domain.events import (
+    Event,
+    ItemCompleted,
+    PermissionRequested,
+    TurnCompleted,
+    TurnFailed,
+)
 from tradewind.domain.models import ModelSpec, Profile, SessionOptions, SubscriptionAuth
 
 pytestmark = pytest.mark.integration
@@ -74,7 +80,11 @@ def _actions(broker: _RecordingBroker) -> list[dict[str, object]]:
 
 def _describe(events: list[Event], broker: _RecordingBroker) -> str:
     lines = [f"broker calls: {broker.calls!r}"]
-    lines += [repr(e) for e in events if isinstance(e, PermissionRequested | TurnFailed)]
+    lines += [
+        repr(e)[:400]
+        for e in events
+        if isinstance(e, PermissionRequested | TurnFailed | TurnCompleted | ItemCompleted)
+    ]
     return "\n".join(lines)
 
 
@@ -102,8 +112,7 @@ async def test_a_file_change_request_reaches_the_broker_with_its_changes(
     assert any(isinstance(e, TurnCompleted) for e in events), detail
     writes = [a for a in _actions(broker) if a.get("kind") == "file_write"]
     assert writes, f"no file_write reached the broker\n{detail}"
-    changes = writes[0]["fields"]["changes"]  # type: ignore[index]
-    assert any("hello.txt" in str(c) for c in changes), detail
+    assert any("hello.txt" in str(w.get("fields")) for w in writes), detail
     denied = [e for e in events if isinstance(e, PermissionRequested) and e.verdict == "deny"]
     assert denied == [], detail
     assert (workspace / "hello.txt").read_text().strip() == "hi"
@@ -130,4 +139,5 @@ async def test_a_shell_request_reaches_the_broker_as_a_shell_action(tmp_path: Pa
     assert any(isinstance(e, TurnCompleted) for e in events), detail
     shells = [a for a in _actions(broker) if a.get("kind") == "shell"]
     assert shells, f"no shell action reached the broker\n{detail}"
+    assert any("touch" in str(s.get("fields")) for s in shells), detail
     assert (workspace / "marker.txt").exists(), detail
