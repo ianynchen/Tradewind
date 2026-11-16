@@ -491,11 +491,17 @@ One set of mechanisms holds on every backend that declares the flag (design:
   anything but never loosen a floor rule. A broker on `ask` gets today's tool name and
   arguments plus a `tradewind` key (`tradewind_action` if the tool has its own `tradewind`
   argument) holding the shared action description; the tool itself never sees that key.
+  A matcher value `$turn.<name>` reads a turn variable: `mode`, `workspace`, `result_tool`
+  (the result tool's name when the turn uses it); `engine_mode` and `shim_server` are set only
+  by backends that have them (Antigravity, PR 2) and are `None` until then.
+  An invalid rule (unknown kind, outcome, mode or matcher op, a bad regex, an unknown `$turn`
+  name) raises `ConfigError`.
   A broker that raises gives `deny`.
 - **Work supervisor.** `TurnDefaults.model_silence_timeout_s` (300), `work_silence_timeout_s`
   (1800) and the optional hard cap `request_timeout_s` (`None` = backend default). All pause
   while a broker question is open. A fired limit adds a `turn_timeout` notice before the
-  terminal event, and a process report when engine processes are involved.
+  terminal event, and a process report where the backend can see the engine process (not on
+  Claude or Codex in this release; see Known limits below).
 - **Preflight.** `SessionOptions.on_preflight(question, details, choices)` answers a check's
   question; a check that stops the turn raises `ConfigError` before `TurnStarted`.
 - **Prompts are messages.** A prompt is never expanded as a slash command. `claude` sends a

@@ -277,7 +277,7 @@ class FakeGovernedBackend(Backend):
                     )
             elif isinstance(step, Observed):
                 work.started(step.id, step.kind, step.action.summary, step.has_end_signal)
-                outcome = policy.observe(step.action)
+                outcome = policy.observe(step.action).outcome
                 self.decisions.append((step.action.kind, outcome))
                 if outcome == "stop":
                     yield TurnFailed(turn_id=ctx.turn_id, error=f"stopped: {step.action.summary}")

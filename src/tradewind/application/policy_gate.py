@@ -7,12 +7,14 @@ action under a `tradewind` key. Nothing here talks to an engine.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Literal
 
 from tradewind.domain.events import Event, ItemCompleted
 from tradewind.domain.models import (
+    BrokerDecision,
     Denial,
     PermissionBroker,
     policy_record_notice,
@@ -30,11 +32,44 @@ class GateDecision:
     rule_ids: tuple[str, ...]
 
 
+@dataclass(frozen=True)
+class Observation:
+    """`observe`'s answer (05 §2.1): `stop` carries the matching rule's
+    reason, if it has one."""
+
+    outcome: Literal["allow", "stop"]
+    reason: str | None
+
+
+# A caller MCP tool reaches a backend as `ToolHost`'s own proxied name,
+# `mcp__<server>__<tool>` (`tool_host._mcp_tool_name`); anything else
+# `ToolHost` serves is a local `Tool`.
+_CALLER_MCP_NAME = re.compile(r"^mcp__(?P<server>[^_]+(?:_[^_]+)*)__.+$")
+
+
+def caller_tool_source(name: str) -> str:
+    """`source` of a caller tool (05 §1): `mcp:<server>` for a tool of a
+    caller MCP server, else `local`. Read from the name because `ToolHost`
+    names proxied tools `mcp__<server>__<tool>`; a local `Tool` the caller
+    named in that same pattern would be labelled `mcp:` (a label only --
+    the broker still gets the call under its own name)."""
+    match = _CALLER_MCP_NAME.match(name)
+    return f"mcp:{match.group('server')}" if match else "local"
+
+
 def broker_args_with_action(args: dict[str, object], action: Action) -> dict[str, object]:
-    """Copy of `args` with the action added under `tradewind`, or under
+    """Copy of `args` with the action (05 §1.1: `kind`, `fields`, `backend`,
+    `native_name`, `summary`) added under `tradewind`, or under
     `tradewind_action` when the tool already has a `tradewind` argument."""
     key = "tradewind_action" if "tradewind" in args else "tradewind"
-    return {**args, key: asdict(action)}
+    shared = {
+        "kind": action.kind,
+        "fields": action.fields,
+        "backend": action.backend,
+        "native_name": action.native_name,
+        "summary": action.summary,
+    }
+    return {**args, key: shared}
 
 
 class _GateBroker:
@@ -42,15 +77,19 @@ class _GateBroker:
 
     is_default_allow_all = False
 
-    def __init__(self, gate: PolicyGate, source: str) -> None:
+    def __init__(self, gate: PolicyGate, backend: str) -> None:
         self._gate = gate
-        self._source = source
+        self._backend = backend
 
-    async def decide(self, tool_name: str, tool_input: dict[str, object]) -> str | Denial:
+    async def decide(self, tool_name: str, tool_input: dict[str, object]) -> BrokerDecision:
         action = Action(
             kind="caller_tool",
-            fields={"name": tool_name, "args": tool_input, "source": self._source},
-            backend=self._gate._backend,
+            fields={
+                "name": tool_name,
+                "args": tool_input,
+                "source": caller_tool_source(tool_name),
+            },
+            backend=self._backend,
             native_name=tool_name,
             native_args=tool_input,
         )
@@ -115,11 +154,14 @@ class PolicyGate:
             )
         return result
 
-    def observe(self, action: Action) -> Literal["allow", "stop"]:
+    def observe(self, action: Action) -> Observation:
         """Decide an action the engine already runs: `deny` and `ask` stop.
         The mode default is `allow` in every mode (05 §2.3), so only a
         matching rule can stop the turn."""
-        return "allow" if self._evaluate(action, "allow").outcome == "allow" else "stop"
+        result = self._evaluate(action, "allow")
+        if result.outcome == "allow":
+            return Observation("allow", None)
+        return Observation("stop", result.reason or None)
 
     async def gate(
         self,
@@ -137,8 +179,8 @@ class PolicyGate:
             return GateDecision("allow", None, False, result.record, ids)
         if result.outcome in ("deny", "stop"):
             return GateDecision(result.outcome, result.reason or None, False, result.record, ids)
-        self._set_pending(self._pending + 1)
         try:
+            self._set_pending(self._pending + 1)
             raw = await self._broker.decide(
                 broker_name, broker_args_with_action(broker_args, action)
             )
@@ -158,6 +200,7 @@ class PolicyGate:
         if self.on_approval_change is not None:
             self.on_approval_change(count)
 
-    def as_broker(self, source: str) -> PermissionBroker:
-        """A broker whose decisions go through this gate (for `ToolHost`)."""
-        return _GateBroker(self, source)  # type: ignore[return-value]
+    def as_broker(self) -> PermissionBroker:
+        """A broker whose decisions go through this gate (for `ToolHost`).
+        A call's `source` comes from its name (`caller_tool_source`)."""
+        return _GateBroker(self, self._backend)

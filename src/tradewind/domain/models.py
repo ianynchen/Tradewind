@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol, runtime_checkable
 
-from pydantic import BaseModel, ConfigDict, SecretStr
+from pydantic import BaseModel, ConfigDict, SecretStr, field_validator
 
 from tradewind.domain.policy import Mode, Rule
 
@@ -316,6 +316,15 @@ class SessionOptions(BaseModel):
     cwd: Path | None = None
     permission_mode: Mode | None = None
     policy_rules: list[Rule] = []
+
+    @field_validator("policy_rules", mode="before")
+    @classmethod
+    def _rules_from_dicts(cls, value: object) -> object:
+        """A rule given as a dict goes through `Rule.from_dict`, so a bad
+        rule raises `ConfigError` here as it does for a `Rule`."""
+        if isinstance(value, list):
+            return [Rule.from_dict(r) if isinstance(r, dict) else r for r in value]
+        return value
 
     def snapshot(self) -> dict[str, Any]:
         """Declarative parts only (I-2): tool names+schemas, redacted MCP

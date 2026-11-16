@@ -50,7 +50,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import re
 from collections.abc import AsyncIterator, Callable
 from typing import ClassVar, cast
 
@@ -72,7 +71,7 @@ from langchain_core.messages.tool import ToolCall
 from langchain_core.messages.tool import tool_call as make_tool_call
 
 from tradewind.application.config import NativeStoreConfig
-from tradewind.application.policy_gate import PolicyGate
+from tradewind.application.policy_gate import PolicyGate, caller_tool_source
 from tradewind.application.ports import Backend, TurnContext
 from tradewind.domain.compaction import (
     build_summary_request,
@@ -125,22 +124,11 @@ _STRUCTURED_OUTPUT_INSTRUCTION = (
 
 ChatModelFactory = Callable[[ModelSpec], BaseChatModel]
 
-# `ToolHost` names a proxied MCP tool `mcp__<server>__<tool>`; the registry
-# is private, so the `source` of a caller tool (05 §1) is read from the name
-# (as `ClaudeBackend` does). A local tool named in that pattern is labelled
-# `mcp:` -- a label only; the broker still gets the call under its own name.
-_CALLER_MCP_NAME = re.compile(r"^mcp__(?P<server>[^_]+(?:_[^_]+)*)__.+$")
-
 
 def _caller_tool_action(name: str, args: dict[str, object]) -> Action:
-    match = _CALLER_MCP_NAME.match(name)
     return Action(
         kind="caller_tool",
-        fields={
-            "name": name,
-            "args": args,
-            "source": f"mcp:{match.group('server')}" if match else "local",
-        },
+        fields={"name": name, "args": args, "source": caller_tool_source(name)},
         backend="langchain",
         native_name=name,
         native_args=args,

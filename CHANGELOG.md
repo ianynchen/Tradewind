@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A broker that raises now gives `deny` (05 §2.6); before, the error was not turned into a verdict.
 - The hard cap (`TurnDefaults.request_timeout_s`) now pauses while a broker question is open, on all backends. Its default is now `None` = backend default: no hard cap on a backend with the work supervisor (Claude, Codex, LangChain), 600 s on one without (Cursor). A fired limit emits a `turn_timeout` notice (`ItemCompleted(kind="event")`) before the terminal event.
-- Codex brokers now receive an extra `tradewind` key in the broker-copy arguments (`tradewind_action` if the tool already has a `tradewind` argument); the tool's own arguments are unchanged.
+- Brokers on every governed backend (Claude, Codex, LangChain) now receive an extra `tradewind` key in the broker-copy arguments (`tradewind_action` if the tool already has a `tradewind` argument); the tool's own arguments are unchanged.
 - A prompt is always treated as a message, never expanded as a slash command. `claude` now sends a prompt whose first non-whitespace character is `/` with the prefix `Message: `; `codex` (app-server passes text as-is) and `langchain` (no slash parsing) send it unchanged; `cursor` sends it unchanged (unverified). The mirror keeps the original prompt.
 - New runtime dependency: `jsonschema>=4.26,<5`.
 

@@ -6,6 +6,8 @@ import json
 
 import pytest
 
+from tradewind.domain.errors import ConfigError
+from tradewind.domain.models import SessionOptions
 from tradewind.domain.policy import (
     Action,
     Matcher,
@@ -138,11 +140,23 @@ def test_matchers():
     assert m("ne", "a", "b") and not m("ne", "a", "a")
 
 
-def test_turn_workspace_variable_in_glob():
+def test_turn_workspace_variable_in_ne():
     rule = Rule("r", "file_write", {"path": Matcher("ne", "$turn.workspace")}, "deny")
     assert (
         _run(_action("file_write", path="/o"), caller=[rule], mode_default="allow").outcome
         == "deny"
+    )
+
+
+def test_turn_workspace_variable_in_glob():
+    rule = Rule("r", "file_read", {"path": Matcher("glob", "$turn.workspace")}, "deny")
+    assert (
+        _run(_action("file_read", path="/ws"), caller=[rule], mode_default="allow").outcome
+        == "deny"
+    )
+    assert (
+        _run(_action("file_read", path="/o"), caller=[rule], mode_default="allow").outcome
+        == "allow"
     )
 
 
@@ -178,3 +192,63 @@ def test_rule_can_match_unknown_tool_flag():
     flagged = Action("native", {}, "claude", "Mystery", {}, unknown_tool=True)
     assert _run(flagged, caller=[rule], mode_default="allow").outcome == "deny"
     assert _run(_action(), caller=[rule], mode_default="allow").outcome == "allow"
+
+
+_GOOD_RULE: dict[str, object] = {
+    "id": "r",
+    "kind": "shell",
+    "where": {"command": {"op": "prefix", "value": "rm"}},
+    "outcome": "deny",
+}
+
+# Each bad field, as (dict patch, constructor call). A typo must never turn
+# a rule into something else (e.g. `"dney"` silently never matching).
+_BAD_RULES: list[tuple[dict[str, object], object]] = [
+    ({"kind": "shel"}, lambda: Rule("r", "shel", {}, "deny")),  # type: ignore[arg-type]
+    ({"outcome": "dney"}, lambda: Rule("r", "shell", {}, "dney")),  # type: ignore[arg-type]
+    (
+        {"modes": ["brokr"]},
+        lambda: Rule("r", "shell", {}, "deny", modes=frozenset({"brokr"})),  # type: ignore[arg-type]
+    ),
+    (
+        {"where": {"command": {"op": "regx", "value": "a"}}},
+        lambda: Rule("r", "shell", {"command": Matcher("regx", "a")}, "deny"),  # type: ignore[arg-type]
+    ),
+    (
+        {"where": {"command": {"op": "regex", "value": "("}}},
+        lambda: Rule("r", "shell", {"command": Matcher("regex", "(")}, "deny"),
+    ),
+    (
+        {"where": {"command": {"op": "equals", "value": "$turn.workspce"}}},
+        lambda: Rule("r", "shell", {"command": Matcher("equals", "$turn.workspce")}, "deny"),
+    ),
+    (
+        {"where": {"command": {"value": "a"}}},
+        lambda: Rule("r", "shell", {"command": {"op": "prefix"}}, "deny"),  # type: ignore[dict-item]
+    ),
+]
+
+
+@pytest.mark.parametrize(("patch", "build"), _BAD_RULES)
+def test_bad_rule_field_raises_config_error(patch, build):
+    with pytest.raises(ConfigError):
+        build()
+    with pytest.raises(ConfigError):
+        Rule.from_dict({**_GOOD_RULE, **patch})
+    with pytest.raises(ConfigError):
+        SessionOptions(policy_rules=[{**_GOOD_RULE, **patch}])
+
+
+@pytest.mark.parametrize("missing", ["id", "kind", "where", "outcome"])
+def test_rule_from_dict_missing_key_raises_config_error(missing):
+    d = {k: v for k, v in _GOOD_RULE.items() if k != missing}
+    with pytest.raises(ConfigError):
+        Rule.from_dict(d)
+    with pytest.raises(ConfigError):
+        SessionOptions(policy_rules=[d])
+
+
+def test_good_rule_dict_accepted_by_session_options():
+    opts = SessionOptions(policy_rules=[_GOOD_RULE])
+    assert opts.policy_rules == [Rule.from_dict(_GOOD_RULE)]
+    assert Matcher("ne", "$turn.result_tool").value == "$turn.result_tool"

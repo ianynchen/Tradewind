@@ -93,7 +93,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from collections.abc import AsyncIterator, Sequence
 from typing import Any, ClassVar, cast
 
@@ -133,7 +132,7 @@ from claude_agent_sdk import (
 )
 
 from tradewind.application.config import NativeStoreConfig
-from tradewind.application.policy_gate import PolicyGate
+from tradewind.application.policy_gate import PolicyGate, caller_tool_source
 from tradewind.application.ports import Backend, TurnContext
 from tradewind.application.supervisor import WorkSupervisor
 from tradewind.application.tool_host import ToolHost
@@ -641,22 +640,6 @@ class _CallerRoundCap:
         return self._round_of_call[tool_use_id] > self.cap
 
 
-# A caller MCP tool reaches this adapter as `ToolHost`'s own proxied name,
-# `mcp__<server>__<tool>` (`tool_host._mcp_tool_name`); anything else
-# `ToolHost` serves is a local `Tool`.
-_CALLER_MCP_NAME = re.compile(r"^mcp__(?P<server>[^_]+(?:_[^_]+)*)__.+$")
-
-
-def _caller_tool_source(bare_name: str) -> str:
-    """`source` of a caller tool (05 §1): `mcp:<server>` for a tool of a
-    caller MCP server, else `local`. Read from the name because `ToolHost`
-    names proxied tools `mcp__<server>__<tool>`; a local `Tool` the caller
-    named in that same pattern would be labelled `mcp:` (a label only --
-    the broker still gets the call under its own name)."""
-    match = _CALLER_MCP_NAME.match(bare_name)
-    return f"mcp:{match.group('server')}" if match else "local"
-
-
 def message_prompt(prompt: str) -> str:
     """05 §5 (owner M11): a prompt is always a message to the model. The
     bundled CLI expands a leading `/` as a slash command, and its only
@@ -813,7 +796,7 @@ def _make_can_use_tool(
 def _caller_tool_action(name: str, args: dict[str, object]) -> Action:
     return Action(
         kind="caller_tool",
-        fields={"name": name, "args": args, "source": _caller_tool_source(name)},
+        fields={"name": name, "args": args, "source": caller_tool_source(name)},
         backend="claude",
         native_name=name,
         native_args=args,

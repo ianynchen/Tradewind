@@ -54,9 +54,9 @@ are disabled above), this adapter COULD, in principle, still consult
 `ctx.broker.decide()` itself inside `_build_custom_tools`'s `execute`
 callback before calling `ToolHost.call()`, the same way `LangchainBackend`'s
 own self-owned tool loop does. It deliberately does not: the capability
-flag says False, and `turn_runner.py`'s own `tool_host_broker = broker if
-backend.name == "codex" else None` line already only wires a broker into
-`ToolHost` itself for Codex, so leaving this adapter's own bridge
+flag says False, and `turn_runner.py`'s own `tool_host_broker =
+gate.as_broker() if backend.name == "codex" else None` line already only
+wires a broker into `ToolHost` itself for Codex, so leaving this adapter's own bridge
 broker-silent keeps the flag and the actual behavior in agreement (R-1:
 "honest capability over false uniformity") rather than gating quietly
 behind an unadvertised flag. No `PermissionRequested` event is ever

@@ -86,7 +86,7 @@ from tradewind.domain.models import (
     Tool,
     TurnResult,
 )
-from tradewind.domain.policy import Action, Rule
+from tradewind.domain.policy import Action, Matcher, Rule
 from tradewind.domain.supervision import Limits
 
 _VALID_ID = "33333333-3333-3333-3333-333333333333"
@@ -2699,6 +2699,87 @@ async def test_gate_notice_precedes_synthesized_terminal(tmp_path: Path) -> None
     assert _is_policy_notice(events[-2])
     stored = tw._store.history(_VALID_ID, include_children=False, include_raw=False)
     assert any(m.content.get("type") == "policy_recorded" for m in stored)
+
+
+class _NoticeThenRaiseBackend(_RecordingNoticeBackend):
+    """Raises one recorded gate notice, then fails with its own error."""
+
+    def __init__(self, profile: Profile, native_config: NativeStoreConfig) -> None:
+        super().__init__(profile, native_config, terminal=False)
+
+    async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
+        yield TurnStarted(turn_id=ctx.turn_id)
+        self._notice(ctx)
+        raise RuntimeError("backend boom")
+
+
+async def test_end_drain_failure_keeps_error_and_finalizes(tmp_path: Path) -> None:
+    """A store failure while the `finally` stores gate notices is logged:
+    the backend's own error still propagates and the turn is finalized."""
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    tw._backends["default"] = _NoticeThenRaiseBackend(profile, NativeStoreConfig())
+    session = await tw.create(_VALID_ID, SessionOptions(policy_rules=[_record_rule()]))
+    store = tw._store
+    real_append = store.append_message
+
+    def append_message(session_id: str, turn_id: str, message: NormalizedMessage) -> int:
+        if message.content.get("type") == "policy_recorded":
+            raise OSError("disk full")
+        return real_append(session_id, turn_id, message)
+
+    store.append_message = append_message  # type: ignore[method-assign]
+    with pytest.raises(RuntimeError, match="backend boom"):
+        _ = [e async for e in session.stream("go")]
+
+    assert _turn_statuses(store, _VALID_ID) == ["failed"]
+
+
+class _ResultToolProbeBackend(_RecordingNoticeBackend):
+    """Uses the result tool (05 §6); observes one call to it and records
+    what the gate answered."""
+
+    uses_result_tool: ClassVar[bool] = True
+
+    def __init__(self, profile: Profile, native_config: NativeStoreConfig) -> None:
+        super().__init__(profile, native_config, terminal=True)
+        self.observed: list[str] = []
+
+    def _notice(self, ctx: TurnContext) -> None:
+        assert ctx.policy is not None
+        self.observed.append(
+            ctx.policy.observe(
+                Action(
+                    kind="caller_tool",
+                    fields={"name": "tradewind_submit_result"},
+                    backend="langchain",
+                    native_name="tradewind_submit_result",
+                    native_args={},
+                )
+            ).outcome
+        )
+
+
+@pytest.mark.parametrize(("schema", "outcome"), [({"type": "object"}, "stop"), (None, "allow")])
+async def test_turn_result_tool_variable_names_the_result_tool(
+    tmp_path: Path, schema: dict[str, object] | None, outcome: str
+) -> None:
+    """`$turn.result_tool` is the result tool's name on a turn that uses it,
+    else `None` -- so the rule matches only then."""
+    profile = _profile()
+    tw = Tradewind(_config(tmp_path, profile))
+    backend = _ResultToolProbeBackend(profile, NativeStoreConfig())
+    tw._backends["default"] = backend
+    rule = Rule(
+        id="r",
+        kind="caller_tool",
+        where={"name": Matcher("equals", "$turn.result_tool")},
+        outcome="deny",
+    )
+    session = await tw.create(_VALID_ID, SessionOptions(output_schema=schema, policy_rules=[rule]))
+    _ = [e async for e in session.stream("go")]
+
+    assert backend.observed == [outcome]
 
 
 # --- 05-turn-governance §4: prepare_turn and a stop around it ---

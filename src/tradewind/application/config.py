@@ -74,6 +74,15 @@ class TurnDefaults(BaseModel):
     compaction: CompactionSettings = CompactionSettings()
     retry: RetrySettings = RetrySettings()
 
+    def model_post_init(self, _context: Any, /) -> None:
+        """Raises:
+        ConfigError: a limit is set but not a positive number (the rule
+            the per-call overrides follow)."""
+        for key in ("model_silence_timeout_s", "work_silence_timeout_s", "request_timeout_s"):
+            value = getattr(self, key)
+            if value is not None and value <= 0:
+                raise ConfigError(f"{key} must be a positive number, got {value!r}")
+
 
 EventHook = Callable[[Event], None]
 

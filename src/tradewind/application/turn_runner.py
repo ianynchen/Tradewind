@@ -36,7 +36,7 @@ from tradewind.application.policy_gate import PolicyGate
 from tradewind.application.ports import Backend, SessionStorePort, TurnContext
 from tradewind.application.resume import ResumePlanner
 from tradewind.application.supervisor import WorkSupervisor
-from tradewind.application.tool_host import ToolHost
+from tradewind.application.tool_host import RESULT_TOOL_NAME, ToolHost
 from tradewind.domain.errors import (
     ConfigError,
     SessionNotFound,
@@ -706,6 +706,10 @@ class TurnRunner:
             # for them too would consult it twice per tool call -- harmless
             # for a stateless allow/deny broker, but wrong for "ask"
             # semantics (blocks on a human; must not be asked twice).
+            output_schema = _effective_output_schema(snapshot, overrides)
+            # 05 §6: engines with no output-schema support get the result
+            # tool instead; `$turn.result_tool` names it on such a turn.
+            uses_result_tool = backend.uses_result_tool and output_schema is not None
             gate = PolicyGate(
                 broker=broker,
                 floor=[*floor_tradewind(), *backend.floor_rules()],
@@ -716,7 +720,7 @@ class TurnRunner:
                     engine_mode=None,
                     shim_server=None,
                     workspace=cast("str | None", snapshot.get("cwd")),
-                    result_tool=None,
+                    result_tool=RESULT_TOOL_NAME if uses_result_tool else None,
                 ),
                 has_broker=not getattr(broker, "is_default_allow_all", False),
                 emit=gate_events.append,
@@ -733,17 +737,14 @@ class TurnRunner:
             )
             # Broker questions pause every limit (05 §3.2).
             gate.on_approval_change = supervisor.approvals_changed
-            tool_host_broker = gate.as_broker("shim") if backend.name == "codex" else None
-            output_schema = _effective_output_schema(snapshot, overrides)
+            tool_host_broker = gate.as_broker() if backend.name == "codex" else None
             async with ToolHost(
                 options.tools,
                 options.mcp_servers,
                 self._resolve_ref,
                 socket_dir=self._config.tool_host.socket_dir,
                 broker=tool_host_broker,
-                # 05 §6: engines with no output-schema support get the
-                # result tool instead.
-                result_schema=output_schema if backend.uses_result_tool else None,
+                result_schema=output_schema if uses_result_tool else None,
             ) as tool_host:
                 # The prompt is this turn's own input, not something a
                 # backend "completes" as an `ItemCompleted` event, so
@@ -1051,9 +1052,16 @@ class TurnRunner:
                         )
             if gate_events:
                 # Notices raised before an abnormal end (a raising backend,
-                # an abandoned stream) still reach the store.
+                # an abandoned stream) still reach the store. A failure here
+                # is logged, not raised: it must not replace the error
+                # already in flight nor skip the finalize write below.
                 with anyio.CancelScope(shield=True):
-                    await drain_gate_events()
+                    try:
+                        await drain_gate_events()
+                    except Exception:
+                        _logger.exception(
+                            "storing gate notices at turn end failed", extra={"turn_id": turn_id}
+                        )
             if terminal_status is None:
                 # Reached only when the caller abandoned the stream before
                 # a terminal event was produced (GeneratorExit from an

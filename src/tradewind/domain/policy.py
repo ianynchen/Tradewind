@@ -11,8 +11,10 @@ from __future__ import annotations
 import fnmatch
 import re
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any, Literal, get_args
+
+from tradewind.domain.errors import ConfigError
 
 ActionKind = Literal[
     "caller_tool",
@@ -67,12 +69,40 @@ class TurnVars:
     result_tool: str | None
 
 
+_TURN_VAR_NAMES: frozenset[str] = frozenset(f.name for f in fields(TurnVars))
+
+
 @dataclass(frozen=True)
 class Matcher:
-    """Test of one action field. A missing field never matches, except `ne`."""
+    """Test of one action field. A missing field never matches, except `ne`.
+
+    Failure modes:
+        ConfigError: `op` is not a `MatchOp`, a `regex` value is not a
+            valid pattern, or a `$turn.<name>` value names no `TurnVars`
+            field.
+    """
 
     op: MatchOp
     value: object = None
+
+    def __post_init__(self) -> None:
+        if self.op not in get_args(MatchOp):
+            raise ConfigError(f"matcher op {self.op!r} is not one of {get_args(MatchOp)}")
+        value = self.value
+        if isinstance(value, str) and value.startswith("$turn."):
+            name = value[len("$turn.") :]
+            if name not in _TURN_VAR_NAMES:
+                raise ConfigError(
+                    f"matcher value {value!r} names no turn variable; "
+                    f"known: {sorted(_TURN_VAR_NAMES)}"
+                )
+        elif self.op == "regex":
+            if not isinstance(value, str):
+                raise ConfigError(f"regex matcher value must be a string, got {value!r}")
+            try:
+                re.compile(value)
+            except re.error as exc:
+                raise ConfigError(f"regex matcher value {value!r} is invalid: {exc}") from exc
 
     def matches(self, actual: object, turn: TurnVars) -> bool:
         expected = self.value
@@ -101,7 +131,12 @@ class Matcher:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Matcher:
-        return cls(op=d["op"], value=d.get("value"))
+        """Raises:
+        ConfigError: `d` has no `op`, or the matcher is invalid."""
+        try:
+            return cls(op=d["op"], value=d.get("value"))
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise ConfigError(f"invalid matcher {d!r}: {exc!r}") from exc
 
 
 def _lookup(action: Action, name: str) -> object:
@@ -115,7 +150,12 @@ def _lookup(action: Action, name: str) -> object:
 
 @dataclass(frozen=True)
 class Rule:
-    """A policy rule: when `kind` and every `where` matcher match, `outcome` applies."""
+    """A policy rule: when `kind` and every `where` matcher match, `outcome` applies.
+
+    Failure modes:
+        ConfigError: `kind`, `outcome` or a `modes` entry is not one of its
+            allowed values, or a `where` value is not a `Matcher`.
+    """
 
     id: str
     kind: ActionKind | Literal["any"]
@@ -124,6 +164,22 @@ class Rule:
     record: bool = False
     modes: frozenset[Mode] = field(default_factory=lambda: _ALL_MODES)
     reason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.kind != "any" and self.kind not in get_args(ActionKind):
+            raise ConfigError(f"rule {self.id!r}: kind {self.kind!r} is not an action kind")
+        if self.outcome not in get_args(Outcome):
+            raise ConfigError(
+                f"rule {self.id!r}: outcome {self.outcome!r} is not one of {get_args(Outcome)}"
+            )
+        bad_modes = sorted(str(m) for m in self.modes if m not in _ALL_MODES)
+        if bad_modes:
+            raise ConfigError(
+                f"rule {self.id!r}: modes {bad_modes} are not one of {get_args(Mode)}"
+            )
+        for name, matcher in self.where.items():
+            if not isinstance(matcher, Matcher):
+                raise ConfigError(f"rule {self.id!r}: where[{name!r}] is not a Matcher")
 
     def matches(self, action: Action, turn: TurnVars) -> bool:
         if turn.mode not in self.modes:
@@ -145,15 +201,21 @@ class Rule:
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> Rule:
-        return cls(
-            id=d["id"],
-            kind=d["kind"],
-            where={k: Matcher.from_dict(m) for k, m in d["where"].items()},
-            outcome=d["outcome"],
-            record=d.get("record", False),
-            modes=frozenset(d.get("modes", _ALL_MODES)),
-            reason=d.get("reason", ""),
-        )
+        """Raises:
+        ConfigError: `d` lacks `id`, `kind`, `where` or `outcome`, or the
+            rule or one of its matchers is invalid."""
+        try:
+            return cls(
+                id=d["id"],
+                kind=d["kind"],
+                where={k: Matcher.from_dict(m) for k, m in d["where"].items()},
+                outcome=d["outcome"],
+                record=d.get("record", False),
+                modes=frozenset(d.get("modes", _ALL_MODES)),
+                reason=d.get("reason", ""),
+            )
+        except (KeyError, TypeError, AttributeError) as exc:
+            raise ConfigError(f"invalid rule {d!r}: {exc!r}") from exc
 
 
 @dataclass(frozen=True)

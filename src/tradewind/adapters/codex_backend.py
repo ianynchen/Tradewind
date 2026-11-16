@@ -1627,9 +1627,11 @@ class CodexBackend(Backend):
         action = observed_action(item, workspace=workspace)
         if action is None or ledger.was_requested(item.root.id):
             return None
-        if policy.observe(action) == "allow":
+        observation = policy.observe(action)
+        if observation.outcome == "allow":
             return None
-        return f"turn stopped by policy after {action.kind} {action.summary!r}"
+        stopped = f"turn stopped by policy after {action.kind} {action.summary!r}"
+        return f"{stopped}: {observation.reason}" if observation.reason else stopped
 
     async def _consume(
         self,

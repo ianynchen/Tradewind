@@ -5,8 +5,10 @@ from __future__ import annotations
 import anyio
 
 from tradewind.application.policy_gate import (
+    Observation,
     PolicyGate,
     broker_args_with_action,
+    caller_tool_source,
 )
 from tradewind.domain.events import Event, ItemCompleted
 from tradewind.domain.models import Denial, SessionOptions
@@ -73,6 +75,25 @@ async def test_existing_broker_receives_todays_name_and_args():
     assert args == {"pr": 7}
 
 
+def test_broker_copy_holds_only_the_shared_fields():
+    """05 §1.1: `{kind, fields, backend, native_name, summary}` -- never
+    `native_args` or the internal flags."""
+    out = broker_args_with_action({"pr": 7}, _action())
+    assert out["tradewind"] == {
+        "kind": "caller_tool",
+        "fields": {"name": "merge_pull_request", "args": {"pr": 7}},
+        "backend": "claude",
+        "native_name": "merge_pull_request",
+        "summary": "merge_pull_request call",
+    }
+
+
+def test_caller_tool_source_from_name():
+    assert caller_tool_source("merge") == "local"
+    assert caller_tool_source("mcp__gh__merge") == "mcp:gh"
+    assert caller_tool_source("mcp__my_srv__t") == "mcp:my_srv"
+
+
 def test_tradewind_key_collision_uses_tradewind_action():
     args = {"tradewind": "mine", "x": 1}
     out = broker_args_with_action(args, _action())
@@ -91,17 +112,22 @@ async def test_pass_through_never_asks():
 
 def test_observe_default_allow_and_deny_becomes_stop():
     gate, _ = _gate(mode="engine_auto", has_broker=False)
-    assert gate.observe(_action()) == "allow"
+    assert gate.observe(_action()) == Observation("allow", None)
     gate2, _ = _gate(
         mode="engine_auto",
-        caller=[Rule("d", "caller_tool", {"name": Matcher("equals", "x")}, "deny")],
+        caller=[
+            Rule("d", "caller_tool", {"name": Matcher("equals", "x")}, "deny", reason="no x"),
+            Rule("q", "caller_tool", {"name": Matcher("equals", "z")}, "ask"),
+        ],
     )
-    assert gate2.observe(_action(name="x")) == "stop"
+    # A stop carries the matching rule's reason (None when it has none).
+    assert gate2.observe(_action(name="x")) == Observation("stop", "no x")
+    assert gate2.observe(_action(name="z")) == Observation("stop", None)
     # 05 §2.3: the observe default is `allow` in every mode -- a gate's
     # `ask` default never stops an observed action; only a matching rule does.
-    assert gate2.observe(_action(name="y")) == "allow"
+    assert gate2.observe(_action(name="y")) == Observation("allow", None)
     gate3, _ = _gate(mode="broker")
-    assert gate3.observe(_action()) == "allow"
+    assert gate3.observe(_action()) == Observation("allow", None)
 
 
 async def test_engine_auto_without_broker_allows_without_asking():
@@ -188,7 +214,7 @@ async def test_as_broker_maps_outcomes():
             Rule("a", "caller_tool", {"name": Matcher("equals", "good")}, "allow"),
         ]
     )
-    b = gate.as_broker("tool_host")
+    b = gate.as_broker()
     assert getattr(b, "is_default_allow_all", False) is False
     assert await b.decide("good", {}) == "allow"
     assert await b.decide("bad", {}) == Denial("nope", False)
@@ -198,7 +224,10 @@ async def test_as_broker_maps_outcomes():
 async def test_as_broker_builds_caller_tool_action():
     seen: list[Action] = []
     gate, _ = _gate(
-        caller=[Rule("a", "caller_tool", {"source": Matcher("equals", "shim")}, "allow")]
+        caller=[
+            Rule("a", "caller_tool", {"source": Matcher("equals", "local")}, "allow"),
+            Rule("m", "caller_tool", {"source": Matcher("equals", "mcp:gh")}, "allow"),
+        ]
     )
     orig = gate.gate
 
@@ -207,9 +236,28 @@ async def test_as_broker_builds_caller_tool_action():
         return await orig(action, **kw)
 
     gate.gate = spy  # type: ignore[method-assign]
-    assert await gate.as_broker("shim").decide("t", {"a": 1}) == "allow"
-    assert seen[0].fields == {"name": "t", "args": {"a": 1}, "source": "shim"}
+    assert await gate.as_broker().decide("t", {"a": 1}) == "allow"
+    assert await gate.as_broker().decide("mcp__gh__t", {}) == "allow"
+    assert seen[0].fields == {"name": "t", "args": {"a": 1}, "source": "local"}
+    assert seen[1].fields["source"] == "mcp:gh"
     assert seen[0].backend == "claude"
+
+
+async def test_pending_counter_paired_when_approval_hook_raises():
+    """The +1 is inside the `try`, so the `finally` always pairs it."""
+    gate, _ = _gate(_Broker())
+    counts: list[int] = []
+
+    def hook(count: int) -> None:
+        counts.append(count)
+        if count == 1:
+            raise RuntimeError("hook")
+
+    gate.on_approval_change = hook
+    decision = await gate.gate(_action(), broker_name="n", broker_args={})
+    assert decision.outcome == "deny"
+    assert gate.pending_approvals == 0
+    assert counts == [1, 0]
 
 
 def test_snapshot_includes_permission_mode_and_rules():

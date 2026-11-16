@@ -1299,6 +1299,22 @@ async def test_observe_only_completed_without_request() -> None:
     failed = [e for e in events if isinstance(e, TurnFailed)]
     assert len(failed) == 1
     assert "ls" in failed[0].error
+    # The matching rule's reason reaches the stop (05 §2.1).
+    assert "no ls" in failed[0].error
+
+
+async def test_tool_host_broker_labels_caller_tools_by_name() -> None:
+    """05 §1: a caller tool's `source` is `local` or `mcp:<server>`, also
+    for the broker `turn_runner` gives Codex's `ToolHost`."""
+    broker = _ScriptedBroker("allow")
+    tool_host_broker = _gate(broker, caller=[_rule("caller_tool", "ask")]).as_broker()
+
+    assert await tool_host_broker.decide("merge", {"pr": 7}) == "allow"
+    assert await tool_host_broker.decide("mcp__gh__merge", {}) == "allow"
+
+    assert [a["fields"]["source"] for a in broker.actions] == ["local", "mcp:gh"]
+    assert broker.actions[0]["backend"] == "codex"
+    assert broker.calls[0] == ("merge", {"pr": 7})
 
 
 async def test_item_started_is_never_observed() -> None:
