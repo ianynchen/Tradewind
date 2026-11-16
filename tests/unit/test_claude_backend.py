@@ -2226,7 +2226,28 @@ async def test_isolated_false_is_the_default(monkeypatch: pytest.MonkeyPatch) ->
     assert options.strict_mcp_config is False
 
 
-def test_isolated_must_be_a_bool() -> None:
-    """A typo such as "yes" must not silently mean "not isolated"."""
+@pytest.mark.parametrize("value", ["yes", 1, None])
+def test_isolated_must_be_a_bool(value: object) -> None:
+    """A typo such as "yes" (or 1) must not silently mean "not isolated"."""
     with pytest.raises(ValueError, match="isolated"):
-        ClaudeBackend(_isolated_profile("yes"), NativeStoreConfig())
+        ClaudeBackend(_isolated_profile(value), NativeStoreConfig())
+
+
+async def test_isolation_reaches_the_cli_argv(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The SDK transport, not only the options object: `[]` must become
+    `--setting-sources=` (not be dropped as falsy) and strict MCP must become
+    `--strict-mcp-config`. Guards an SDK upgrade too."""
+    from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+
+    def argv_of(options: Any) -> list[str]:
+        transport = SubprocessCLITransport(prompt="", options=options)
+        transport._cli_path = "claude"  # resolved by connect() in real runs
+        return transport._build_command()
+
+    argv = argv_of(await _captured_options(monkeypatch, _isolated_profile(True)))
+    assert "--strict-mcp-config" in argv
+    assert "--setting-sources=" in argv
+
+    default_argv = argv_of(await _captured_options(monkeypatch, _profile()))
+    assert "--strict-mcp-config" not in default_argv
+    assert not any(a.startswith("--setting-sources") for a in default_argv)

@@ -660,7 +660,8 @@ What "no configuration" actually means:
 - **Claude loads the user's own Claude settings by default** (the SDK default): plugins, hooks,
   permission rules and MCP servers from `~/.claude` and `~/.claude.json`, and project settings
   from the session's `cwd`. Set `Profile.backend_options["isolated"] = True` to load none of
-  them and to allow only the MCP servers you pass (0.14).
+  them and to allow only the MCP servers you pass (0.14). It does not change what the CLI
+  reads outside those settings: managed policy, the login credentials and its memory folder.
 - **The toolproxy unix socket** has no authentication of its own — filesystem permissions
   (`0o700` socket directory) and the same-machine, same-OS-user assumption are the boundary.
 
