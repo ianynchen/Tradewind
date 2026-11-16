@@ -15,8 +15,15 @@ import stat
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from tradewind.domain.errors import ConfigError
+
+if TYPE_CHECKING:
+    # TYPE_CHECKING only: `application.ports` imports `CustomizationPattern`
+    # from this module, so a runtime import here would loop.
+    from tradewind.application.ports import Backend
+    from tradewind.domain.models import SessionRow
 
 
 @dataclass(frozen=True)
@@ -88,6 +95,19 @@ def scan(folder: Path, patterns: Sequence[CustomizationPattern], backend: str) -
     lines = [backend, str(root.resolve()), *(f"{f.path.as_posix()} {f.sha256}" for f in files)]
     fingerprint = hashlib.sha256(os.fsencode("\n".join(lines))).hexdigest()
     return CustomizationScan(root=root, files=files, fingerprint=fingerprint)
+
+
+def scan_session(session: SessionRow, backend: Backend) -> CustomizationScan:
+    """Scan the engine's working folder for `backend`'s patterns: the
+    session's `cwd` when it is set, else the process cwd (06 §2 "One
+    folder"). `Session.scan_customizations()` and the turn runner both call
+    this, so they give the same fingerprint.
+
+    Raises:
+        ConfigError: as `scan`.
+    """
+    folder = Path(session.cwd) if session.cwd is not None else Path.cwd()
+    return scan(folder, backend.customization_patterns(), backend.name)
 
 
 def _lstat(path: Path) -> os.stat_result | None:

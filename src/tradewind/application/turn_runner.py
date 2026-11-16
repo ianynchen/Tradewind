@@ -26,6 +26,7 @@ import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable
 from contextlib import aclosing
 from dataclasses import replace
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import ClassVar, Protocol, cast
 
@@ -43,14 +44,17 @@ from tradewind.application.process_report import (
 from tradewind.application.resume import ResumePlanner
 from tradewind.application.supervisor import WorkSupervisor
 from tradewind.application.tool_host import RESULT_TOOL_NAME, SHIM_MODULE, ToolHost
+from tradewind.application.workspace_decision import apply_delete, resolve
+from tradewind.application.workspace_scan import scan_session
 from tradewind.domain.errors import (
     ConfigError,
     SessionNotFound,
     TurnInProgress,
     Unsupported,
 )
-from tradewind.domain.events import Event, ItemCompleted, TurnCompleted, TurnFailed
+from tradewind.domain.events import Event, ItemCompleted, TurnCompleted, TurnFailed, TurnStarted
 from tradewind.domain.models import (
+    CustomizationDecision,
     HistoryScope,
     ModelSpec,
     NormalizedMessage,
@@ -62,6 +66,7 @@ from tradewind.domain.models import (
     TurnResult,
     TurnStatus,
     Verdict,
+    customization_notice,
     timeout_notice,
 )
 from tradewind.domain.policy import Rule, TurnVars, floor_tradewind
@@ -199,6 +204,19 @@ def _effective_history_scope(overrides: dict[str, object]) -> HistoryScope | Non
         raise ConfigError(f"history_scope must be one of 'none'/'flat'/'tree', got {value!r}")
     # mypy narrows `value` to the literal set via the membership check above.
     return value
+
+
+def _effective_customizations(overrides: dict[str, object]) -> CustomizationDecision | None:
+    """Validate the per-call `customizations` decision (06 §3). Per-call
+    only and never stored (D4).
+
+    Failure modes:
+        ConfigError: the value is not a `CustomizationDecision`.
+    """
+    value = overrides.get("customizations")
+    if value is None or isinstance(value, CustomizationDecision):
+        return value
+    raise ConfigError(f"customizations must be a CustomizationDecision, got {value!r}")
 
 
 def _render_child_block(child_session_id: str, messages: list[StoredMessage]) -> str:
@@ -612,6 +630,10 @@ class TurnRunner:
             ConfigError: the session's profile is no longer registered, the
                 effective tier is not one of its models, or a
                 `max_tool_rounds` override is not a non-negative int.
+                It is also raised, with no turn opened, when workspace
+                customizations are found and the `customizations` decision
+                is missing, stale or `stop` (06 §3); and, with the turn
+                failed before `run()`, when a `delete` cannot complete.
             TurnInProgress: `session_id` already has an in-flight turn
                 (raised by `store.begin_turn`, propagates untouched -- I-5).
         """
@@ -642,6 +664,14 @@ class TurnRunner:
                 overrides, "work_silence_timeout_s", self._config.defaults.work_silence_timeout_s
             ),
         )
+        customizations = _effective_customizations(overrides)
+        backend = self._resolve_backend(session_row.profile, profile)
+        # 06 §3: the workspace check runs once, here -- before `begin_turn`,
+        # the native reconcile and anything that spawns an engine -- so a
+        # refusal raises with no turn row and no mirrored prompt. The scan
+        # is kept: a `delete` removes exactly these files before `run()`.
+        customization_scan = await anyio.to_thread.run_sync(scan_session, session_row, backend)
+        customization_outcome = resolve(customization_scan, customizations)
 
         turn_id = str(uuid.uuid4())
         self._interrupt_requested.discard(session_id)
@@ -672,6 +702,9 @@ class TurnRunner:
         # A terminal held back until the engine is closed and its process
         # report is out (the report precedes the terminal).
         held_terminal: Event | None = None
+        # 06 §3: the `delete`/`proceed` notice, emitted right after the
+        # backend's first `TurnStarted`.
+        pending_notice: ItemCompleted | None = None
 
         async def drain_gate_events() -> list[Event]:
             """Persist and tap the buffered gate and timeout notices; the
@@ -691,12 +724,11 @@ class TurnRunner:
         error: str | None = None
 
         # Everything from here on runs with an open turn in the store, so
-        # it is all inside try/finally: any failure -- resolving the
-        # backend included, not just the turn itself -- still finalizes
-        # the turn as `failed` rather than leaving it `in_progress` until
-        # the next `sweep_stale_turns` (session open).
+        # it is all inside try/finally: any failure, not just the turn
+        # itself, still finalizes the turn as `failed` rather than leaving
+        # it `in_progress` until the next `sweep_stale_turns` (session
+        # open). The backend is resolved above, for the workspace check.
         try:
-            backend = self._resolve_backend(session_row.profile, profile)
             # 05 §2: the stored snapshot is the source of truth for the
             # session's policy, mode and the gate's workspace (`cwd`) (a
             # bare `resume()` passes empty live options;
@@ -938,6 +970,34 @@ class TurnRunner:
                     await backend.prepare_turn(ctx)
                     stopped_before_run = session_id in self._interrupt_requested
                 if not stopped_before_run:
+                    # 06 §3: a `delete` happens just before `run()`; a
+                    # failure fails the turn, like a `prepare_turn`
+                    # `ConfigError`, and nothing reaches the engine.
+                    if customization_outcome.delete:
+                        backup = await anyio.to_thread.run_sync(
+                            lambda: apply_delete(
+                                customization_scan,
+                                backup_dir=self._config.customization_backup_dir,
+                                turn_id=turn_id,
+                                now=datetime.now(UTC),
+                            )
+                        )
+                        notice_text: str | None = (
+                            f"workspace customizations deleted: "
+                            f"{customization_outcome.files_text}; backup at {backup}"
+                        )
+                    else:
+                        notice_text = customization_outcome.notice
+                    if notice_text is not None:
+                        _logger.warning(
+                            "%s",
+                            notice_text,
+                            extra={"turn_id": turn_id, "session_id": session_id},
+                        )
+                        pending_notice = ItemCompleted(
+                            message=customization_notice(text=notice_text)
+                        )
+
                     # FR-6.6 work supervisor (05 §3): a TASK (deliberately not
                     # a cancel scope across this generator's yields -- the
                     # 0.5.0 pitfall class) that, when a limit fires, records
@@ -1030,6 +1090,16 @@ class TurnRunner:
                                     continue
                             self._tap(event, turn_id)
                             yield event
+                            if isinstance(event, TurnStarted) and pending_notice is not None:
+                                notice, pending_notice = pending_notice, None
+                                await anyio.to_thread.run_sync(
+                                    self._store.append_message,
+                                    session_id,
+                                    turn_id,
+                                    notice.message,
+                                )
+                                self._tap(notice, turn_id)
+                                yield notice
 
                     await stop_supervisor()
                     # A stop from here on finds no watch (05 §3.4: what the

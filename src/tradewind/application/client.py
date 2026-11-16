@@ -43,6 +43,7 @@ import anyio
 from tradewind.application.config import NativeStoreConfig, TradewindConfig
 from tradewind.application.ports import Backend, SessionStorePort
 from tradewind.application.turn_runner import TurnRunner
+from tradewind.application.workspace_scan import CustomizationScan, scan_session
 from tradewind.domain.compaction import summarizer_spend
 from tradewind.domain.errors import (
     ConfigError,
@@ -53,6 +54,7 @@ from tradewind.domain.errors import (
 from tradewind.domain.events import Event, TurnCompleted, TurnFailed
 from tradewind.domain.models import (
     BackendName,
+    CustomizationDecision,
     Profile,
     SessionOptions,
     SessionRow,
@@ -158,9 +160,15 @@ class Session:
     _client: Tradewind
     _options: SessionOptions = field(default_factory=lambda: SessionOptions())
 
-    async def run(self, prompt: str, **overrides: object) -> TurnResult:
+    async def run(
+        self,
+        prompt: str,
+        *,
+        customizations: CustomizationDecision | None = None,
+        **overrides: object,
+    ) -> TurnResult:
         result: TurnResult | None = None
-        async for event in self.stream(prompt, **overrides):
+        async for event in self.stream(prompt, customizations=customizations, **overrides):
             if isinstance(event, TurnCompleted):
                 result = event.result
             elif isinstance(event, TurnFailed):
@@ -173,8 +181,33 @@ class Session:
             raise TurnExecutionFailed("turn ended without a result")
         return result
 
-    def stream(self, prompt: str, **overrides: object) -> AsyncIterator[Event]:
+    def stream(
+        self,
+        prompt: str,
+        *,
+        customizations: CustomizationDecision | None = None,
+        **overrides: object,
+    ) -> AsyncIterator[Event]:
+        """`customizations` is this turn's answer to a customization scan
+        (06 §3). It travels with the per-call overrides and is never stored
+        (D4)."""
+        if customizations is not None:
+            overrides["customizations"] = customizations
         return self._client._turn_runner.execute(self.id, self._options, prompt, overrides)
+
+    def scan_customizations(self) -> CustomizationScan:
+        """Find the workspace files this session's engine would load that
+        can run code or loosen permissions without a broker question
+        (06 §1, §2). Pass `scan.fingerprint` back in a
+        `CustomizationDecision` with the next turn. Reads the file system;
+        a backend with no patterns gives an empty scan.
+
+        Failure modes:
+            SessionNotFound: the session does not exist.
+            ConfigError: the profile or backend cannot be resolved, or a
+                flagged file cannot be read.
+        """
+        return self._client._scan_customizations(self.id)
 
     async def stop(self) -> None:
         await self._client._stop(self.id)
@@ -195,8 +228,16 @@ class Session:
         """
         return await self._client._turn_runner.compact(self.id, instructions)
 
-    async def spawn(self, prompt: str, *, tier: TierName | None = None) -> Session:
-        return await self._client._spawn(self, prompt, tier)
+    async def spawn(
+        self,
+        prompt: str,
+        *,
+        tier: TierName | None = None,
+        customizations: CustomizationDecision | None = None,
+    ) -> Session:
+        """`customizations` is the decision for the child's first turn; the
+        child never takes the parent's decision (D9)."""
+        return await self._client._spawn(self, prompt, tier, customizations)
 
 
 class Tradewind:
@@ -393,7 +434,20 @@ class Tradewind:
         backend = self._resolve_backend(row.profile, profile)
         await self._turn_runner.request_stop(session_id, backend)
 
-    async def _spawn(self, parent: Session, prompt: str, tier: TierName | None) -> Session:
+    def _scan_customizations(self, session_id: str) -> CustomizationScan:
+        row = self._store.get_session(session_id)
+        if row is None:
+            raise SessionNotFound(session_id)
+        _, profile = _resolve_profile(self._config, row.profile)
+        return scan_session(row, self._resolve_backend(row.profile, profile))
+
+    async def _spawn(
+        self,
+        parent: Session,
+        prompt: str,
+        tier: TierName | None,
+        customizations: CustomizationDecision | None,
+    ) -> Session:
         parent_row = await anyio.to_thread.run_sync(self._store.get_session, parent.id)
         if parent_row is None:
             raise SessionNotFound(parent.id)
@@ -419,5 +473,5 @@ class Tradewind:
         await anyio.to_thread.run_sync(self._store.sweep_stale_turns, child_id)
         child = Session(id=child_id, _client=self, _options=parent._options)
         overrides: dict[str, object] = {"tier": tier} if tier is not None else {}
-        await child.run(prompt, **overrides)
+        await child.run(prompt, customizations=customizations, **overrides)
         return child

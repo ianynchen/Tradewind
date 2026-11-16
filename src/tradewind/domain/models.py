@@ -550,6 +550,18 @@ def process_report_notice(
     )
 
 
+def customization_notice(*, text: str) -> NormalizedMessage:
+    """The mirrored `kind="event"` visibility item for a `delete` or
+    `proceed` customization decision that applied to found files
+    (docs/components/06-workspace-safety.md §3): `text` names the files
+    (and, after a delete, the backup folder)."""
+    return NormalizedMessage(
+        role="assistant",
+        kind="event",
+        content={"type": "workspace_customizations", "text": text},
+    )
+
+
 def resume_degraded_notice(*, reason: str) -> NormalizedMessage:
     """The mirrored `kind="event"` visibility item for a NATIVE->REPLAY
     degrade or cross-backend continuation (FR-6.1): the conversation
