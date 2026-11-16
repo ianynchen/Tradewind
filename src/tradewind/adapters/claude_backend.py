@@ -821,6 +821,17 @@ def _caller_tool_action(name: str, args: dict[str, object]) -> Action:
     )
 
 
+def _isolated_from_options(backend_options: dict[str, Any]) -> bool:
+    """`Profile.backend_options["isolated"]` (0.14): a bool, default False.
+
+    Anything else is refused at construction, so a typo such as "yes" can
+    never silently mean "not isolated"."""
+    value = backend_options.get("isolated", False)
+    if not isinstance(value, bool):
+        raise ValueError(f'claude backend_options["isolated"] must be true or false, got {value!r}')
+    return value
+
+
 class ClaudeBackend(Backend):
     """`Backend` for Claude via the official `claude-agent-sdk` (see module
     docstring for the tool-bridging/interrupt design)."""
@@ -829,6 +840,7 @@ class ClaudeBackend(Backend):
 
     def __init__(self, profile: Profile, native_config: NativeStoreConfig) -> None:
         super().__init__(profile, native_config)
+        self._isolated = _isolated_from_options(profile.backend_options)
         self._clients: dict[str, ClaudeSDKClient] = {}
         # Keyed by tradewind session_id, mirroring `_clients` (task-11
         # review, fix round 1): one `ClaudeBackend` instance is cached and
@@ -1055,6 +1067,14 @@ class ClaudeBackend(Backend):
                 if ctx.output_schema is not None
                 else None
             ),
+            # 0.14 isolation (`backend_options["isolated"]`): `[]` is the SDK's
+            # isolation mode -- no user, project or local settings, so none of
+            # their plugins, hooks or permission rules -- and
+            # `--strict-mcp-config` drops every MCP server not passed here
+            # (the user's own servers in ~/.claude.json). `None`/False keep the
+            # SDK default: all sources load.
+            setting_sources=[] if self._isolated else None,
+            strict_mcp_config=self._isolated,
         )
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:

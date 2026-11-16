@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-16
+
+### Added
+
+- Claude isolation: `Profile.backend_options["isolated"] = True` starts Claude with `setting_sources=[]` (the SDK's isolation mode: no user, project or local settings, so none of their plugins, hooks or permission rules) and `strict_mcp_config=True` (only the caller's MCP servers; the user's own servers in `~/.claude.json` are not loaded). Built-in tools stay off as before. Default `False`: nothing changes. A value that is not a bool is refused when the backend is built. For callers whose agents must not reach the user's files or tools (Meridian DEC-0018).
+
 ## [0.13.0] - 2026-11-15
 
 ### Added
