@@ -209,42 +209,43 @@ async def test_project_hook_runs_on_proceed_not_after_delete(tmp_path: Path) -> 
         assert not marker.exists(), f"the hook ran after delete\n{trap.describe()}"
 
 
-async def test_project_permission_allow_skips_can_use_tool(tmp_path: Path) -> None:
-    """Without project settings, a caller MCP tool asks `can_use_tool`, so
-    the broker is called (control). With a project `permissions.allow` rule
-    for it and `proceed`, the tool runs and the broker is not called. Proves
-    that the settings file must be flagged."""
+async def test_project_allow_rule_does_not_bypass_can_use_tool(tmp_path: Path) -> None:
+    """Engine-regression guard: a project `permissions.allow` rule for a
+    caller MCP tool does not skip `can_use_tool`, so the broker is still
+    asked.
+
+    Live finding (CLI 2.1.258, 2026-11-15): with `.claude/settings.json` =
+    `{"permissions": {"allow": ["mcp__tradewind__probe_tool"]}}` and
+    `proceed`, the broker was still asked (broker calls: ['probe_tool']).
+    The transcript's tool_use name was exactly `mcp__tradewind__probe_tool`,
+    so the rule matched the tool. Today the `.claude/settings.json` flag is
+    needed for its hooks, not for this permission rule.
+
+    Pass (positive evidence): with the rule present, the broker got the
+    probe tool, and the tool ran. Fail: the tool ran with no broker
+    question; a future CLI then skips `can_use_tool` for project allow
+    rules. "Inconclusive": the model did not call the tool."""
     _print_engine_version()
     with anyio.fail_after(_CAP_S):
-        tradewind = _tradewind(tmp_path)
-
-        plain = _workspace(tmp_path, "plain")
+        workspace = _workspace(tmp_path)
+        _write_settings(workspace, {"permissions": {"allow": [_PROBE_FULL_NAME]}})
         probe, broker = _Probe(), _RecordingBroker()
-        session = await _create(tradewind, plain, tools=[probe.tool()], broker=broker)
-        control = await turn(session, _CALL_PROBE)
-        detail = f"broker calls: {broker.calls}; tool calls: {probe.calls}\n{control.describe()}"
-        if not probe.calls:
-            pytest.fail(f"inconclusive: the model did not call the probe tool\n{detail}")
-        if _PROBE not in broker.calls:
-            pytest.fail(
-                "inconclusive: the probe tool ran without a broker question even with no "
-                f"project settings (a user-level allow rule can cause this)\n{detail}"
-            )
-
-        allowed = _workspace(tmp_path, "allowed")
-        _write_settings(allowed, {"permissions": {"allow": [_PROBE_FULL_NAME]}})
-        probe, broker = _Probe(), _RecordingBroker()
-        session = await _create(tradewind, allowed, tools=[probe.tool()], broker=broker)
-        decision = _decide(session, "proceed", [Path(".claude/settings.json")])
-        trap = await turn(session, _CALL_PROBE, decision)
-        detail = f"broker calls: {broker.calls}; tool calls: {probe.calls}\n{trap.describe()}"
-        if not probe.calls:
-            pytest.fail(f"inconclusive: the model did not call the probe tool\n{detail}")
-
-        assert _PROBE not in broker.calls, (
-            "the project allow rule did not skip can_use_tool: the flag on "
-            f".claude/settings.json may no longer be needed for this rule\n{detail}"
+        session = await _create(
+            _tradewind(tmp_path), workspace, tools=[probe.tool()], broker=broker
         )
+        decision = _decide(session, "proceed", [Path(".claude/settings.json")])
+
+        outcome = await turn(session, _CALL_PROBE, decision)
+
+        detail = f"broker calls: {broker.calls}; tool calls: {probe.calls}\n{outcome.describe()}"
+        if not probe.calls and _PROBE not in broker.calls:
+            pytest.fail(f"inconclusive: the model did not call the probe tool\n{detail}")
+        assert _PROBE in broker.calls, (
+            "a project permissions.allow rule now skips can_use_tool: the probe tool ran "
+            "with no broker question. The .claude/settings.json flag is then needed for "
+            f"permission rules too, not only for hooks (06 §1)\n{detail}"
+        )
+        assert probe.calls, f"the broker allowed the call, but the tool did not run\n{detail}"
 
 
 async def test_env_scrub_keeps_subscription(
