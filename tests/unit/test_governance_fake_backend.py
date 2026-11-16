@@ -35,7 +35,7 @@ from tradewind.domain.events import (
     TurnStarted,
 )
 from tradewind.domain.models import ApiKeyAuth, ModelSpec, Profile, SessionOptions
-from tradewind.domain.policy import Rule
+from tradewind.domain.policy import Matcher, Rule
 
 _ID = "44444444-4444-4444-4444-444444444444"
 _OTHER_ID = "55555555-5555-5555-5555-555555555555"
@@ -414,3 +414,22 @@ async def test_governance_without_flags_off_is_not_refused(tmp_path: Path) -> No
     result = await session.run("go")
 
     assert result.status == "completed"
+
+
+async def test_a_bare_resume_keeps_the_stored_workspace(tmp_path: Path) -> None:
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    read_root = action("file_read", path=str(workspace), in_workspace=True)
+    tw, fake = _tradewind(tmp_path, [Request(read_root)])
+    no_root = Rule(
+        id="caller.no-root-read",
+        kind="file_read",
+        where={"path": Matcher("equals", "$turn.workspace")},
+        outcome="deny",
+    )
+    await tw.create(_ID, SessionOptions(cwd=workspace, policy_rules=[no_root]))
+
+    resumed = await tw.resume(_ID)
+    await resumed.run("go")
+
+    assert fake.decisions == [("file_read", "deny")]

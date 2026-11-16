@@ -614,7 +614,8 @@ class TurnRunner:
         try:
             backend = self._resolve_backend(session_row.profile, profile)
             # 05 §2: the stored snapshot is the source of truth for the
-            # session's policy (a bare `resume()` passes empty live options;
+            # session's policy, mode and the gate's workspace (`cwd`) (a
+            # bare `resume()` passes empty live options;
             # `resume(options=...)` rewrites the snapshot), as it is for
             # the adapters that read it.
             permission_mode, policy_rules = _stored_governance(snapshot)
@@ -714,7 +715,7 @@ class TurnRunner:
                     mode="engine_auto" if permission_mode == "engine_auto" else "broker",
                     engine_mode=None,
                     shim_server=None,
-                    workspace=str(options.cwd) if options.cwd is not None else None,
+                    workspace=cast("str | None", snapshot.get("cwd")),
                     result_tool=None,
                 ),
                 has_broker=not getattr(broker, "is_default_allow_all", False),
