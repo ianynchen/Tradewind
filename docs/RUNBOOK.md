@@ -167,12 +167,14 @@ caller-facing summary.
   "/cost"` answered "/cost isn't available in this environment." with `num_turns=0` and no
   model call. So a prompt whose first non-whitespace character is `/` is sent as
   `Message: <prompt>` (05 §5).
-- **No process report on Claude.** The CLI's PID is reachable only through private
+- **Process report reads a private PID.** The CLI's PID is reachable only through private
   attributes (`ClaudeSDKClient._transport._process`,
-  `_internal/transport/subprocess_cli.py:233,853`), and the CLI is spawned without a new
-  session, so it shares the caller's process group (a group walk would list the caller's
-  own processes). The adapter does not report descendants (05 §3.4) until the SDK exposes
-  the PID.
+  `_internal/transport/subprocess_cli.py:233,853`); the adapter reads it with one guarded
+  accessor, and a unit test fails if an SDK upgrade moves it (then the adapter logs
+  "process report unavailable" and the turn runs without a report). The CLI is spawned
+  without a new session, so it shares the caller's process group: the process group step
+  of 05 §3.4 is skipped and only the tree walk from the CLI is used, which never includes
+  the caller or its ancestors.
 - **Late engine output after settle reaches the mirror only through reconcile.** The model's
   reply to an injected task-notification turn that arrives after the turn has settled, and
   later `ResultMessage`s read while settling, are not mirrored live; they reach the mirror
@@ -202,14 +204,13 @@ caller-facing summary.
   to core input (`app-server/src/request_processors/turn_processor.rs:512-516`,
   app-server-protocol `v2/turn.rs:328-336`); slash commands are a TUI feature. The prompt is
   sent unchanged.
-- **No process report on Codex.** The `codex app-server` process is held only in the private
-  `CodexClient._proc` (`openai_codex/client.py:222,259`), so the adapter does not report
-  descendants (05 §3.4) until the SDK exposes the PID.
+- **Process report reads a private PID.** The `codex app-server` process is held only in the
+  private `CodexClient._proc` (`openai_codex/client.py:222,259`); the adapter reads it with
+  one guarded accessor, pinned by a unit test. It is spawned without a new session, so, as
+  on Claude, the process group step is skipped and only the tree walk is used.
 
 ### Known limits of turn governance (PR 1)
 
-- Claude and Codex process reports (05 §3.4) are skipped: neither SDK exposes the engine pid
-  publicly (see the two findings above).
 - `in_workspace` on file actions is lexical; symlinks are not resolved.
 - Cursor supports none of the governance features (`supports_action_policy`,
   `supports_work_supervisor`, `supports_engine_auto` are all False).

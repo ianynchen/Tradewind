@@ -122,6 +122,9 @@ class PolicyGate:
         self._emit = emit
         self._pending = 0
         self.on_approval_change: Callable[[int], None] | None = None
+        # The summary of the last action decided here, for the process
+        # report (05 §3.4); None before the first.
+        self.last_action: str | None = None
 
     @property
     def pending_approvals(self) -> int:
@@ -133,6 +136,7 @@ class PolicyGate:
         return "ask"
 
     def _evaluate(self, action: Action, mode_default: Outcome) -> PolicyResult:
+        self.last_action = action.summary
         result = evaluate(
             action,
             floor=self._floor,

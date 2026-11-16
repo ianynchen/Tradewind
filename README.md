@@ -500,8 +500,9 @@ One set of mechanisms holds on every backend that declares the flag (design:
 - **Work supervisor.** `TurnDefaults.model_silence_timeout_s` (300), `work_silence_timeout_s`
   (1800) and the optional hard cap `request_timeout_s` (`None` = backend default). All pause
   while a broker question is open. A fired limit adds a `turn_timeout` notice before the
-  terminal event, and a process report where the backend can see the engine process (not on
-  Claude or Codex in this release; see Known limits below).
+  terminal event, and a process report where the backend can see the engine process (Claude
+  and Codex). The report also comes on an interrupt, and at a normal end when a process the
+  engine started is still alive; such a process is reported, not killed.
 - **Preflight.** `SessionOptions.on_preflight(question, details, choices)` answers a check's
   question; a check that stops the turn raises `ConfigError` before `TurnStarted`.
 - **Prompts are messages.** A prompt is never expanded as a slash command. `claude` sends a
@@ -509,7 +510,7 @@ One set of mechanisms holds on every backend that declares the flag (design:
   `langchain` (no slash parsing) send it unchanged; `cursor` also sends it unchanged
   (unverified).
 
-Known limits: Claude and Codex process reports are skipped (no public engine pid); the
+Known limits: the
 `in_workspace` field of a file action is lexical (no symlink resolution); `cursor` supports
 none of this, and `policy_rules` or `permission_mode` raise `Unsupported` there. On Codex,
 observe sees only completed commands that had no approval request, so write narrow `shell` /

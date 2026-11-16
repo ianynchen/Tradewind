@@ -73,6 +73,10 @@ _STOP_SOCKET_GRACE_S: float = 30.0
 #: The result tool's name (05 §6). A caller tool of this name is refused.
 RESULT_TOOL_NAME: Final = "tradewind_submit_result"
 
+#: The module the stdio shim runs as (`python -m`); the process report
+#: (05 §3.4) excludes the process whose command line runs it.
+SHIM_MODULE: Final = "tradewind.toolproxy"
+
 #: Calls of the result tool that count; a further call is answered
 #: `"No more attempts."` and not recorded (05 §6).
 MAX_RESULT_ATTEMPTS: Final = 3
@@ -564,7 +568,7 @@ class ToolHost:
         return McpServerDef(
             name="toolproxy",
             transport="stdio",
-            command=[sys.executable, "-m", "tradewind.toolproxy"],
+            command=[sys.executable, "-m", SHIM_MODULE],
             env={protocol.SOCKET_ENV_VAR: str(socket_path)},
         )
 

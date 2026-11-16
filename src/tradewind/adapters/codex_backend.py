@@ -1279,6 +1279,46 @@ def _drive_turn(
         out_queue.put(_DONE)
 
 
+def _engine_pid(client: CodexClient) -> int | None:
+    """The app-server process's PID, for the process report (05 §3.4). The
+    SDK keeps it private (`CodexClient._proc`, pinned by a unit test); when
+    it is missing, one WARNING and no report."""
+    pid = getattr(getattr(client, "_proc", None), "pid", None)
+    if not isinstance(pid, int):
+        _logger.warning("process report unavailable: codex SDK has no _proc.pid")
+        return None
+    return pid
+
+
+class _EngineReportingClient(CodexClient):
+    """A turn's `CodexClient` that reports its app-server process to the
+    runner (05 §3.4): the PID once started, and a snapshot request just
+    before it is closed. Both run on `_drive_turn`'s worker thread, where
+    blocking on `ps` is fine."""
+
+    def __init__(
+        self,
+        config: CodexConfig | None = None,
+        approval_handler: ApprovalHandler | None = None,
+        *,
+        engine_started: Callable[[int], None],
+        engine_closing: Callable[[], None],
+    ) -> None:
+        super().__init__(config=config, approval_handler=approval_handler)
+        self._engine_started = engine_started
+        self._engine_closing = engine_closing
+
+    def start(self) -> None:
+        super().start()
+        pid = _engine_pid(self)
+        if pid is not None:
+            self._engine_started(pid)
+
+    def close(self) -> None:
+        self._engine_closing()
+        super().close()
+
+
 async def _interrupt_for_stop(
     request_interrupt: Callable[[], Awaitable[None]] | None, turn_id: str
 ) -> None:
@@ -1476,7 +1516,12 @@ class CodexBackend(Backend):
             )
 
             def make_client() -> CodexClient:
-                return CodexClient(config=config, approval_handler=approval_handler)
+                return _EngineReportingClient(
+                    config=config,
+                    approval_handler=approval_handler,
+                    engine_started=ctx.engine_started,
+                    engine_closing=ctx.engine_closing,
+                )
 
             backend_options = self.profile.backend_options
             # Duck-typed marker check (module docstring, item 3a) -- see

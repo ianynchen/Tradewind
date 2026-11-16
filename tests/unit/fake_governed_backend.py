@@ -12,6 +12,11 @@ work signals, result-tool calls over the shim socket), report the
 engine done, wait for open work to settle, then emit the process report
 (if work was closed after done) and the terminal event.
 
+With `engine_pid`, it reports an engine process through the runner's
+seam as the Claude and Codex adapters do: `ctx.engine_started(pid)` before
+the script and `ctx.engine_closing()` when the turn's stream ends, then
+`on_engine_closed()` (the test's stand-in for the engine exiting).
+
 Its `name` is `"codex"` only so the runner gives `ToolHost` the gate
 broker, as it will for Antigravity (04 "Interface changes").
 """
@@ -19,7 +24,7 @@ broker, as it will for Antigravity (04 "Interface changes").
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
@@ -139,6 +144,9 @@ class FakeGovernedBackend(Backend):
         logged_in: bool = True,
         engine_auto: bool = True,
         action_policy: bool = True,
+        engine_pid: int | None = None,
+        on_engine_closed: Callable[[], None] | None = None,
+        answers_interrupt: bool = True,
     ) -> None:
         super().__init__(profile, native_config)
         self._script = script
@@ -146,6 +154,9 @@ class FakeGovernedBackend(Backend):
         self._logged_in = logged_in
         self._engine_auto = engine_auto
         self._action_policy = action_policy
+        self._engine_pid = engine_pid
+        self._on_engine_closed = on_engine_closed
+        self._answers_interrupt = answers_interrupt
         self._interrupts: dict[str, asyncio.Event] = {}
         self.calls: list[str] = []
         self.contexts: list[TurnContext] = []
@@ -228,6 +239,18 @@ class FakeGovernedBackend(Backend):
 
     async def run(self, ctx: TurnContext) -> AsyncIterator[Event]:
         self.calls.append("run")
+        if self._engine_pid is not None:
+            await asyncio.to_thread(ctx.engine_started, self._engine_pid)
+        try:
+            async for event in self._play(ctx):
+                yield event
+        finally:
+            if self._engine_pid is not None:
+                await asyncio.to_thread(ctx.engine_closing)
+                if self._on_engine_closed is not None:
+                    self._on_engine_closed()
+
+    async def _play(self, ctx: TurnContext) -> AsyncIterator[Event]:
         # Step 2: apply the preflight answer, then start the shim.
         answer = ctx.preflight.get("customizations")
         if answer == "stop":
@@ -340,6 +363,11 @@ class FakeGovernedBackend(Backend):
         raise Unsupported("fake backend has no native transcript")
 
     async def interrupt(self, session_id: str) -> None:
+        if self._answers_interrupt:
+            self.end_engine(session_id)
+
+    def end_engine(self, session_id: str) -> None:
+        """End the turn as the engine's exit would (on the loop)."""
         event = self._interrupts.get(session_id)
         if event is not None:
             event.set()

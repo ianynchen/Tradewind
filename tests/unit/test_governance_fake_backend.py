@@ -4,7 +4,12 @@ that uses every seam the way the Antigravity adapter will
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import os
+import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -24,7 +29,9 @@ from fake_governed_backend import (
 from pydantic import SecretStr
 
 from tradewind import Tradewind
+from tradewind.application import process_report, turn_runner
 from tradewind.application.config import NativeStoreConfig, TradewindConfig
+from tradewind.application.process_report import ProcInfo
 from tradewind.domain.errors import ConfigError, Unsupported
 from tradewind.domain.events import (
     Event,
@@ -433,3 +440,195 @@ async def test_a_bare_resume_keeps_the_stored_workspace(tmp_path: Path) -> None:
     await resumed.run("go")
 
     assert fake.decisions == [("file_read", "deny")]
+
+
+# --- process report (05 §3.4) -----------------------------------------------
+
+_ENGINE, _CHILD, _GRANDCHILD, _SIBLING, _SHIM = 90001, 90002, 90003, 90004, 90005
+_ENGINE_TREE = {_ENGINE, _CHILD, _GRANDCHILD, _SHIM}
+
+
+class _FakeProcesses:
+    """A fake process table for `process_report`: the real caller, its
+    parent and a sibling in the caller's group; the engine (the caller's
+    child, in the caller's group, as both SDKs spawn it), its child, a
+    grandchild in its own group, and the shim. No real process is listed
+    for signalling: `kill_tree` is replaced and only records."""
+
+    def __init__(self) -> None:
+        me, parent, group = os.getpid(), os.getppid(), os.getpgrp()
+        rows = [
+            (parent, 1, group, "zsh"),
+            (me, parent, group, "pytest"),
+            (_SIBLING, parent, group, "sibling-of-caller"),
+            (_ENGINE, me, group, "engine --app-server"),
+            (_CHILD, _ENGINE, group, "node mcp-server.js"),
+            (_GRANDCHILD, _CHILD, _GRANDCHILD, "sleep 1000"),
+            (_SHIM, _ENGINE, group, f"{sys.executable} -m tradewind.toolproxy"),
+        ]
+        self.alive = {
+            pid: ProcInfo(pid, ppid, pgid, "Sun Nov 15 15:11:42 2026", cmd)
+            for pid, ppid, pgid, cmd in rows
+        }
+        self.killed: list[set[int]] = []
+        self.on_kill: Callable[[], None] | None = None
+
+    def list(self) -> list[ProcInfo]:
+        return list(self.alive.values())
+
+    def close_engine(self, *, leaves: set[int] = frozenset({_GRANDCHILD, _SHIM})) -> None:
+        """The engine exits; of its tree, only `leaves` stay alive."""
+        for pid in _ENGINE_TREE - leaves:
+            self.alive.pop(pid, None)
+
+    def kill_tree(self, procs: list[ProcInfo], **_kwargs: object) -> None:
+        self.killed.append({p.pid for p in procs})
+        for p in procs:
+            self.alive.pop(p.pid, None)
+        if self.on_kill is not None:
+            self.on_kill()
+
+
+@pytest.fixture
+def procs(monkeypatch: pytest.MonkeyPatch) -> _FakeProcesses:
+    fake = _FakeProcesses()
+    monkeypatch.setattr(process_report, "list_processes", fake.list)
+    monkeypatch.setattr(process_report, "kill_tree", fake.kill_tree)
+    monkeypatch.setattr(turn_runner, "_REPORT_SETTLE_S", 0.0)
+    return fake
+
+
+def _engine_tradewind(
+    tmp_path: Path, script: list[Step], procs: _FakeProcesses, **fake_kwargs: Any
+) -> tuple[Tradewind, FakeGovernedBackend]:
+    return _tradewind(
+        tmp_path, script, engine_pid=_ENGINE, on_engine_closed=procs.close_engine, **fake_kwargs
+    )
+
+
+def _pids(report: dict[str, Any]) -> list[int]:
+    return [p["pid"] for p in report["processes"]]
+
+
+async def test_normal_end_reports_a_live_descendant_and_kills_nothing(
+    tmp_path: Path, procs: _FakeProcesses, caplog: pytest.LogCaptureFixture
+) -> None:
+    tw, _fake = _engine_tradewind(tmp_path, [Say("done")], procs)
+    session = await tw.create(_ID, SessionOptions())
+
+    with caplog.at_level(logging.WARNING, logger="tradewind"):
+        events = [e async for e in session.stream("go")]
+
+    assert procs.killed == []
+    assert isinstance(events[-1], TurnCompleted)
+    assert events[-1].result.status == "completed"
+    # One report, just before the terminal: the grandchild outlived the
+    # engine; the shim is excluded; the caller and its sibling never appear.
+    [report] = _notices([events[-2]], "process_report")
+    assert _pids(report) == [_GRANDCHILD]
+    assert report["limit"] is None
+    assert len(_notices(events, "process_report")) == 1
+    assert sum("process report" in r.getMessage() for r in caplog.records) == 1
+    # Stored in the mirror like any other event item.
+    history = await tw.history(_ID)
+    assert any(m.content.get("type") == "process_report" for m in history)
+
+
+async def test_plain_turn_without_a_live_descendant_emits_the_same_events(
+    tmp_path: Path, procs: _FakeProcesses
+) -> None:
+    (tmp_path / "plain").mkdir()
+    (tmp_path / "tracked").mkdir()
+    plain_tw, _ = _tradewind(tmp_path / "plain", [Say("done")])
+    tracked_tw, _ = _tradewind(
+        tmp_path / "tracked",
+        [Say("done")],
+        engine_pid=_ENGINE,
+        on_engine_closed=lambda: procs.close_engine(leaves={_SHIM}),
+    )
+    plain = await plain_tw.create(_ID, SessionOptions())
+    tracked = await tracked_tw.create(_ID, SessionOptions())
+
+    plain_events = [e async for e in plain.stream("go")]
+    tracked_events = [e async for e in tracked.stream("go")]
+
+    assert [type(e) for e in tracked_events] == [type(e) for e in plain_events]
+    assert _notices(tracked_events, "process_report") == []
+    assert procs.killed == []
+
+
+async def test_fired_limit_kills_the_engine_tree_and_reports_before_the_terminal(
+    tmp_path: Path, procs: _FakeProcesses
+) -> None:
+    build = action("native", name="build")
+    tw, _fake = _engine_tradewind(tmp_path, [Observed("bg1", build, kind="background")], procs)
+    session = await tw.create(_ID, SessionOptions())
+
+    events = [e async for e in session.stream("go", work_silence_timeout_s=0.2)]
+
+    # The recorded tree (engine and descendants, shim included) is ended;
+    # never the caller, its parent or its sibling in the same group.
+    assert procs.killed == [_ENGINE_TREE]
+    terminal = events[-1]
+    assert isinstance(terminal, TurnCompleted)
+    assert (terminal.result.status, terminal.result.end_reason) == ("interrupted", "timeout")
+    [report] = _notices([events[-2]], "process_report")
+    assert report["limit"]["limit"] == "work_silence"
+    assert report["open_items"] == [{"kind": "background", "label": build.summary}]
+    assert report["last_action"] == build.summary
+    assert _pids(report) == []  # no survivors
+    types = [e.message.content.get("type") for e in events if isinstance(e, ItemCompleted)]
+    assert types.index("turn_timeout") < types.index("process_report")
+
+
+async def test_answered_interrupt_reports_without_killing(
+    tmp_path: Path, procs: _FakeProcesses
+) -> None:
+    tw, _fake = _engine_tradewind(
+        tmp_path, [Observed("bg1", action("native", name="build"), kind="background")], procs
+    )
+    session = await tw.create(_ID, SessionOptions())
+
+    events: list[Event] = []
+    async for event in session.stream("go"):
+        events.append(event)
+        if isinstance(event, TurnStarted):
+            await session.stop()
+
+    assert procs.killed == []
+    terminal = events[-1]
+    assert isinstance(terminal, TurnCompleted)
+    assert terminal.result.status == "interrupted"
+    # The report is always made on an interrupt.
+    [report] = _notices([events[-2]], "process_report")
+    assert report["limit"] is None
+    assert _pids(report) == [_GRANDCHILD]
+
+
+async def test_unanswered_interrupt_kills_the_engine_tree_after_the_grace(
+    tmp_path: Path, procs: _FakeProcesses, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(turn_runner, "_INTERRUPT_GRACE_S", 0.05)
+    tw, fake = _engine_tradewind(
+        tmp_path,
+        [Observed("bg1", action("native", name="build"), kind="background")],
+        procs,
+        answers_interrupt=False,
+    )
+    loop = asyncio.get_running_loop()
+    # The engine's death ends its stream.
+    procs.on_kill = lambda: loop.call_soon_threadsafe(fake.end_engine, _ID)
+    session = await tw.create(_ID, SessionOptions())
+
+    events: list[Event] = []
+    async for event in session.stream("go"):
+        events.append(event)
+        if isinstance(event, TurnStarted):
+            await session.stop()
+
+    assert procs.killed and procs.killed[0] == _ENGINE_TREE
+    terminal = events[-1]
+    assert isinstance(terminal, TurnCompleted)
+    assert terminal.result.status == "interrupted"
+    [report] = _notices([events[-2]], "process_report")
+    assert _pids(report) == []

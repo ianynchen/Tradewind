@@ -255,3 +255,9 @@
 - [ ] **Step 1:** Dispatch an independent reviewer on the whole branch diff against `05` and this plan's Review Focus.
 - [ ] **Step 2:** Fix findings (small ones directly; design-sized ones back to the owner).
 - [ ] **Step 3:** Gate && push the branch; open the PR to `main` (body ends with the Claude Code line); link it.
+
+### Task 14: Process report and kill on Claude and Codex (owner ruling B, 2026-11-15)
+
+**Files:** `application/process_report.py` (caller guard; `EngineWatch`), `application/ports.py` (`TurnContext.engine_started` / `engine_closing`), `application/turn_runner.py` (snapshot before every interrupt, 15 s grace, kill on a fired limit or an unanswered interrupt, report before the terminal), `adapters/claude_backend.py`, `adapters/codex_backend.py` (one guarded PID accessor each), fake backend, docs.
+- [ ] **Step 1: Write failing tests**: fake-`ps` caller guard (same group, caller's sibling excluded, engine's grandchild included); runner end to end with the fake backend (normal end reports a live descendant without a kill; a plain turn with none alive is unchanged; a fired limit kills the tree and reports before the terminal; interrupt answered vs unanswered); each adapter reports the SDK's PID; SDK attribute pins.
+- [ ] **Steps 2–5:** run → fail → implement → pass → gate && commit `feat: process report and kill on Claude and Codex`.

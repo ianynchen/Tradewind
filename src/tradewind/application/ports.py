@@ -291,6 +291,14 @@ class SessionStorePort(ABC):
         ...
 
 
+def _ignore_engine_pid(_pid: int) -> None:
+    """`TurnContext.engine_started`'s default: no process report."""
+
+
+def _no_engine_snapshot() -> None:
+    """`TurnContext.engine_closing`'s default: no process report."""
+
+
 @dataclass
 class TurnContext:
     """Everything a `Backend.run()` needs for one turn, assembled by the
@@ -367,6 +375,14 @@ class TurnContext:
     # The caller's live `SessionOptions.on_preflight` (05 §4), which
     # `run_checks` asks; None means every question gets its default.
     on_preflight: OnPreflight | None = None
+    # The process report (05 §3.4), for a backend that spawns an engine
+    # process: it calls `engine_started(pid)` once the engine is spawned
+    # and `engine_closing()` just before it closes the engine, so the
+    # engine's descendants are recorded while they can still be found.
+    # Both block on `ps`: call them from a worker thread. The defaults do
+    # nothing; the runner sets both.
+    engine_started: Callable[[int], None] = _ignore_engine_pid
+    engine_closing: Callable[[], None] = _no_engine_snapshot
 
 
 class Backend(ABC):

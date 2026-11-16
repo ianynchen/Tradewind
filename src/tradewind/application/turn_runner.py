@@ -34,9 +34,15 @@ import anyio
 from tradewind.application.config import TradewindConfig
 from tradewind.application.policy_gate import PolicyGate
 from tradewind.application.ports import Backend, SessionStorePort, TurnContext
+from tradewind.application.process_report import (
+    EngineWatch,
+    ProcInfo,
+    log_report,
+    report_event,
+)
 from tradewind.application.resume import ResumePlanner
 from tradewind.application.supervisor import WorkSupervisor
-from tradewind.application.tool_host import RESULT_TOOL_NAME, ToolHost
+from tradewind.application.tool_host import RESULT_TOOL_NAME, SHIM_MODULE, ToolHost
 from tradewind.domain.errors import (
     ConfigError,
     SessionNotFound,
@@ -301,8 +307,68 @@ _UNSUPERVISED_HARD_CAP_S = 600.0
 # How long the turn waits for the interrupt a fired limit sent (05 §3.4:
 # the 15 s grace for an engine interrupt). A limit often fires because the
 # engine hangs, and its interrupt() can hang too; past the grace the turn
-# ends anyway. Module-level so tests can shorten it.
+# ends anyway. The same grace decides whether an interrupt of a turn with
+# an engine process was answered (`EngineWatch.interrupting`).
+# Module-level so tests can shorten it.
 _INTERRUPT_GRACE_S = 15.0
+
+# How long the process report waits, at a turn end that kills nothing, for
+# the engine's descendants to exit after the engine closed (an MCP server
+# ends shortly after its engine); only paid while one is still alive.
+# Module-level so tests can shorten it.
+_REPORT_SETTLE_S = 1.0
+
+
+def _is_shim(proc: ProcInfo) -> bool:
+    """The Tradewind stdio shim, which the process report excludes."""
+    return f"-m {SHIM_MODULE}" in proc.command
+
+
+async def _engine_report(
+    watch: EngineWatch,
+    ctx: TurnContext,
+    *,
+    backend: str,
+    timed_out: bool,
+    interrupted: bool,
+) -> ItemCompleted | None:
+    """End the engine watch and build the process report (05 §3.4).
+
+    A fired limit, or an interrupt not answered within the grace, kills the
+    recorded tree first. The report (one WARNING log entry, and the event
+    returned here) is made on a fired limit, on an interrupt, or when a
+    recorded process is still alive; otherwise None. A failure to list or
+    end processes is logged and gives no report: it never fails the turn.
+    """
+    try:
+        alive = await watch.finish(kill=timed_out, settle_s=_REPORT_SETTLE_S)
+    except Exception:
+        _logger.exception("process report failed", extra={"turn_id": ctx.turn_id})
+        return None
+    if not (alive or timed_out or interrupted):
+        return None
+    work, policy = ctx.work, ctx.policy
+    timeout_reason = cast("dict[str, float | str] | None", ctx.timeout_reason)
+    open_items = [*work.open_items(), *work.closed_after_done()] if work else []
+    last_action = policy.last_action if policy else None
+    log_report(
+        turn_id=ctx.turn_id,
+        session_id=ctx.session.session_id,
+        backend=backend,
+        timeout_reason=timeout_reason,
+        open_items=open_items,
+        alive=alive,
+        last_action=last_action,
+    )
+    return report_event(
+        turn_id=ctx.turn_id,
+        session_id=ctx.session.session_id,
+        backend=backend,
+        timeout_reason=timeout_reason,
+        open_items=open_items,
+        alive=alive,
+        last_action=last_action,
+    )
 
 
 async def _await_interrupt(interrupt_task: asyncio.Future[None], session_id: str) -> None:
@@ -495,6 +561,9 @@ class TurnRunner:
         # `compact()` and a turn from interleaving mirror writes. Same
         # single-process assumption as the store's own seq serialization.
         self._busy: set[str] = set()
+        # session_id -> its in-flight turn's engine watch (05 §3.4), so
+        # `request_stop` records the engine's tree before it interrupts.
+        self._watches: dict[str, EngineWatch] = {}
 
     async def request_stop(self, session_id: str, backend: Backend) -> None:
         """`Session.stop()`'s implementation: record that this session's
@@ -502,6 +571,10 @@ class TurnRunner:
         the backend to cancel it. A no-op at the backend level when no turn
         is in flight (`Backend.interrupt` contract)."""
         self._interrupt_requested.add(session_id)
+        watch = self._watches.get(session_id)
+        if watch is not None:
+            # 05 §3.4: the tree before the interrupt, and the grace after it.
+            await watch.interrupting(_INTERRUPT_GRACE_S)
         await backend.interrupt(session_id)
 
     def _tap(self, event: Event, turn_id: str) -> None:
@@ -588,6 +661,14 @@ class TurnRunner:
         # notice) are buffered here and drained into the store and stream
         # by the event loop below.
         gate_events: list[Event] = []
+        # 05 §3.4: the engine process of a backend that reports one
+        # (`ctx.engine_started`); untracked otherwise, and then nothing
+        # below changes the turn's events.
+        watch = EngineWatch(exclude=_is_shim)
+        report_ctx: TurnContext | None = None
+        # A terminal held back until the engine is closed and its process
+        # report is out (the report precedes the terminal).
+        held_terminal: Event | None = None
 
         async def drain_gate_events() -> list[Event]:
             """Persist and tap the buffered gate and timeout notices; the
@@ -837,7 +918,11 @@ class TurnRunner:
                     max_tool_rounds=max_tool_rounds,
                     policy=gate,
                     work=supervisor,
+                    engine_started=watch.started,
+                    engine_closing=watch.snapshot,
                 )
+                self._watches[session_id] = watch
+                report_ctx = ctx
 
                 # 05 §4: `prepare_turn` runs before the supervisor starts
                 # (its time is not counted by any limit) and before `run()`.
@@ -865,6 +950,8 @@ class TurnRunner:
                                 message=timeout_notice(limit=limit, value=value, elapsed=elapsed)
                             )
                         )
+                        # 05 §3.4: the engine's tree before the interrupt.
+                        await watch.interrupting(_INTERRUPT_GRACE_S)
                         # Shielded: the backend may answer with its terminal
                         # while this call is in flight, and the runner then
                         # cancels this task; the interrupt itself must finish,
@@ -928,10 +1015,31 @@ class TurnRunner:
                                 await stop_supervisor()
                                 for gate_event in await drain_gate_events():
                                     yield gate_event
+                                if watch.tracked:
+                                    # 05 §3.4: the adapter closes its engine
+                                    # after its terminal; the report, which
+                                    # comes first, is made once it has.
+                                    held_terminal = event
+                                    continue
                             self._tap(event, turn_id)
                             yield event
 
                     await stop_supervisor()
+                    if watch.tracked:
+                        report = await _engine_report(
+                            watch,
+                            ctx,
+                            backend=backend.name,
+                            timed_out=timed_out[0],
+                            interrupted=session_id in self._interrupt_requested,
+                        )
+                        if report is not None:
+                            gate_events.append(report)
+                        for gate_event in await drain_gate_events():
+                            yield gate_event
+                    if held_terminal is not None:
+                        self._tap(held_terminal, turn_id)
+                        yield held_terminal
 
                 if terminal_status is None:
                     # A notice raised after the last backend event must
@@ -1050,6 +1158,22 @@ class TurnRunner:
                         _logger.exception(
                             "interrupt after a fired limit raised", extra={"turn_id": turn_id}
                         )
+            if report_ctx is not None and watch.tracked and not watch.finished:
+                # An abnormal end (a raising backend, an abandoned stream):
+                # the engine is still ended per 05 §3.4 and its report
+                # stored, though no event can be yielded any more.
+                with anyio.CancelScope(shield=True):
+                    report = await _engine_report(
+                        watch,
+                        report_ctx,
+                        backend=backend.name,
+                        timed_out=timed_out[0],
+                        interrupted=session_id in self._interrupt_requested,
+                    )
+                if report is not None:
+                    gate_events.append(report)
+            if self._watches.get(session_id) is watch:
+                self._watches.pop(session_id, None)
             if gate_events:
                 # Notices raised before an abnormal end (a raising backend,
                 # an abandoned stream) still reach the store. A failure here

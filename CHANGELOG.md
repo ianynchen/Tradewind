@@ -22,7 +22,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Turn governance (ADR-0004, `docs/components/05-turn-governance.md`; FR-4.5, FR-7.3, FR-8.1a, FR-11):
   - Action policy: a shared `Action` vocabulary, `SessionOptions.policy_rules` and `permission_mode` (`broker` / `engine_auto`); floor rules, caller rules, backend default rules and mode default; `gate` and `observe`.
   - Work supervisor: model silence (300 s) and work silence (1800 s) limits, `TurnDefaults.model_silence_timeout_s` and `work_silence_timeout_s`.
-  - Process report (WARNING log and event item) when a limit fires, on interrupt, or when descendants stay alive. Skipped on Claude and Codex (no public engine pid).
+  - Process report (WARNING log and event item) when a limit fires, on interrupt, or when descendants stay alive.
+  - Claude and Codex report their engine process (`TurnContext.engine_started` / `engine_closing`): a fired limit or an interrupt not answered within 15 s ends the engine's process tree (tree walk only; the caller's process group is never signalled), and descendants still alive at a normal end or an answered interrupt are reported, not killed.
   - Preflight checks: `SessionOptions.on_preflight`, `Ok` / `Ask` / `Stop`; `Stop` raises `ConfigError` before `TurnStarted`. A turn can now end with a terminal record and no `TurnStarted`.
   - Result-tool seam: `tradewind_submit_result` (validated with `jsonschema`, at most 3 calls) for engines with no output schema.
   - Capability flags `supports_engine_auto` / `supports_work_supervisor` / `supports_action_policy`: Claude False/True/True, Codex True/True/True, LangChain False/True/True, Cursor False/False/False. Claude `engine_auto` is unsupported because the SDK's auto mode bypasses `can_use_tool`; Codex `engine_auto` uses the auto-reviewer with the workspace-write sandbox. Unsupported settings raise `Unsupported` before `prepare_turn`.

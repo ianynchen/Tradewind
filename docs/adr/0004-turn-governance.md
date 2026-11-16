@@ -81,8 +81,10 @@ Antigravity mapping is PR 2 (future work).
   lock through `mcp`). Process listing uses `ps`; no `psutil`.
 - A turn can now end with a terminal record and no `TurnStarted` (stop,
   limit or error before `run()` reaches it).
-- Known limits: Claude and Codex process reports are skipped (no public
-  engine pid); `_in_workspace` is lexical (no symlink resolution); Cursor
+- Claude and Codex report their engine pid through `TurnContext.engine_started`,
+  read from private SDK attributes (pinned by unit tests); the engines share
+  the caller's process group, so only the tree walk is used.
+- Known limits: `_in_workspace` is lexical (no symlink resolution); Cursor
   supports none of the governance features. Observe on Codex sees only
   completed actions that had no request, so broad `ask` rules stop turns
   late; callers write narrow rules.

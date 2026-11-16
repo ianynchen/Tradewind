@@ -10,6 +10,8 @@ a real live session is `tests/conformance/test_claude.py` /
 
 from __future__ import annotations
 
+import logging
+from types import SimpleNamespace
 from typing import Any, cast
 
 import anyio
@@ -2098,3 +2100,75 @@ async def test_open_plain_tool_item_does_not_hold_the_terminal(
     events = await _collect_bounded(ClaudeBackend(_profile(), NativeStoreConfig()).run(ctx))
 
     assert isinstance(events[-1], TurnCompleted)
+
+
+# --- process report seam (05 §3.4) ---
+
+
+def _install_engine_client(
+    monkeypatch: pytest.MonkeyPatch, order: list[str], *, transport: object
+) -> None:
+    """A fake `ClaudeSDKClient` whose transport holds the CLI process the
+    way the SDK does (`client._transport._process.pid`)."""
+
+    class _EngineClient:
+        def __init__(self, _options: object) -> None:
+            self._transport = transport
+
+        async def connect(self, _prompt: str) -> None:
+            order.append("connect")
+
+        async def receive_response(self) -> Any:
+            yield _success_result()
+
+        async def disconnect(self) -> None:
+            order.append("disconnect")
+
+    monkeypatch.setattr(claude_backend_module, "ClaudeSDKClient", _EngineClient)
+
+
+async def test_run_reports_the_cli_pid_and_snapshots_before_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    order: list[str] = []
+    process = SimpleNamespace(pid=4242)
+    _install_engine_client(monkeypatch, order, transport=SimpleNamespace(_process=process))
+    ctx = _make_ctx(output_schema=None)
+    ctx.engine_started = lambda pid: order.append(f"started {pid}")
+    ctx.engine_closing = lambda: order.append("closing")
+
+    [event async for event in ClaudeBackend(_profile(), NativeStoreConfig()).run(ctx)]
+
+    assert order == ["connect", "started 4242", "closing", "disconnect"]
+
+
+async def test_run_without_the_sdk_attribute_warns_and_reports_no_pid(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    order: list[str] = []
+    _install_engine_client(monkeypatch, order, transport=SimpleNamespace())
+    ctx = _make_ctx(output_schema=None)
+    ctx.engine_started = lambda pid: order.append(f"started {pid}")
+
+    with caplog.at_level(logging.WARNING):
+        events = [e async for e in ClaudeBackend(_profile(), NativeStoreConfig()).run(ctx)]
+
+    assert isinstance(events[-1], TurnCompleted)
+    assert not any(step.startswith("started") for step in order)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("process report unavailable: claude SDK has no" in w for w in warnings)
+
+
+def test_installed_sdk_keeps_the_cli_process_where_the_adapter_reads_it() -> None:
+    """Pins the private attributes `_engine_pid` reads: an SDK upgrade that
+    moves them fails here, not silently in production."""
+    import inspect
+
+    from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
+    from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
+
+    options = ClaudeAgentOptions()
+    assert hasattr(ClaudeSDKClient(options), "_transport")
+    assert "self._transport = SubprocessCLITransport(" in inspect.getsource(ClaudeSDKClient)
+    assert hasattr(SubprocessCLITransport(prompt="", options=options), "_process")
+    assert "self._process = await anyio.open_process(" in inspect.getsource(SubprocessCLITransport)

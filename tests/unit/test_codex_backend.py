@@ -1661,3 +1661,83 @@ def test_ledger_hands_the_changes_to_a_request_that_waits_for_the_start() -> Non
     (changes,) = got
     assert [c.path for c in cast(Any, changes)] == ["b.py"]
     assert ApprovalLedger(wait_s=0.0).started_changes("missing") is None
+
+
+# --- process report seam (05 §3.4) ---
+
+
+def test_turn_client_reports_the_engine_pid_and_snapshots_before_close(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`run()` hands `_drive_turn` a client factory whose clients report
+    the app-server's PID once started and ask for a snapshot before they
+    close it (no process is spawned: `CodexClient.start`/`close` are
+    replaced at the SDK boundary)."""
+    from openai_codex.client import CodexClient
+
+    order: list[str] = []
+
+    def fake_start(self: Any) -> None:
+        self._proc = SimpleNamespace(pid=5151)
+        order.append("start")
+
+    def fake_close(self: Any) -> None:
+        self._proc = None
+        order.append("close")
+
+    monkeypatch.setattr(CodexClient, "start", fake_start)
+    monkeypatch.setattr(CodexClient, "close", fake_close)
+
+    def fake_drive_turn(*args: Any) -> None:
+        client = args[0]()
+        client.start()
+        client.close()
+        args[10].put(codex_backend._DONE)
+
+    monkeypatch.setattr(codex_backend, "_drive_turn", fake_drive_turn)
+    tool_host = ToolHost([], [], lambda ref: ref)
+    ctx = _make_turn_context(broker=_ScriptedBroker("allow"), tools=tool_host)
+    ctx.engine_started = lambda pid: order.append(f"started {pid}")
+    ctx.engine_closing = lambda: order.append("closing")
+
+    async def run() -> None:
+        try:
+            [event async for event in CodexBackend(_profile(), NativeStoreConfig()).run(ctx)]
+        finally:
+            await tool_host.stop_socket()
+
+    asyncio.run(run())
+
+    assert order == ["start", "started 5151", "closing", "close"]
+
+
+def test_turn_client_without_the_sdk_attribute_warns_and_reports_no_pid(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    from openai_codex.client import CodexClient
+
+    started: list[int] = []
+    monkeypatch.setattr(CodexClient, "start", lambda self: delattr(self, "_proc"))
+    client = codex_backend._EngineReportingClient(
+        engine_started=started.append, engine_closing=lambda: None
+    )
+
+    with caplog.at_level("WARNING"):
+        client.start()
+
+    assert started == []
+    assert any(
+        "process report unavailable: codex SDK has no _proc" in r.getMessage()
+        for r in caplog.records
+    )
+
+
+def test_installed_sdk_keeps_the_app_server_process_where_the_adapter_reads_it() -> None:
+    """Pins the private attribute `_engine_pid` reads: an SDK upgrade that
+    moves it fails here, not silently in production."""
+    import inspect
+
+    from openai_codex.client import CodexClient
+
+    assert hasattr(CodexClient(), "_proc")
+    assert "self._proc = subprocess.Popen(" in inspect.getsource(CodexClient.start)

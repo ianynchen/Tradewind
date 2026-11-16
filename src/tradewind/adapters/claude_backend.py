@@ -162,6 +162,19 @@ from tradewind.domain.policy import Action, TurnVars, floor_tradewind
 
 _logger = logging.getLogger(__name__)
 
+
+def _engine_pid(client: ClaudeSDKClient) -> int | None:
+    """The CLI process's PID, for the process report (05 §3.4). The SDK
+    keeps it private (`ClaudeSDKClient._transport._process`, pinned by a
+    unit test); when it is missing, one WARNING and no report."""
+    transport = getattr(client, "_transport", None)
+    pid = getattr(getattr(transport, "_process", None), "pid", None)
+    if not isinstance(pid, int):
+        _logger.warning("process report unavailable: claude SDK has no _transport._process.pid")
+        return None
+    return pid
+
+
 # `ResultMessage.terminal_reason` values that mean "this turn was ended by
 # `ClaudeSDKClient.interrupt()`, not a genuine completion or failure"
 # (`ResultMessage.terminal_reason`'s own docstring; confirmed empirically
@@ -1073,14 +1086,19 @@ class ClaudeBackend(Backend):
             if self._stop_requests.get(session_id) is stop_request:
                 self._stop_requests.pop(session_id, None)
             try:
-                await client.disconnect()
-            except Exception:
-                # Cleanup-only failure (subprocess already gone, etc.): must
-                # never mask a result already yielded above, so it is
-                # logged, not raised (GUIDELINES §9).
-                _logger.exception(
-                    "ClaudeSDKClient.disconnect() failed", extra={"turn_id": ctx.turn_id}
-                )
+                # 05 §3.4: the CLI's descendants, while they can still be
+                # found; a cancel here still reaches the disconnect below.
+                await asyncio.to_thread(ctx.engine_closing)
+            finally:
+                try:
+                    await client.disconnect()
+                except Exception:
+                    # Cleanup-only failure (subprocess already gone, etc.):
+                    # must never mask a result already yielded above, so it
+                    # is logged, not raised (GUIDELINES §9).
+                    _logger.exception(
+                        "ClaudeSDKClient.disconnect() failed", extra={"turn_id": ctx.turn_id}
+                    )
 
     async def _drive_client(
         self,
@@ -1119,6 +1137,10 @@ class ClaudeBackend(Backend):
                     )
                 )
                 await anyio.sleep(delay)
+        # 05 §3.4: the runner records the CLI process for the process report.
+        engine_pid = _engine_pid(client)
+        if engine_pid is not None:
+            await asyncio.to_thread(ctx.engine_started, engine_pid)
         # The CLI's StructuredOutput pair (FR-1.3) is hidden from the stream;
         # its ids carry from the call's message to the result's.
         hidden_ids: set[str] = set()

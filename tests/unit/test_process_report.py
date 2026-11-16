@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import logging
+import os
 import signal
 import subprocess
 import sys
+import time
 
 from tradewind.application import process_report as pr
 from tradewind.application.process_report import (
@@ -169,3 +171,103 @@ def test_log_report_warns(caplog):
     recs = [r for r in caplog.records if r.levelno == logging.WARNING]
     assert len(recs) == 1
     assert "t1" in recs[0].getMessage() and "102" in recs[0].getMessage()
+
+
+# --- the caller guard (05 §3.4: engines share the caller's process group) ---
+
+_ENGINE, _CHILD, _GRANDCHILD, _SIBLING, _SHIM = 90001, 90002, 90003, 90004, 90005
+
+
+def _caller_ps() -> str:
+    """A listing where the engine is the caller's child in the caller's
+    group: a child in that group, a grandchild in its own group, the shim,
+    and a sibling of the caller in the same group."""
+    me, parent, group = os.getpid(), os.getppid(), os.getpgrp()
+    when = "Sun Nov 15 15:11:42 2026"
+    rows = [
+        (parent, 1, group, "zsh"),
+        (me, parent, group, "pytest"),
+        (_SIBLING, parent, group, "sibling-of-caller"),
+        (_ENGINE, me, group, "claude --print"),
+        (_CHILD, _ENGINE, group, "node server.js"),
+        (_GRANDCHILD, _CHILD, _GRANDCHILD, "sleep 1000"),
+        (_SHIM, _ENGINE, group, f"{sys.executable} -m tradewind.toolproxy"),
+    ]
+    return "".join(f"{pid} {ppid} {pgid} {when} {cmd}\n" for pid, ppid, pgid, cmd in rows)
+
+
+def test_descendants_skip_the_group_when_it_is_the_callers():
+    procs = list_processes(_caller_ps)
+    found = {p.pid for p in descendants(_ENGINE, os.getpgrp(), procs)}
+    # The tree walk only: never the caller, its parent or the caller's sibling.
+    assert found == {_CHILD, _GRANDCHILD, _SHIM}
+
+
+def test_descendants_without_a_group_walk_the_tree_only():
+    procs = list_processes(lambda: PS)
+    # 103 shares the root's group but is not its descendant.
+    assert {p.pid for p in descendants(100, None, procs)} == {101, 102}
+
+
+def test_descendants_never_include_the_caller_or_its_ancestors():
+    procs = list_processes(_caller_ps)
+    # A root that is the caller's parent: the walk would reach the caller.
+    found = {p.pid for p in descendants(os.getppid(), None, procs)}
+    assert os.getpid() not in found and os.getppid() not in found
+    assert descendants(os.getpid(), None, procs) == []
+
+
+def test_kill_tree_never_signals_the_caller_or_its_ancestors(monkeypatch):
+    sent = []
+    monkeypatch.setattr(pr.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    procs = list_processes(_caller_ps)
+    kill_tree(procs, grace_s=0.0, sleep=lambda _s: None, list_fn=lambda: procs)
+    signalled = {pid for pid, _sig in sent}
+    assert os.getpid() not in signalled and os.getppid() not in signalled
+    assert _ENGINE in signalled
+
+
+def test_real_tree_is_found_and_killed_without_touching_the_caller():
+    # A `sh` this test starts, with two `sleep` children; it shares the
+    # caller's group, so only the tree walk finds them.
+    root = subprocess.Popen(["sh", "-c", "sleep 30 & sleep 30 & wait"])
+    try:
+        deadline = time.monotonic() + 5
+        kids: list[ProcInfo] = []
+        while time.monotonic() < deadline and len(kids) < 2:
+            procs = list_processes()
+            kids = descendants(root.pid, None, procs)
+            time.sleep(0.05)
+        assert len(kids) == 2 and all("sleep" in p.command for p in kids)
+        engine = next(p for p in procs if p.pid == root.pid)
+        kill_tree([engine, *kids], grace_s=0.5)
+        root.wait(timeout=5)
+        alive = {(p.pid, p.start) for p in list_processes()}
+        assert all((p.pid, p.start) not in alive for p in kids)
+    finally:
+        if root.poll() is None:
+            root.kill()
+            root.wait()
+
+
+def test_engine_watch_survives_a_failed_listing(monkeypatch, caplog):
+    def broken():
+        raise subprocess.CalledProcessError(1, "ps")
+
+    monkeypatch.setattr(pr, "list_processes", broken)
+    watch = pr.EngineWatch(exclude=lambda _p: False)
+    with caplog.at_level(logging.WARNING):
+        watch.started(_ENGINE)
+        watch.snapshot()
+    assert not watch.tracked
+    assert any("listing processes failed" in r.getMessage() for r in caplog.records)
+
+
+def test_engine_watch_ignores_the_callers_own_pid(monkeypatch):
+    monkeypatch.setattr(pr, "list_processes", lambda: list_processes(_caller_ps))
+    watch = pr.EngineWatch(exclude=lambda _p: False)
+    watch.started(os.getpid())
+    assert not watch.tracked
+    watch.started(_ENGINE)
+    watch.snapshot()
+    assert {p.pid for p in watch.recorded()} == {_ENGINE, _CHILD, _GRANDCHILD, _SHIM}

@@ -250,7 +250,9 @@ closed items. The terminal event comes after this point.
 | caller interrupt answered within 15 s | terminated | reported, not killed |
 | interrupt unanswered, or a limit fired | process group, then tree walk | killed; survivors reported |
 
-The report is emitted on a fired limit, on an interrupt, or when
+The process group step applies only when the engine has its own group;
+an engine that shares the caller's group gets the tree walk only. The
+report is emitted on a fired limit, on an interrupt, or when
 descendants are alive at a normal end. Process listing uses `ps` (no new
 dependency); a PID whose start time
 changed is not reported; the shim and the engine's own helper processes
