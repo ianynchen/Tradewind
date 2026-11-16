@@ -16,6 +16,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Brokers on every governed backend (Claude, Codex, LangChain) now receive an extra `tradewind` key in the broker-copy arguments (`tradewind_action` if the tool already has a `tradewind` argument); the tool's own arguments are unchanged.
 - A prompt is always treated as a message, never expanded as a slash command. `claude` now sends a prompt whose first non-whitespace character is `/` with the prefix `Message: `; `codex` (app-server passes text as-is) and `langchain` (no slash parsing) send it unchanged; `cursor` sends it unchanged (unverified). The mirror keeps the original prompt.
 - New runtime dependency: `jsonschema>=4.26,<5`.
+- On Claude and Codex the terminal event now arrives after the engine process has closed, so the process report can precede it; an event an adapter yields after its terminal now comes before the terminal.
 
 ### Added
 

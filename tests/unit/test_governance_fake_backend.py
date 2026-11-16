@@ -632,3 +632,24 @@ async def test_unanswered_interrupt_kills_the_engine_tree_after_the_grace(
     assert terminal.result.status == "interrupted"
     [report] = _notices([events[-2]], "process_report")
     assert _pids(report) == []
+
+
+async def test_a_stop_after_the_turn_ends_never_kills_reported_processes(
+    tmp_path: Path, procs: _FakeProcesses, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(turn_runner, "_INTERRUPT_GRACE_S", 0.05)
+    tw, _fake = _engine_tradewind(tmp_path, [Say("done")], procs)
+    session = await tw.create(_ID, SessionOptions())
+
+    events: list[Event] = []
+    async for event in session.stream("go"):
+        events.append(event)
+        if isinstance(event, TurnCompleted):
+            await session.stop()
+    await asyncio.sleep(0.3)
+
+    # The grandchild was reported, not killed (owner M10); a late stop
+    # must not start a grace that kills it afterwards.
+    [report] = _notices(events, "process_report")
+    assert _pids(report) == [_GRANDCHILD]
+    assert procs.killed == []

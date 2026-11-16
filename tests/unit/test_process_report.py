@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import signal
@@ -271,3 +272,43 @@ def test_engine_watch_ignores_the_callers_own_pid(monkeypatch):
     watch.started(_ENGINE)
     watch.snapshot()
     assert {p.pid for p in watch.recorded()} == {_ENGINE, _CHILD, _GRANDCHILD, _SHIM}
+
+
+def _watch_with_fakes(monkeypatch, listing):
+    killed = []
+    monkeypatch.setattr(pr, "list_processes", lambda: list_processes(listing))
+    monkeypatch.setattr(pr, "kill_tree", lambda procs, **_kw: killed.append({p.pid for p in procs}))
+    return pr.EngineWatch(exclude=lambda _p: False), killed
+
+
+async def test_a_stop_before_the_engine_started_still_gets_the_grace(monkeypatch):
+    watch, killed = _watch_with_fakes(monkeypatch, _caller_ps)
+    await watch.interrupting(0.05)  # no engine yet
+    await asyncio.to_thread(watch.started, _ENGINE)
+    await asyncio.sleep(0.3)
+    assert watch.unanswered
+    assert killed and _ENGINE in killed[0]
+
+
+async def test_a_pending_stop_starts_no_grace_once_the_watch_is_finished(monkeypatch):
+    watch, killed = _watch_with_fakes(monkeypatch, _caller_ps)
+    await watch.interrupting(0.05)
+    await watch.finish(kill=False, settle_s=0.0)
+    await asyncio.to_thread(watch.started, _ENGINE)
+    await watch.interrupting(0.05)
+    await asyncio.sleep(0.3)
+    assert killed == []
+
+
+def test_a_restarted_engine_keeps_the_first_engines_tree(monkeypatch):
+    second = 90006
+
+    def listing():
+        me, group = os.getpid(), os.getpgrp()
+        return _caller_ps() + f"{second} {me} {group} Sun Nov 15 15:11:42 2026 engine-2\n"
+
+    watch, _killed = _watch_with_fakes(monkeypatch, listing)
+    watch.started(_ENGINE)
+    watch.snapshot()
+    watch.started(second)
+    assert {p.pid for p in watch.recorded()} == {_ENGINE, _CHILD, _GRANDCHILD, _SHIM, second}

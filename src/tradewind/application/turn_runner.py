@@ -314,7 +314,10 @@ _INTERRUPT_GRACE_S = 15.0
 
 # How long the process report waits, at a turn end that kills nothing, for
 # the engine's descendants to exit after the engine closed (an MCP server
-# ends shortly after its engine); only paid while one is still alive.
+# ends shortly after its engine); only paid while one is still alive. The
+# terminal is held for this wait and for the adapter's engine close, which
+# is bounded by the SDK (Claude's disconnect escalates to kill; Codex
+# terminates, waits 2 s, then kills).
 # Module-level so tests can shorten it.
 _REPORT_SETTLE_S = 1.0
 
@@ -1018,13 +1021,21 @@ class TurnRunner:
                                 if watch.tracked:
                                     # 05 §3.4: the adapter closes its engine
                                     # after its terminal; the report, which
-                                    # comes first, is made once it has.
+                                    # comes first, is made once it has. The
+                                    # hold relies on the SDK close being
+                                    # bounded (Claude's disconnect escalates
+                                    # to kill; Codex terminates, waits 2 s,
+                                    # then kills).
                                     held_terminal = event
                                     continue
                             self._tap(event, turn_id)
                             yield event
 
                     await stop_supervisor()
+                    # A stop from here on finds no watch (05 §3.4: what the
+                    # report names as alive is never killed afterwards).
+                    if self._watches.get(session_id) is watch:
+                        self._watches.pop(session_id, None)
                     if watch.tracked:
                         report = await _engine_report(
                             watch,
@@ -1158,6 +1169,8 @@ class TurnRunner:
                         _logger.exception(
                             "interrupt after a fired limit raised", extra={"turn_id": turn_id}
                         )
+            if self._watches.get(session_id) is watch:
+                self._watches.pop(session_id, None)
             if report_ctx is not None and watch.tracked and not watch.finished:
                 # An abnormal end (a raising backend, an abandoned stream):
                 # the engine is still ended per 05 §3.4 and its report
@@ -1172,8 +1185,6 @@ class TurnRunner:
                     )
                 if report is not None:
                     gate_events.append(report)
-            if self._watches.get(session_id) is watch:
-                self._watches.pop(session_id, None)
             if gate_events:
                 # Notices raised before an abnormal end (a raising backend,
                 # an abandoned stream) still reach the store. A failure here

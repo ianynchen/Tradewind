@@ -172,6 +172,9 @@ class EngineWatch:
         self._engine: ProcInfo | None = None
         self._tree: dict[tuple[int, str], ProcInfo] = {}
         self._watchdog: asyncio.Task[None] | None = None
+        # An interrupt that came before the engine was reported: its grace
+        # starts once `started` records the engine.
+        self._pending: tuple[asyncio.AbstractEventLoop, float] | None = None
         self.unanswered = False
         self.finished = False
 
@@ -181,9 +184,11 @@ class EngineWatch:
         return self._engine is not None
 
     def started(self, pid: int) -> None:
-        """Record the engine by PID and start time; a PID that is not
-        listed, or is this process or an ancestor of it, is ignored. A
-        failed listing is logged: the turn goes on without a report."""
+        """Record the engine by PID and start time, beside any engine
+        recorded before (a restarted engine keeps the first one's tree); a
+        PID that is not listed, or is this process or an ancestor of it, is
+        ignored. A failed listing is logged: the turn goes on without a
+        report. An interrupt already pending starts its grace now."""
         try:
             procs = list_processes()
         except Exception:
@@ -195,7 +200,11 @@ class EngineWatch:
             return
         with self._lock:
             self._engine = engine
-            self._tree = {(engine.pid, engine.start): engine}
+            self._tree[(engine.pid, engine.start)] = engine
+            pending = self._pending
+        if pending is not None:
+            loop, grace_s = pending
+            loop.call_soon_threadsafe(self._arm, grace_s)
 
     def snapshot(self) -> None:
         """Add the engine's current descendants to the record. Nothing is
@@ -225,11 +234,23 @@ class EngineWatch:
     async def interrupting(self, grace_s: float) -> None:
         """Before an interrupt: snapshot the tree, then start the grace.
         When the turn has not ended (`finish`) within `grace_s`, the
-        interrupt counts as unanswered and the tree is killed."""
-        if not self.tracked:
+        interrupt counts as unanswered and the tree is killed. Nothing
+        happens once the watch is finished (the turn already ended and its
+        report is out); before the engine is reported, the interrupt is
+        kept and its grace starts in `started`."""
+        if self.finished:
             return
+        if not self.tracked:
+            with self._lock:
+                self._pending = (asyncio.get_running_loop(), grace_s)
+            if not self.tracked:
+                return
         await asyncio.to_thread(self.snapshot)
-        if self._watchdog is None:
+        self._arm(grace_s)
+
+    def _arm(self, grace_s: float) -> None:
+        """Start the grace once (on the loop); never after `finish`."""
+        if self._watchdog is None and not self.finished:
             self._watchdog = asyncio.get_running_loop().create_task(self._kill_after(grace_s))
 
     async def _kill_after(self, grace_s: float) -> None:
