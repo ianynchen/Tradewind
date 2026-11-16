@@ -63,7 +63,8 @@ as Antigravity will. Capability flags (engine_auto / work supervisor /
 action policy): Claude False/True/True, Codex True/True/True, LangChain
 False/True/True, Cursor False/False/False. Claude `engine_auto` is
 unsupported because the SDK's auto mode bypasses `can_use_tool`. The
-Antigravity mapping is PR 2 (future work).
+Antigravity mapping was planned as PR 2. The owner stopped it on 2026-11-15
+because of Google's terms (`04-antigravity-adapter.md`, Status).
 
 ## Consequences
 

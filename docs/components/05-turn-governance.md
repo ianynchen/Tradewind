@@ -2,8 +2,9 @@
 
 Status: design (2026-11-15). Owner-approved restructuring of the Antigravity
 design (`04-antigravity-adapter.md`) into backend-neutral mechanisms;
-revised after an independent review. Not implemented. Delivered in PR 1
-(Delivery, below).
+revised after an independent review. Implemented in PR 1 (0.12.0). The
+Antigravity adapter (`04`) was stopped by the owner on 2026-11-15 because of
+Google's terms; Antigravity rows below are history.
 
 ## Purpose
 
@@ -357,7 +358,7 @@ compatibility); FR-6.6 (supervisor; hard cap optional; "every backend");
 FR-8.1 (new flags); FR-2 and the port docstring (terminal record without
 `TurnStarted`).
 
-**PR 2:** the Antigravity adapter (`04`).
+**PR 2:** the Antigravity adapter (`04`). Stopped by the owner, 2026-11-15 (Google's terms).
 
 ## Acceptance (PR 1)
 

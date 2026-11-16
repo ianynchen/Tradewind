@@ -4,8 +4,25 @@ Status: design. Approach approved by the owner (2026-11-15); revised after
 an adversarial review and the go/no-go spike
 (`docs/research/2026-11-15-antigravity-acp-spike.md`, verdict **GO for
 broker mode, conditional**); restructured onto the shared mechanisms in
-`05-turn-governance.md` (owner, 2026-11-15). Not implemented. Delivered in
-PR 2, after PR 1 (`05`) is merged.
+`05-turn-governance.md` (owner, 2026-11-15).
+
+**Stopped (owner, 2026-11-15). Not to be implemented.** Google's terms do not
+permit this use of a Google AI Pro subscription:
+
+- Antigravity Additional Terms §6 (<https://antigravity.google/terms>):
+  "Using third party software, tools, or services to access the Service ... is
+  a breach of this Agreement", and it can lead to "suspension or termination of
+  your Antigravity and/or Gemini CLI accounts". The FAQ
+  (<https://antigravity.google/docs/faq>) says the same.
+- A Google collaborator on google-antigravity/antigravity-cli#1493 (2026-11-12)
+  permits `agy acp` only "when a human user is directly driving the session".
+  The answer forbids "using agy acp as a backend worker inside a third-party
+  coding agent, autonomous agent harness, or background orchestrator". That is
+  the Meridian use this adapter was for.
+
+For Gemini models, use the LangChain backend with an API key. The generic
+safety mechanisms this design produced are in `05-turn-governance.md`
+(released in 0.12.0). The text below is kept as history.
 
 ## Purpose
 

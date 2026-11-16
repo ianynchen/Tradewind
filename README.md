@@ -493,7 +493,7 @@ One set of mechanisms holds on every backend that declares the flag (design:
   argument) holding the shared action description; the tool itself never sees that key.
   A matcher value `$turn.<name>` reads a turn variable: `mode`, `workspace`, `result_tool`
   (the result tool's name when the turn uses it); `engine_mode` and `shim_server` are set only
-  by backends that have them (Antigravity, PR 2) and are `None` until then.
+  by backends that have them; no current backend does, so they are always `None`.
   An invalid rule (unknown kind, outcome, mode or matcher op, a bad regex, an unknown `$turn`
   name) raises `ConfigError`.
   A broker that raises gives `deny`.
