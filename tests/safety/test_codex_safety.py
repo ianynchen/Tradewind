@@ -6,7 +6,7 @@ login and a real `codex app-server`. The owner starts it, time-boxed:
 
     TRADEWIND_RUN_SAFETY=1 timeout 1500 uv run pytest tests/safety -v -m integration
 
-Add `-rP` to see the printed engine versions of passed tests.
+Add `-rP` to see the printed engine versions and evidence of passed tests.
 
 Each test checks a fact that an engine upgrade can change. A test that
 cannot show its effect fails with "inconclusive: <why>"; it never passes
@@ -19,42 +19,39 @@ The two broker tests came from `tests/integration/test_codex_governance_live.py`
 action with the changed path, not a `missing_critical_field` floor deny.
 The sandbox is `read-only`, so every write must ask first.
 
-Workspaces, markers and project config are in the test's temp folder only.
-The tests never edit `~/.codex/config.toml` and never change Codex trust.
+Workspaces, markers and project config are in the test's temp folder. The
+tests never write `~/.codex/config.toml`; the trust for the config trap is
+a per-process `--config` override (see that test). The engine itself still
+writes its own session files under `~/.codex/sessions`, as on every Codex
+turn.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
-import re
 import secrets
 import shutil
+import tomllib
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import anyio
 import pytest
+from openai_codex.client import CodexConfig
 
+from tests.safety._live import Outcome, auth_failure, redact, turn
 from tradewind.adapters.codex_backend import CodexBackend
 from tradewind.application.client import Session, Tradewind
-from tradewind.application.config import TradewindConfig
-from tradewind.domain.events import (
-    Event,
-    ItemCompleted,
-    PermissionRequested,
-    TurnCompleted,
-    TurnFailed,
-)
+from tradewind.application.config import NativeStoreConfig, TradewindConfig
+from tradewind.domain.events import PermissionRequested
 from tradewind.domain.models import (
     CustomizationDecision,
     ModelSpec,
     Profile,
     SessionOptions,
     SubscriptionAuth,
-    TurnResult,
 )
 
 pytestmark = pytest.mark.integration
@@ -73,27 +70,6 @@ _CONTROL_CAP_S = 90
 _PONG = "Reply with exactly one word: pong"
 _CODEWORD = "KUMQUAT"
 _AUTH_VARS = ("OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN")
-# Words that show a turn failed on authentication, not for another reason.
-_AUTH_MARKERS = (
-    "api key",
-    "api_key",
-    "apikey",
-    "401",
-    "auth",
-    "unauthorized",
-    "credential",
-    "token",
-    "login",
-    "log in",
-    "invalid",
-)
-
-
-@dataclass
-class _Outcome:
-    events: list[Event]
-    result: TurnResult | None
-    error: str | None
 
 
 @dataclass
@@ -113,16 +89,25 @@ class _RecordingBroker:
         return found
 
 
-def _tradewind(tmp_path: Path, *, sandbox: str | None = None) -> Tradewind:
-    profile = Profile(
+def _profile(sandbox: str | None = None) -> Profile:
+    return Profile(
         backend="codex",
         auth=SubscriptionAuth(),
         models={"standard": ModelSpec(model=_MODEL)},
         backend_options={"sandbox": sandbox} if sandbox is not None else {},
     )
+
+
+def _print_engine_version() -> None:
+    """Printed before any turn, so a failed test shows it too."""
+    version = CodexBackend(_profile(), NativeStoreConfig()).engine_version()
+    print(f"codex engine_version: {version}")
+
+
+def _tradewind(tmp_path: Path, *, sandbox: str | None = None) -> Tradewind:
     return Tradewind(
         TradewindConfig(
-            profiles={"default": profile},
+            profiles={"default": _profile(sandbox)},
             default_profile="default",
             store=tmp_path / "sessions.db",
         )
@@ -143,75 +128,42 @@ async def _create(
     )
 
 
-async def _turn(
-    session: Session, prompt: str, customizations: CustomizationDecision | None = None
-) -> _Outcome:
-    """One streamed turn. A failure is recorded, not raised, so a control
-    run can inspect it."""
-    events: list[Event] = []
-    error: str | None = None
-    try:
-        # Closed at once, also on a cancel, so the engine process ends.
-        async with contextlib.aclosing(
-            session.stream(prompt, customizations=customizations)
-        ) as stream:
-            async for event in stream:
-                events.append(event)
-    except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
-    result: TurnResult | None = None
-    for event in events:
-        if isinstance(event, TurnCompleted):
-            result = event.result
-            print(f"codex engine_version: {result.engine_version}")
-        elif isinstance(event, TurnFailed):
-            error = event.error
-    return _Outcome(events=events, result=result, error=error)
-
-
-def _describe(outcome: _Outcome, broker: _RecordingBroker | None = None) -> str:
+def _describe(outcome: Outcome, broker: _RecordingBroker | None = None) -> str:
     lines = [f"broker calls: {broker.calls!r}"] if broker is not None else []
-    lines += [f"error: {outcome.error!r}"]
-    lines += [
-        repr(e)[:400]
-        for e in outcome.events
-        if isinstance(e, PermissionRequested | TurnFailed | TurnCompleted | ItemCompleted)
-    ]
-    return "\n".join(lines)
-
-
-def _redact(text: str, values: list[str]) -> str:
-    """Never print the invalid values: drop each one and any masked form."""
-    for value in values:
-        text = text.replace(value, "<redacted>")
-    return re.sub(r"\S*\*{3,}\S*", "<masked>", text)
-
-
-def _auth_failure(outcome: _Outcome) -> str | None:
-    """The text that shows the turn failed on auth, or None."""
-    texts: list[str] = []
-    if outcome.error:
-        texts.append(outcome.error)
-    if outcome.result is not None and outcome.result.status != "completed":
-        texts.append(outcome.result.final_text or "")
-    for text in texts:
-        if any(marker in text.lower() for marker in _AUTH_MARKERS):
-            return text
-    return None
+    return "\n".join([*lines, outcome.describe()])
 
 
 def _no_auth_vars(_self: CodexBackend) -> frozenset[str]:
     return frozenset()
 
 
+def _trust_override(workspace: Path) -> str:
+    """A `--config` entry that trusts `workspace` for one Codex process.
+
+    Codex splits an override key on "." (`config/src/overrides.rs`
+    `apply_toml_override`), so the path cannot be in the key. The key is
+    `projects`, and the paths are keys of an inline-table value. Both the
+    given and the resolved path are listed (macOS temp folders are under a
+    `/var` -> `/private/var` link)."""
+    paths = sorted({str(workspace), str(workspace.resolve())})
+    entries = ", ".join(f'{json.dumps(p)} = {{ trust_level = "trusted" }}' for p in paths)
+    override = f"projects = {{ {entries} }}"
+    # The value must parse as TOML; Codex reads a value that does not parse
+    # as a plain string, which would make the trap show nothing.
+    parsed = tomllib.loads(override)["projects"]
+    assert all(parsed[p] == {"trust_level": "trusted"} for p in paths), override
+    return override.replace("projects = ", "projects=", 1)
+
+
 async def test_shell_reaches_broker(tmp_path: Path) -> None:
     """A shell command reaches the broker as a `shell` action."""
+    _print_engine_version()
     with anyio.fail_after(_CAP_S):
         workspace = _workspace(tmp_path)
         broker = _RecordingBroker()
         session = await _create(_tradewind(tmp_path, sandbox="read-only"), workspace, broker)
 
-        outcome = await _turn(
+        outcome = await turn(
             session,
             "Run exactly this shell command once: touch marker.txt -- then reply with "
             "the word done. Do not run any other command.",
@@ -230,12 +182,13 @@ async def test_shell_reaches_broker(tmp_path: Path) -> None:
 async def test_file_write_reaches_broker_with_changes(tmp_path: Path) -> None:
     """A file write reaches the broker as a `file_write` action with its
     changes, not a `missing_critical_field` deny."""
+    _print_engine_version()
     with anyio.fail_after(_CAP_S):
         workspace = _workspace(tmp_path)
         broker = _RecordingBroker()
         session = await _create(_tradewind(tmp_path, sandbox="read-only"), workspace, broker)
 
-        outcome = await _turn(
+        outcome = await turn(
             session,
             "Create a new file named hello.txt in the current directory whose whole "
             "content is the single line: hi. Use your apply_patch file-editing tool, "
@@ -260,12 +213,13 @@ async def test_env_scrub_keeps_subscription(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With invalid Codex auth variables and no scrub, the turn fails on
-    auth (control). With the scrub, the same environment gives a turn on
-    the subscription. The values are never printed.
+    auth (control). With the scrub, the same environment gives a completed
+    turn on the subscription. The values are never printed.
 
     Codex 0.147.0 (`login/src/auth/manager.rs` `load_auth`) reads
     `CODEX_ACCESS_TOKEN` before the stored ChatGPT login, so that variable
     is the one expected to break the control."""
+    _print_engine_version()
     with anyio.fail_after(_CAP_S):
         invalid = {name: f"tradewind-safety-invalid-{secrets.token_hex(16)}" for name in _AUTH_VARS}
         for name, value in invalid.items():
@@ -274,45 +228,54 @@ async def test_env_scrub_keeps_subscription(
         workspace = _workspace(tmp_path)
         tradewind = _tradewind(tmp_path)
 
-        control: _Outcome | None = None
+        control: Outcome | None = None
         with monkeypatch.context() as no_scrub:
             # Test-only: the adapter builds its config without the scrub.
             no_scrub.setattr(CodexBackend, "auth_env_vars", _no_auth_vars)
             session = await _create(tradewind, workspace)
             with anyio.move_on_after(_CONTROL_CAP_S):
-                control = await _turn(session, _PONG)
+                control = await turn(session, _PONG)
         if control is None:
             pytest.fail(f"inconclusive: the control turn did not end in {_CONTROL_CAP_S} s")
-        if _auth_failure(control) is None:
+        evidence = auth_failure(control)
+        if evidence is None:
             pytest.fail(
                 "inconclusive: without the scrub, invalid Codex auth variables did not make "
-                "the turn fail on auth\n" + _redact(_describe(control), values)
+                "the turn fail on auth\n" + redact(_describe(control), values)
             )
 
         session = await _create(tradewind, workspace)
-        protected = await _turn(session, _PONG)
+        protected = await turn(session, _PONG)
 
-        if protected.result is None or not protected.result.final_text:
+        status = protected.result.status if protected.result is not None else None
+        if status != "completed" or auth_failure(protected) is not None:
             pytest.fail(
                 "the scrubbed turn did not complete on the subscription\n"
-                + _redact(_describe(protected), values)
+                + redact(_describe(protected), values)
             )
+        print("control auth failure (evidence): " + redact(evidence, values)[:400])
 
 
-async def test_project_config_keys_honored(tmp_path: Path) -> None:
+async def test_project_config_keys_honored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Whether a project `.codex/config.toml` key that runs code is honored.
     This decides the Codex pattern in 06 §1.
 
     The file sets two keys:
     - `developer_instructions` (harmless): the reply ends with a codeword
-      when the project layer is loaded. This is the control.
+      when the project layer is loaded. Printed as extra evidence.
     - `mcp_servers` (runs code, not on the 0.147.0 project-local denylist
       in `config/src/loader/mod.rs`): its command touches a marker.
 
-    Codex loads the project layer only when the folder is trusted. A temp
-    folder is trusted only if the owner's own trust settings already cover
-    it; the test never changes them, so an untrusted folder is
-    "inconclusive"."""
+    Codex loads the project layer only for a trusted folder. Controller
+    ruling: the test trusts its temp folder for this one Codex process only,
+    with a `--config projects=...` override added to the adapter's
+    `config_overrides` (test-only monkeypatch). Codex reads the trust list
+    from the merged config, and that includes `--config` overrides
+    (`project_trust_context`). Nothing is written to `~/.codex/config.toml`.
+
+    With the folder trusted, a completed turn without the marker is a real
+    result, "honored: no", not "inconclusive"."""
+    _print_engine_version()
     with anyio.fail_after(_CAP_S):
         workspace = _workspace(tmp_path)
         marker = tmp_path / "project-mcp-server-started"
@@ -326,23 +289,35 @@ async def test_project_config_keys_honored(tmp_path: Path) -> None:
             f"command = {json.dumps(touch)}\n"
             f"args = [{json.dumps(str(marker))}]\n"
         )
+        trust = _trust_override(workspace)
+        real_engine_config = CodexBackend._engine_config
+
+        def trusted_engine_config(
+            self: CodexBackend, config_overrides: tuple[str, ...] = ()
+        ) -> CodexConfig:
+            return real_engine_config(self, (*config_overrides, trust))
+
+        monkeypatch.setattr(CodexBackend, "_engine_config", trusted_engine_config)
         session = await _create(_tradewind(tmp_path), workspace)
         scan = session.scan_customizations()
         assert [f.path for f in scan.files] == [Path(".codex/config.toml")], scan
         decision = CustomizationDecision(action="proceed", fingerprint=scan.fingerprint)
 
-        outcome = await _turn(session, "Reply with one short sentence that says hello.", decision)
+        outcome = await turn(session, "Reply with one short sentence that says hello.", decision)
 
-        detail = _describe(outcome)
-        if marker.exists():
-            return  # a project-local key that runs code is honored: the flag is needed
         reply = (outcome.result.final_text or "") if outcome.result is not None else ""
-        if _CODEWORD.lower() not in reply.lower():
-            pytest.fail(
-                "inconclusive: no sign that the project config layer loaded; the temp folder "
-                "is probably not trusted by Codex (the test never changes trust)\n" + detail
-            )
+        evidence = (
+            f"trust override: {trust}\n"
+            f"marker exists: {marker.exists()}\n"
+            f"codeword in reply: {_CODEWORD.lower() in reply.lower()}\n"
+            f"{_describe(outcome)}"
+        )
+        if marker.exists():
+            print(f"honored: yes (mcp_servers from project config started)\n{evidence}")
+            return
+        if outcome.result is None:
+            pytest.fail(f"inconclusive: the turn did not complete\n{evidence}")
         pytest.fail(
-            "the project config layer loaded (codeword seen), but its mcp_servers entry did "
-            "not start: re-check which project-local keys this Codex honors (06 §1)\n" + detail
+            "honored: no -- with the folder trusted for this process, the project "
+            "mcp_servers entry did not start; re-check the Codex pattern in 06 §1\n" + evidence
         )

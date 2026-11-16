@@ -6,24 +6,23 @@ login and the SDK's bundled CLI. The owner starts it, time-boxed:
 
     TRADEWIND_RUN_SAFETY=1 timeout 1500 uv run pytest tests/safety -v -m integration
 
-Add `-rP` to see the printed engine versions of passed tests.
+Add `-rP` to see the printed engine versions and evidence of passed tests.
 
 Each test checks a fact that an engine upgrade can change. Each trap has a
 control run that shows the effect without the protection. When the control
 does not show the effect, the test fails with "inconclusive: <why>"; it
 never passes without positive evidence.
 
-Workspaces, markers and backups are in the test's temp folder only. The
-tests never edit `~/.claude` (the CLI still writes its own session
-transcripts there, as on every Claude turn).
+Workspaces, markers and backups are in the test's temp folder. The tests
+edit no config outside it. The engine itself still writes its own state
+outside it, as on every Claude turn: per-project state in `~/.claude.json`
+and session transcripts under `~/.claude/projects/`.
 """
 
 from __future__ import annotations
 
-import contextlib
 import json
 import os
-import re
 import secrets
 import shlex
 import uuid
@@ -34,10 +33,10 @@ from typing import Literal
 import anyio
 import pytest
 
+from tests.safety._live import auth_failure, redact, turn
 from tradewind.adapters.claude_backend import _MCP_SERVER_NAME, ClaudeBackend
 from tradewind.application.client import Session, Tradewind
-from tradewind.application.config import TradewindConfig
-from tradewind.domain.events import Event, ItemCompleted, TurnCompleted, TurnFailed
+from tradewind.application.config import NativeStoreConfig, TradewindConfig
 from tradewind.domain.models import (
     CustomizationDecision,
     ModelSpec,
@@ -45,7 +44,6 @@ from tradewind.domain.models import (
     SessionOptions,
     SubscriptionAuth,
     Tool,
-    TurnResult,
 )
 
 pytestmark = pytest.mark.integration
@@ -66,32 +64,19 @@ _CALL_PROBE = (
     f"Call the tool {_PROBE_FULL_NAME} exactly once with the input "
     '{"x": "a"}. Then reply with the word done.'
 )
-# Words that show a turn failed on authentication, not for another reason.
-_AUTH_MARKERS = (
-    "api key",
-    "api_key",
-    "apikey",
-    "401",
-    "auth",
-    "unauthorized",
-    "credential",
-    "token",
-    "login",
-    "log in",
-    "invalid",
+# The Claude auth and provider variables other than ANTHROPIC_API_KEY
+# (06 §4). The scrub control removes them, so it can never use a real
+# credential from the owner's shell.
+_OTHER_AUTH_VARS = (
+    "ANTHROPIC_AUTH_TOKEN",
+    "CLAUDE_CODE_USE_BEDROCK",
+    "CLAUDE_CODE_USE_VERTEX",
+    "CLAUDE_CODE_USE_FOUNDRY",
+    "CLAUDE_CODE_USE_ANTHROPIC_AWS",
+    "CLAUDE_CODE_USE_ANTHROPIC_GOOGLE_CLOUD",
+    "CLAUDE_CODE_USE_MANTLE",
+    "CLAUDE_CODE_USE_GATEWAY",
 )
-
-
-@dataclass
-class _Outcome:
-    events: list[Event]
-    result: TurnResult | None
-    error: str | None
-
-    def describe(self) -> str:
-        lines = [f"result: {self.result!r}", f"error: {self.error!r}"]
-        lines += [repr(e)[:400] for e in self.events if isinstance(e, ItemCompleted)]
-        return "\n".join(lines)
 
 
 @dataclass
@@ -126,15 +111,24 @@ class _Probe:
         )
 
 
-def _tradewind(tmp_path: Path) -> Tradewind:
-    profile = Profile(
+def _profile() -> Profile:
+    return Profile(
         backend="claude",
         auth=SubscriptionAuth(),
         models={"standard": ModelSpec(model=_MODEL)},
     )
+
+
+def _print_engine_version() -> None:
+    """Printed before any turn, so a failed test shows it too."""
+    version = ClaudeBackend(_profile(), NativeStoreConfig()).engine_version()
+    print(f"claude engine_version: {version}")
+
+
+def _tradewind(tmp_path: Path) -> Tradewind:
     return Tradewind(
         TradewindConfig(
-            profiles={"default": profile},
+            profiles={"default": _profile()},
             default_profile="default",
             store=tmp_path / "sessions.db",
             customization_backup_dir=tmp_path / "backups",
@@ -168,32 +162,6 @@ async def _create(
     )
 
 
-async def _turn(
-    session: Session, prompt: str, customizations: CustomizationDecision | None = None
-) -> _Outcome:
-    """One streamed turn. A failure is recorded, not raised, so a control
-    run can inspect it."""
-    events: list[Event] = []
-    error: str | None = None
-    try:
-        # Closed at once, also on a cancel, so the engine process ends.
-        async with contextlib.aclosing(
-            session.stream(prompt, customizations=customizations)
-        ) as stream:
-            async for event in stream:
-                events.append(event)
-    except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
-    result: TurnResult | None = None
-    for event in events:
-        if isinstance(event, TurnCompleted):
-            result = event.result
-            print(f"claude engine_version: {result.engine_version}")
-        elif isinstance(event, TurnFailed):
-            error = event.error
-    return _Outcome(events=events, result=result, error=error)
-
-
 def _decide(
     session: Session, action: Literal["delete", "proceed"], expected: list[Path]
 ) -> CustomizationDecision:
@@ -201,24 +169,6 @@ def _decide(
     found = sorted(f.path for f in scan.files)
     assert found == sorted(expected), f"scan found {found}, expected {expected}"
     return CustomizationDecision(action=action, fingerprint=scan.fingerprint)
-
-
-def _redact(text: str, secret: str) -> str:
-    """Never print the invalid key: drop the value and any masked form."""
-    return re.sub(r"\S*\*{3,}\S*", "<masked>", text.replace(secret, "<redacted>"))
-
-
-def _auth_failure(outcome: _Outcome) -> str | None:
-    """The text that shows the turn failed on auth, or None."""
-    texts: list[str] = []
-    if outcome.error:
-        texts.append(outcome.error)
-    if outcome.result is not None and outcome.result.status != "completed":
-        texts.append(outcome.result.final_text or "")
-    for text in texts:
-        if any(marker in text.lower() for marker in _AUTH_MARKERS):
-            return text
-    return None
 
 
 def _no_auth_vars(_self: ClaudeBackend) -> frozenset[str]:
@@ -229,6 +179,7 @@ async def test_project_hook_runs_on_proceed_not_after_delete(tmp_path: Path) -> 
     """A project `SessionStart` hook runs on a `proceed` turn (control), and
     not after a `delete` turn. Proves the flagged settings file is loaded
     and that `delete` keeps its hook from running."""
+    _print_engine_version()
     with anyio.fail_after(_CAP_S):
         marker = tmp_path / "hook-ran"
         workspace = _workspace(tmp_path)
@@ -238,7 +189,7 @@ async def test_project_hook_runs_on_proceed_not_after_delete(tmp_path: Path) -> 
         expected = [Path(".claude/settings.json")]
 
         session = await _create(tradewind, workspace)
-        control = await _turn(session, _PONG, _decide(session, "proceed", expected))
+        control = await turn(session, _PONG, _decide(session, "proceed", expected))
         if control.result is None:
             pytest.fail(f"inconclusive: the proceed turn did not complete\n{control.describe()}")
         if not marker.exists():
@@ -249,7 +200,7 @@ async def test_project_hook_runs_on_proceed_not_after_delete(tmp_path: Path) -> 
 
         marker.unlink()
         session = await _create(tradewind, workspace)
-        trap = await _turn(session, _PONG, _decide(session, "delete", expected))
+        trap = await turn(session, _PONG, _decide(session, "delete", expected))
 
         assert trap.result is not None, trap.describe()
         assert not settings_path.exists(), "delete left the settings file"
@@ -263,13 +214,14 @@ async def test_project_permission_allow_skips_can_use_tool(tmp_path: Path) -> No
     the broker is called (control). With a project `permissions.allow` rule
     for it and `proceed`, the tool runs and the broker is not called. Proves
     that the settings file must be flagged."""
+    _print_engine_version()
     with anyio.fail_after(_CAP_S):
         tradewind = _tradewind(tmp_path)
 
         plain = _workspace(tmp_path, "plain")
         probe, broker = _Probe(), _RecordingBroker()
         session = await _create(tradewind, plain, tools=[probe.tool()], broker=broker)
-        control = await _turn(session, _CALL_PROBE)
+        control = await turn(session, _CALL_PROBE)
         detail = f"broker calls: {broker.calls}; tool calls: {probe.calls}\n{control.describe()}"
         if not probe.calls:
             pytest.fail(f"inconclusive: the model did not call the probe tool\n{detail}")
@@ -284,7 +236,7 @@ async def test_project_permission_allow_skips_can_use_tool(tmp_path: Path) -> No
         probe, broker = _Probe(), _RecordingBroker()
         session = await _create(tradewind, allowed, tools=[probe.tool()], broker=broker)
         decision = _decide(session, "proceed", [Path(".claude/settings.json")])
-        trap = await _turn(session, _CALL_PROBE, decision)
+        trap = await turn(session, _CALL_PROBE, decision)
         detail = f"broker calls: {broker.calls}; tool calls: {probe.calls}\n{trap.describe()}"
         if not probe.calls:
             pytest.fail(f"inconclusive: the model did not call the probe tool\n{detail}")
@@ -299,10 +251,13 @@ async def test_env_scrub_keeps_subscription(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """With an invalid `ANTHROPIC_API_KEY` and no scrub, the turn fails on
-    auth (control). With the scrub, the same environment gives a turn on
-    the subscription. The key value is never printed."""
+    auth (control). With the scrub, the same environment gives a completed
+    turn on the subscription. The key value is never printed."""
+    _print_engine_version()
     with anyio.fail_after(_CAP_S):
         invalid_key = f"sk-ant-api03-tradewind-safety-invalid-{secrets.token_hex(16)}"
+        for name in _OTHER_AUTH_VARS:
+            monkeypatch.delenv(name, raising=False)
         monkeypatch.setenv("ANTHROPIC_API_KEY", invalid_key)
         workspace = _workspace(tmp_path)
         tradewind = _tradewind(tmp_path)
@@ -311,25 +266,29 @@ async def test_env_scrub_keeps_subscription(
             # Test-only: the adapter builds its options without the scrub.
             no_scrub.setattr(ClaudeBackend, "auth_env_vars", _no_auth_vars)
             session = await _create(tradewind, workspace)
-            control = await _turn(session, _PONG)
-        if _auth_failure(control) is None:
+            control = await turn(session, _PONG)
+        evidence = auth_failure(control)
+        if evidence is None:
             pytest.fail(
                 "inconclusive: without the scrub, an invalid ANTHROPIC_API_KEY did not make "
-                "the turn fail on auth\n" + _redact(control.describe(), invalid_key)
+                "the turn fail on auth\n" + redact(control.describe(), [invalid_key])
             )
 
         session = await _create(tradewind, workspace)
-        protected = await _turn(session, _PONG)
+        protected = await turn(session, _PONG)
 
-        if protected.result is None or not protected.result.final_text:
+        status = protected.result.status if protected.result is not None else None
+        if status != "completed" or auth_failure(protected) is not None:
             pytest.fail(
                 "the scrubbed turn did not complete on the subscription\n"
-                + _redact(protected.describe(), invalid_key)
+                + redact(protected.describe(), [invalid_key])
             )
+        print("control auth failure (evidence): " + redact(evidence, [invalid_key])[:400])
 
 
 async def test_caller_mcp_tool_reaches_broker(tmp_path: Path) -> None:
     """A caller MCP tool call reaches the broker through `can_use_tool`."""
+    _print_engine_version()
     with anyio.fail_after(_CAP_S):
         workspace = _workspace(tmp_path)
         probe, broker = _Probe(), _RecordingBroker()
@@ -337,7 +296,7 @@ async def test_caller_mcp_tool_reaches_broker(tmp_path: Path) -> None:
             _tradewind(tmp_path), workspace, tools=[probe.tool()], broker=broker
         )
 
-        outcome = await _turn(session, _CALL_PROBE)
+        outcome = await turn(session, _CALL_PROBE)
 
         detail = f"broker calls: {broker.calls}; tool calls: {probe.calls}\n{outcome.describe()}"
         if not probe.calls and not broker.calls:
