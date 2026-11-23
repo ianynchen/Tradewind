@@ -473,8 +473,8 @@ emulates silently — an unsupported call raises `Unsupported`.
 | `supports_action_policy` | yes | yes | yes | no |
 | `supports_work_supervisor` | yes | yes | yes | no (keeps the 600 s hard cap) |
 | `supports_engine_auto` | no | no (the SDK's auto mode bypasses `can_use_tool`) | yes (Codex's auto-reviewer, workspace-write sandbox) | no |
-| `web_search` | None | None | None | None |
-| `fetch_url` | None | None | None | None |
+| `web_search` | None | gated | observed | None |
+| `fetch_url` | gated | gated | gated | None |
 
 Engine-auto strength differs by engine: on Codex the engine's own auto review decides its tools
 inside its sandbox; elsewhere `permission_mode="engine_auto"` raises `Unsupported`.
@@ -528,8 +528,13 @@ the call), `"observed"` (the call runs, then your rules can stop the turn; needs
 `.fetch_url`; no session and no network call. A setting the backend cannot serve raises
 `Unsupported`. Fetch is Tradewind's own `tradewind_fetch_url` tool (http/https, no redirects,
 text only: `text/*`, JSON and XML). A session that has a caller tool named
-`tradewind_fetch_url` while `web.fetch` is on raises `ConfigError`. In 0.15.0 every backend still reports `None` for both kinds (slice 2 turns on
-Claude and Codex search). Design: `docs/components/07-web-access.md`, ADR-0006.
+`tradewind_fetch_url` while `web.fetch` is on raises `ConfigError`. Fetch
+verifies TLS with certifi's CA bundle. Per backend (0.16.0): Claude searches with its own
+`WebSearch` (`gated`, each call checked as `web_search` with its `query`); Codex searches
+by itself and each finished web item is observed (`observed`); LangChain has fetch only;
+Cursor has neither. Codex opens pages as part of a search, and that maps to `fetch_url`, so a
+Codex session that searches needs `fetch=True` too, or the floor stops the turn at the first
+opened page. Design: `docs/components/07-web-access.md`, ADR-0006.
 
 ## Workspace safety — scan and decide
 

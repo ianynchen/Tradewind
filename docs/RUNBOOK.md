@@ -32,6 +32,7 @@ TRADEWIND_RUN_CLAUDE_INTEGRATION=1 uv run pytest tests/conformance/test_claude.p
 TRADEWIND_RUN_CODEX_INTEGRATION=1  uv run pytest tests/conformance/test_codex.py  -v -m integration
 TRADEWIND_RUN_SAFETY=1  timeout 1500 uv run pytest tests/safety -v -rP -m integration  # on demand only; includes the Codex governance tests
 TRADEWIND_RUN_LANGCHAIN_INTEGRATION=1 uv run pytest tests/conformance/test_langchain_live.py -v -m integration  # ANTHROPIC_API_KEY from the operator's environment
+TRADEWIND_RUN_WEB_INTEGRATION=1 uv run pytest tests/integration/test_web_live.py -v -m integration  # Claude + Codex web access
 uv run pytest tests/conformance/test_cursor.py -v      # always self-skips; no env gate exists
 ```
 
@@ -55,6 +56,13 @@ uv run pytest tests/conformance/test_cursor.py -v      # always self-skips; no e
   (both self-skip; part of `check.sh`'s 7 skips). The langchain adapter's own conformance
   coverage (`tests/conformance/test_langchain.py`, fake `_ScriptedChatModel`) runs and passes
   on every `check.sh` invocation — see the matrix row above.
+
+**Web access live runs (2026-11-23, claude-sonnet via the subscription; Codex via the ChatGPT login):**
+
+- Run 1: **4 passed, 1 failed**. `test_claude_fetch_tool` failed with a TLS error ("unable to
+  get local issuer certificate"): the default trust store does not work on macOS.
+- Fix: the fetch tool verifies with certifi's CA bundle; `certifi` is a declared dependency.
+- Run 2 (after the fix): **5 passed** in 39.16 s.
 
 ## Known live flakiness
 

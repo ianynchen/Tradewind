@@ -1,6 +1,6 @@
 # Component: Web access (any backend)
 
-Status: design, for the owner's approval (2026-11-22). Its first caller is Meridian's web
+Status: slice 1 shipped in 0.15.0 and slice 2 in 0.16.0 (design approved 2026-11-22). Its first caller is Meridian's web
 lookups (`meridian/docs/components/web-lookups.md`). It builds on turn governance (`05`):
 the action kinds `web_search` and `fetch_url` (§2.1), the rules (§2.2) and the broker
 contract (§1.1). It changes `05` only where a decision below says so.
