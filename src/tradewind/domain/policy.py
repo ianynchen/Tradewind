@@ -12,9 +12,12 @@ import fnmatch
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field, fields
-from typing import Any, Literal, get_args
+from typing import TYPE_CHECKING, Any, Literal, get_args
 
 from tradewind.domain.errors import ConfigError
+
+if TYPE_CHECKING:
+    from tradewind.domain.models import WebAccess
 
 ActionKind = Literal[
     "caller_tool",
@@ -226,9 +229,10 @@ class PolicyResult:
     reason: str
 
 
-def floor_tradewind() -> list[Rule]:
-    """Tradewind's own floor rules (§2.4)."""
-    return [
+def floor_tradewind(web: WebAccess | None = None) -> list[Rule]:
+    """Tradewind's own floor rules (§2.4). With a web setting, each web kind
+    it leaves off is denied (07 §3)."""
+    rules = [
         Rule(
             id="floor.missing_critical_field",
             kind="any",
@@ -238,6 +242,24 @@ def floor_tradewind() -> list[Rule]:
             reason="action is missing a critical field",
         )
     ]
+    if web is not None:
+        kinds: list[tuple[ActionKind, bool, str]] = [
+            ("web_search", web.search, "web search"),
+            ("fetch_url", web.fetch, "web fetch"),
+        ]
+        for kind, on, label in kinds:
+            if not on:
+                rules.append(
+                    Rule(
+                        id=f"floor.{kind}_off",
+                        kind=kind,
+                        where={},
+                        outcome="deny",
+                        record=True,
+                        reason=f"{label} is not turned on for this session",
+                    )
+                )
+    return rules
 
 
 def evaluate(

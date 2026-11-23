@@ -20,7 +20,9 @@ from tradewind.domain.models import (
     McpServerDef,
     SessionOptions,
     Tool,
+    WebAccess,
     engine_compaction_record,
+    web_from_snapshot,
 )
 
 
@@ -237,3 +239,31 @@ def test_engine_compaction_record_carries_claude_trigger_only() -> None:
     record = engine_compaction_record(trigger="manual")
 
     assert record.content == {"trigger": "manual"}
+
+
+# --- web access setting (07-web-access §2) ---
+
+
+def test_web_access_defaults_and_snapshot() -> None:
+    assert SessionOptions().web is None
+    assert SessionOptions().snapshot()["web"] is None
+    snap = SessionOptions(web=WebAccess(search=True, fetch=False)).snapshot()
+    assert snap["web"] == {"search": True, "fetch": False, "observed": False}
+    assert web_from_snapshot(snap) == WebAccess(search=True, fetch=False)
+
+
+def test_an_old_snapshot_has_no_web() -> None:
+    assert web_from_snapshot({"tools": []}) is None
+
+
+def test_capabilities_web_modes_default_to_none() -> None:
+    required = dict.fromkeys(_capabilities_kwargs(), False)
+    caps = Capabilities(**required)
+    assert caps.web_search is None and caps.fetch_url is None
+
+
+def test_web_access_observed_round_trips() -> None:
+    web = WebAccess(search=True, fetch=True, observed=True)
+    snap = SessionOptions(web=web).snapshot()
+    assert snap["web"] == {"search": True, "fetch": True, "observed": True}
+    assert web_from_snapshot(snap) == web

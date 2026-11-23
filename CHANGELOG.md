@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-22
+
+### Added
+
+- Web access, slice 1 (ADR-0006, `docs/components/07-web-access.md`):
+  - `SessionOptions.web = WebAccess(search=..., fetch=..., observed=False)`, with `WebAccess` and `WebMode` exported from `tradewind`. It is part of the session snapshot. `None` (the default) changes nothing on any backend.
+  - `Capabilities.web_search` and `Capabilities.fetch_url` (`"gated"`, `"observed"` or `None`). A web setting that the backend cannot serve, or an observed kind without `observed=True`, raises `Unsupported`; any web setting on a backend without action policy (Cursor) raises `Unsupported`.
+  - A floor rule for each kind, built from the setting: `web_search` is denied unless `web.search` is on, `fetch_url` unless `web.fetch` is on. No caller rule can loosen it.
+  - `tradewind_fetch_url`, Tradewind's own fetch tool (standard library only; `http` and `https`; no redirects; time and size limits; text, JSON and XML only), served when `web.fetch` is on. A caller tool with the same name raises `ConfigError`. One shared mapper classifies it as the `fetch_url` action kind.
+  - Codex `web_search` records also hold the `action` and the `queries`.
+  - `Tradewind.capabilities(profile=None)`: the capabilities of a profile's backend, with no session and no network call. An unknown profile raises `ConfigError`.
+- Every backend's `web_search` and `fetch_url` are still `None`: slice 2 turns on Claude's gated search and Codex's observed search. So a session with a web setting raises `Unsupported` today.
+
 ## [0.14.0] - 2026-11-16
 
 ### Added

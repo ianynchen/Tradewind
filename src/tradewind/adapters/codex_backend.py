@@ -233,7 +233,7 @@ from openai_codex.models import JsonObject, Notification
 
 from tradewind.application.config import NativeStoreConfig
 from tradewind.application.engine_env import engine_env
-from tradewind.application.policy_gate import GateDecision, PolicyGate, caller_tool_source
+from tradewind.application.policy_gate import GateDecision, PolicyGate, caller_tool_action
 from tradewind.application.ports import Backend, TurnContext
 from tradewind.application.supervisor import WorkSupervisor
 from tradewind.application.workspace_scan import CustomizationPattern
@@ -495,11 +495,18 @@ def thread_item_to_messages(item: ThreadItem) -> list[NormalizedMessage]:
             )
         ]
     if isinstance(root, WebSearchThreadItem):
+        # Record the action and queries so every URL Codex opened is in the record (07 §6).
+        action = root.action.root if root.action is not None else None
         return [
             NormalizedMessage(
                 role="assistant",
                 kind="web_search",
-                content={"query": root.query, "results": root.results},
+                content={
+                    "query": root.query,
+                    "results": root.results,
+                    "action": action.model_dump(mode="json", by_alias=True) if action else None,
+                    "queries": getattr(action, "queries", None),
+                },
                 native_id=native_id,
             )
         ]
@@ -964,14 +971,7 @@ def _decide_mcp_elicitation(
         _gate_sync(
             policy,
             loop,
-            Action(
-                kind="caller_tool",
-                fields={"name": name, "args": tool_input, "source": caller_tool_source(name)},
-                backend="codex",
-                native_name=name,
-                native_args=tool_input,
-                summary=name,
-            ),
+            caller_tool_action(name, tool_input, backend="codex"),
             name,
             tool_input,
             pass_through=True,

@@ -12,6 +12,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Literal
 
+from tradewind.application.web_fetch import FETCH_TOOL_NAME
 from tradewind.domain.events import Event, ItemCompleted
 from tradewind.domain.models import (
     BrokerDecision,
@@ -57,6 +58,30 @@ def caller_tool_source(name: str) -> str:
     return f"mcp:{match.group('server')}" if match else "local"
 
 
+def caller_tool_action(name: str, args: dict[str, object], *, backend: str) -> Action:
+    """The `Action` for a caller tool call: `fetch_url` for the fetch tool
+    (07 decision 6), else `caller_tool`."""
+    if name == FETCH_TOOL_NAME:
+        url = args.get("url")
+        return Action(
+            kind="fetch_url",
+            fields={"url": url},
+            backend=backend,
+            native_name=name,
+            native_args=args,
+            summary=name,
+            missing_critical_field=not isinstance(url, str),
+        )
+    return Action(
+        kind="caller_tool",
+        fields={"name": name, "args": args, "source": caller_tool_source(name)},
+        backend=backend,
+        native_name=name,
+        native_args=args,
+        summary=name,
+    )
+
+
 def broker_args_with_action(args: dict[str, object], action: Action) -> dict[str, object]:
     """Copy of `args` with the action (05 §1.1: `kind`, `fields`, `backend`,
     `native_name`, `summary`) added under `tradewind`, or under
@@ -82,17 +107,7 @@ class _GateBroker:
         self._backend = backend
 
     async def decide(self, tool_name: str, tool_input: dict[str, object]) -> BrokerDecision:
-        action = Action(
-            kind="caller_tool",
-            fields={
-                "name": tool_name,
-                "args": tool_input,
-                "source": caller_tool_source(tool_name),
-            },
-            backend=self._backend,
-            native_name=tool_name,
-            native_args=tool_input,
-        )
+        action = caller_tool_action(tool_name, tool_input, backend=self._backend)
         d = await self._gate.gate(action, broker_name=tool_name, broker_args=tool_input)
         if d.outcome == "allow":
             return "allow"

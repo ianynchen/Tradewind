@@ -108,6 +108,10 @@ class SessionOptions(BaseModel):          # declarative parts snapshot into opti
 # Denial(reason=..., terminate=...) — reason shown to the model where
 # supports_deny_reason, terminate ends the turn (end_reason="broker_terminated").
 
+# Capabilities of a profile's backend (no session, no network; unknown profile: ConfigError):
+caps = tw.capabilities()              # default profile; tw.capabilities("name") for another
+                                      #   caps.web_search / caps.fetch_url: "gated" | "observed" | None
+
 # Running a turn — one call, streamed or collected:
 async for event in s.stream(prompt): ...            # normalized events (FR-7)
 result = await s.run(prompt)                        # TurnResult: text, usage, cost, status, end_reason (FR-6.5)

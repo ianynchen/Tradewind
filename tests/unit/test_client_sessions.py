@@ -9,6 +9,7 @@ lineage bookkeeping that conformance doesn't need to re-prove).
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import ClassVar
@@ -446,3 +447,43 @@ async def test_history_defaults_include_children_and_include_raw_to_false() -> N
     assert spy.history_calls == [
         {"session_id": _VALID_ID_A, "include_children": False, "include_raw": False}
     ]
+
+
+def _two_profile_tw(tmp_path: Path) -> Tradewind:
+    other = _profile().model_copy(update={"backend": "langchain"})
+    config = TradewindConfig(
+        profiles={"default": _profile(), "other": other},
+        default_profile="default",
+        store=tmp_path / "caps.db",
+    )
+    tw = Tradewind(config)
+    _seed_backend(tw, [])
+    return tw
+
+
+async def test_capabilities_default_profile_is_its_backends_and_makes_no_session(
+    tmp_path: Path,
+) -> None:
+    tw = _two_profile_tw(tmp_path)
+    assert tw.capabilities() == tw._backends["default"].capabilities()
+    assert tw.capabilities().web_search is None
+    with sqlite3.connect(tmp_path / "caps.db") as db:
+        assert db.execute("SELECT COUNT(*) FROM sessions").fetchone() == (0,)
+
+
+async def test_capabilities_named_profile_uses_that_backend(tmp_path: Path) -> None:
+    tw = _two_profile_tw(tmp_path)
+
+    class _Gated(_FakeBackend):
+        def capabilities(self) -> Capabilities:
+            return super().capabilities().model_copy(update={"web_search": "gated"})
+
+    tw._backends["other"] = _Gated(_profile(), NativeStoreConfig(), [])
+    assert tw.capabilities("other").web_search == "gated"
+    assert tw.capabilities().web_search is None
+
+
+async def test_capabilities_unknown_profile_raises_config_error(tmp_path: Path) -> None:
+    tw = _two_profile_tw(tmp_path)
+    with pytest.raises(ConfigError, match="unknown profile 'nope'"):
+        tw.capabilities("nope")

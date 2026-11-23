@@ -71,7 +71,7 @@ from langchain_core.messages.tool import ToolCall
 from langchain_core.messages.tool import tool_call as make_tool_call
 
 from tradewind.application.config import NativeStoreConfig
-from tradewind.application.policy_gate import PolicyGate, caller_tool_source
+from tradewind.application.policy_gate import PolicyGate, caller_tool_action
 from tradewind.application.ports import Backend, TurnContext
 from tradewind.domain.compaction import (
     build_summary_request,
@@ -108,7 +108,7 @@ from tradewind.domain.models import (
     resume_degraded_notice,
     retry_notice,
 )
-from tradewind.domain.policy import Action, TurnVars, floor_tradewind
+from tradewind.domain.policy import TurnVars, floor_tradewind
 
 _MAX_ITERATIONS = 25
 
@@ -123,17 +123,6 @@ _STRUCTURED_OUTPUT_INSTRUCTION = (
 )
 
 ChatModelFactory = Callable[[ModelSpec], BaseChatModel]
-
-
-def _caller_tool_action(name: str, args: dict[str, object]) -> Action:
-    return Action(
-        kind="caller_tool",
-        fields={"name": name, "args": args, "source": caller_tool_source(name)},
-        backend="langchain",
-        native_name=name,
-        native_args=args,
-        summary=name,
-    )
 
 
 def _direct_policy(ctx: TurnContext, pending_events: list[Event]) -> PolicyGate:
@@ -792,7 +781,7 @@ class LangchainBackend(Backend):
                 for call in tool_calls:
                     call_args = cast("dict[str, object]", call["args"])
                     decision = await policy.gate(
-                        _caller_tool_action(call["name"], call_args),
+                        caller_tool_action(call["name"], call_args, backend="langchain"),
                         broker_name=call["name"],
                         broker_args=call_args,
                     )
