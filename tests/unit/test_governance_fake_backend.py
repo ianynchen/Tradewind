@@ -662,7 +662,7 @@ async def test_a_stop_after_the_turn_ends_never_kills_reported_processes(
     ("kwargs", "web", "match"),
     [
         ({}, WebAccess(search=True, fetch=False), "web search is not offered on backend 'codex'"),
-        ({"fetch_url": None}, WebAccess(search=False, fetch=True), "web fetch is not offered"),
+        ({"web_search": "gated"}, WebAccess(search=False, fetch=True), "web fetch is not offered"),
         (
             {"web_search": "observed"},
             WebAccess(search=True, fetch=False),
@@ -676,7 +676,14 @@ async def test_a_stop_after_the_turn_ends_never_kills_reported_processes(
         (
             {"web_search": "gated", "action_policy": False},
             WebAccess(search=True, fetch=False),
-            "web search is not offered on backend 'codex'",
+            "web access is not offered on backend 'codex': it cannot put tool calls "
+            "through the policy gate",
+        ),
+        (
+            {"action_policy": False},
+            WebAccess(search=False, fetch=False),
+            "web access is not offered on backend 'codex': it cannot put tool calls "
+            "through the policy gate",
         ),
     ],
 )

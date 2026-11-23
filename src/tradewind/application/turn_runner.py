@@ -573,13 +573,18 @@ def _check_web_support(backend: Backend, web: WebAccess | None) -> None:
     if web is None:
         return
     caps = backend.capabilities()
+    if not caps.supports_action_policy:
+        raise Unsupported(
+            f"web access is not offered on backend {backend.name!r}: "
+            "it cannot put tool calls through the policy gate"
+        )
     for on, mode, label in (
         (web.search, caps.web_search, "web search"),
         (web.fetch, caps.fetch_url, "web fetch"),
     ):
         if not on:
             continue
-        if mode is None or not caps.supports_action_policy:
+        if mode is None:
             raise Unsupported(f"{label} is not offered on backend {backend.name!r}")
         if mode == "observed" and not web.observed:
             raise Unsupported(
