@@ -90,7 +90,8 @@ disallow_any_expr = false
 [[tool.mypy.overrides]]
 # `urllib.request` responses and headers (`http.client.HTTPMessage`) are
 # typed with `Any` in typeshed, so the fetch tool cannot read a header or
-# body under disallow_any_expr. Same resolution as the overrides above:
+# body, and the `Tool` input_schema dict literal is `dict[str, Any]`, under
+# disallow_any_expr. Same resolution as the overrides above:
 # narrowed to this module only; its own signatures stay Any-free.
 module = "tradewind.application.web_fetch"
 disallow_any_expr = false

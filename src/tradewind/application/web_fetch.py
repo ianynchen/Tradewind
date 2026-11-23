@@ -5,7 +5,9 @@ section 5). Standard library only; the blocking call runs in a worker thread.
 
 from __future__ import annotations
 
+import codecs
 import re
+import time
 import urllib.error
 import urllib.request
 from html.parser import HTMLParser
@@ -26,6 +28,30 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None  # the 3xx then surfaces as an HTTPError
 
 
+_BLOCK_TAGS = frozenset(
+    [
+        "p",
+        "div",
+        "li",
+        "br",
+        "h1",
+        "h2",
+        "h3",
+        "h4",
+        "h5",
+        "h6",
+        "tr",
+        "table",
+        "section",
+        "article",
+        "header",
+        "footer",
+        "pre",
+        "blockquote",
+    ]
+)
+
+
 class _TextExtractor(HTMLParser):
     def __init__(self) -> None:
         super().__init__()
@@ -35,10 +61,14 @@ class _TextExtractor(HTMLParser):
     def handle_starttag(self, tag: str, _attrs: object) -> None:
         if tag in ("script", "style"):
             self._skip += 1
+        if tag == "br":
+            self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
         if tag in ("script", "style") and self._skip:
             self._skip -= 1
+        if tag in _BLOCK_TAGS:
+            self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
         if not self._skip:
@@ -52,23 +82,49 @@ def _html_to_text(html: str) -> str:
     return re.sub(r"\n\s*\n+", "\n\n", "".join(parser.parts)).strip()
 
 
+def _decode(raw: bytes, charset: str) -> str:
+    try:
+        codecs.lookup(charset)
+    except LookupError:
+        charset = "utf-8"
+    return raw.decode(charset, errors="replace")
+
+
 def _fetch_blocking(url: str) -> str:
     if not url.lower().startswith(("http://", "https://")):
         return _REFUSED
     opener = urllib.request.build_opener(_NoRedirect)
+    deadline = time.monotonic() + FETCH_TIMEOUT_S
     try:
         with opener.open(url, timeout=FETCH_TIMEOUT_S) as resp:
             ctype = resp.headers.get_content_type()
             charset = resp.headers.get_content_charset() or "utf-8"
-            raw = resp.read(FETCH_MAX_BYTES + 1)
+            chunks: list[bytes] = []
+            size = 0
+            timed_out = False
+            # The socket timeout is per operation; this loop makes it a total limit.
+            while size <= FETCH_MAX_BYTES:
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    break
+                chunk = resp.read1(min(8192, FETCH_MAX_BYTES + 1 - size))
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            raw = b"".join(chunks)
     except urllib.error.HTTPError as err:
-        if 300 <= err.code < 400:
-            return f"Redirect {err.code} to {err.headers.get('Location', '')}; not followed."
+        try:
+            location = err.headers.get("Location")
+            if 300 <= err.code < 400 and location:
+                return f"Redirect {err.code} to {location}; not followed."
+        finally:
+            err.close()
         raise
     if not ctype.startswith("text/"):
         return f"Not a text page ({ctype})."
-    cut = len(raw) > FETCH_MAX_BYTES
-    text = raw[:FETCH_MAX_BYTES].decode(charset, errors="replace")
+    cut = timed_out or len(raw) > FETCH_MAX_BYTES
+    text = _decode(raw[:FETCH_MAX_BYTES], charset)
     if ctype == "text/html":
         text = _html_to_text(text)
     return f"{text}\n[truncated]" if cut else text
