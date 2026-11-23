@@ -1383,6 +1383,68 @@ async def test_observed_web_item_stops_at_the_first_stopped_action() -> None:
     assert "no web" in failed.error
 
 
+def _web_completed(action: dict[str, Any]) -> Any:
+    from openai_codex.generated.v2_all import ThreadItem
+
+    return _completed(
+        ThreadItem.model_validate(
+            {"id": "ws-2", "type": "webSearch", "query": "q", "action": action}
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "named"),
+    [
+        ({"type": "openPage"}, "fetch_url 'openPage'"),
+        ({"type": "other"}, "web_search 'other'"),
+    ],
+)
+async def test_observed_web_item_missing_its_field_is_stopped_by_the_floor(
+    action: dict[str, Any], named: str
+) -> None:
+    from tradewind.domain.events import TurnFailed
+
+    events, interrupts = await _consume_all(
+        _queue_of(_web_completed(action), _turn_done("completed")),
+        policy=_gate(_RaisingBroker()),
+        ledger=ApprovalLedger(wait_s=0.0),
+    )
+
+    assert interrupts == [True]
+    (failed,) = [e for e in events if isinstance(e, TurnFailed)]
+    assert named in failed.error
+
+
+async def test_observed_web_item_never_evaluates_queries_after_the_stop() -> None:
+    from tradewind.domain.events import TurnFailed
+
+    policy = _gate(
+        _RaisingBroker(),
+        caller=[_rule("web_search", "allow", query="a"), _rule("web_search", "deny")],
+    )
+    seen: list[str] = []
+    observe = policy.observe
+
+    def recording(action: Any) -> Any:
+        seen.append(action.summary)
+        return observe(action)
+
+    policy.observe = recording
+
+    events, _ = await _consume_all(
+        _queue_of(
+            _web_completed({"type": "search", "queries": ["a", "b", "c"]}),
+            _turn_done("completed"),
+        ),
+        policy=policy,
+        ledger=ApprovalLedger(wait_s=0.0),
+    )
+
+    assert seen == ["a", "b"]
+    assert any(isinstance(e, TurnFailed) for e in events)
+
+
 def test_report_work_maps_items_deltas_and_turn_end() -> None:
     """05 §7 Codex row: items open and close work; output, progress,
     auto-review and terminal input are activity; message and reasoning

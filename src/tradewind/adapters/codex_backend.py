@@ -265,7 +265,7 @@ from tradewind.domain.models import (
     resume_degraded_notice,
     retry_notice,
 )
-from tradewind.domain.policy import Action, TurnVars, floor_tradewind
+from tradewind.domain.policy import Action, ActionKind, TurnVars, floor_tradewind
 
 _logger = logging.getLogger(__name__)
 
@@ -778,15 +778,17 @@ def _web_actions(item: WebSearchThreadItem) -> list[Action]:
     or a missing query or url sets `missing_critical_field` (decision 13)."""
     root = item.action.root if item.action is not None else None
     native_args = root.model_dump(mode="json", by_alias=True) if root is not None else {}
+    # What the stop message names when the query or url is missing.
+    unmapped = root.type if root is not None else "webSearch"
 
-    def one(kind: str, field: str, value: str | None) -> Action:
+    def one(kind: ActionKind, field: str, value: str | None) -> Action:
         return Action(
-            kind=kind,  # type: ignore[arg-type]
+            kind=kind,
             fields={field: value},
             backend="codex",
             native_name="webSearch",
             native_args=native_args,
-            summary=value or "",
+            summary=value or unmapped,
             missing_critical_field=value is None,
         )
 
@@ -1734,8 +1736,8 @@ class CodexBackend(Backend):
         ledger: ApprovalLedger | None,
         workspace: str | None,
     ) -> str | None:
-        """Observe a completed command or file change that had no approval
-        request (05 §2.1, §7): `item/started` comes before a possible
+        """Observe a completed command, file change or web item that had no
+        approval request (05 §2.1, §7, 07 §4): `item/started` comes before a possible
         request, so only the completion is observed, and a requested item is
         decided at the gate only. Returns the stop reason, or `None`."""
         if policy is None or ledger is None:

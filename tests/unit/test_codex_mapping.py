@@ -803,6 +803,7 @@ def test_observed_actions_web_item_missing_critical_field(
     assert only.kind == kind
     assert only.missing_critical_field is True
     assert only.native_name == "webSearch"
+    assert only.summary == (action["type"] if action else "webSearch")
 
 
 @pytest.mark.parametrize(
