@@ -54,6 +54,7 @@ from tradewind.domain.errors import (
 from tradewind.domain.events import Event, TurnCompleted, TurnFailed
 from tradewind.domain.models import (
     BackendName,
+    Capabilities,
     CustomizationDecision,
     Profile,
     SessionOptions,
@@ -288,6 +289,13 @@ class Tradewind:
         backend = factory(profile, self._config.native_stores)
         self._backends[profile_name] = backend
         return backend
+
+    def capabilities(self, profile: str | None = None) -> Capabilities:
+        """The capabilities of a profile's backend (default profile when
+        `None`). Builds the backend like a session would; creates no session
+        and makes no network call. Unknown profile: `ConfigError`."""
+        name, prof = _resolve_profile(self._config, profile)
+        return self._resolve_backend(name, prof).capabilities()
 
     async def aclose(self) -> None:
         """No resources to release yet; kept for `__aexit__` symmetry and

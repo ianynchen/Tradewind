@@ -516,6 +516,18 @@ none of this, and `policy_rules` or `permission_mode` raise `Unsupported` there.
 observe sees only completed commands that had no approval request, so write narrow `shell` /
 `file_write` rules.
 
+## Web access
+
+`SessionOptions.web = WebAccess(search=True, fetch=True, observed=False)` (both exported from
+`tradewind`, with `WebMode`) turns on web search and page fetch for one session; `None` (the
+default) changes nothing. Each backend offers each kind as `"gated"` (your rules decide before
+the call), `"observed"` (the call runs, then your rules can stop the turn; needs
+`observed=True`) or `None`. Read it with `tw.capabilities(profile=None).web_search` and
+`.fetch_url`; no session and no network call. A setting the backend cannot serve raises
+`Unsupported`. Fetch is Tradewind's own `tradewind_fetch_url` tool (http/https, no redirects,
+text only). In 0.15.0 every backend still reports `None` for both kinds (slice 2 turns on
+Claude and Codex search). Design: `docs/components/07-web-access.md`, ADR-0006.
+
 ## Workspace safety — scan and decide
 
 Design: `docs/components/06-workspace-safety.md`, decision: `docs/adr/0005-workspace-safety.md`.

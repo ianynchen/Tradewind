@@ -446,3 +446,33 @@ async def test_history_defaults_include_children_and_include_raw_to_false() -> N
     assert spy.history_calls == [
         {"session_id": _VALID_ID_A, "include_children": False, "include_raw": False}
     ]
+
+
+def _two_profile_tw(tmp_path: Path) -> Tradewind:
+    other = _profile().model_copy(update={"backend": "langchain"})
+    config = TradewindConfig(
+        profiles={"default": _profile(), "other": other},
+        default_profile="default",
+        store=tmp_path / "caps.db",
+    )
+    tw = Tradewind(config)
+    _seed_backend(tw, [])
+    return tw
+
+
+async def test_capabilities_default_profile_is_its_backends(tmp_path: Path) -> None:
+    tw = _two_profile_tw(tmp_path)
+    assert tw.capabilities() == tw._backends["default"].capabilities()
+
+
+async def test_capabilities_named_profile_uses_that_backend(tmp_path: Path) -> None:
+    tw = _two_profile_tw(tmp_path)
+    marker = _FakeBackend(_profile(), NativeStoreConfig(), [])
+    tw._backends["other"] = marker
+    assert tw.capabilities("other") == marker.capabilities()
+
+
+async def test_capabilities_unknown_profile_raises_config_error(tmp_path: Path) -> None:
+    tw = _two_profile_tw(tmp_path)
+    with pytest.raises(ConfigError, match="unknown profile 'nope'"):
+        tw.capabilities("nope")
