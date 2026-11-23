@@ -1,6 +1,6 @@
 # Component: Web access (any backend)
 
-Status: design, for the owner's approval (2026-11-22). Its first caller is Meridian's web
+Status: slice 1 shipped in 0.15.0 and slice 2 in 0.16.0 (design approved 2026-11-22). Its first caller is Meridian's web
 lookups (`meridian/docs/components/web-lookups.md`). It builds on turn governance (`05`):
 the action kinds `web_search` and `fetch_url` (§2.1), the rules (§2.2) and the broker
 contract (§1.1). It changes `05` only where a decision below says so.
@@ -105,10 +105,10 @@ Each adapter maps its own web tools to the shared kinds, with the critical field
 
 - Claude: `WebSearch` → `web_search` (`query`), on the gate path.
 - Codex: a `webSearch` item → on the observe path, by its action: `search` →
-  `web_search` (`query`; a `queries` list gives one action for each query, in list
-  order, and the first stop ends the turn), `openPage` and `findInPage` → `fetch_url`
+  `web_search` (`query`; one action for each distinct query, `query` first and then
+  the `queries` list in order, and the first stop ends the turn), `openPage` and `findInPage` → `fetch_url`
   (`url`). No action, an unknown action, or a page action with no `url` sets
-  `missing_critical_field` (owner decision 13). Today `observed_action` maps only
+  `missing_critical_field` (owner decision 13). Today `observed_actions` maps only
   commands and file changes; it gains these.
 
 Claude's own `WebFetch` is not used: the spike showed that it returns a second model's
@@ -129,7 +129,7 @@ summary of the page, not the page, so the agent cannot quote it.
 One tool, `tradewind_fetch_url`, served like a caller tool, and classified as the
 `fetch_url` kind by the shared mapper (owner decision 6):
 
-- the Python standard library only (`urllib`, `html.parser`);
+- the Python standard library (`urllib`, `html.parser`) plus certifi's CA bundle for TLS;
 - `http` and `https` only, and **no redirects**: a redirect ends the fetch, and the
   result says where it points, so the caller can approve that URL in its turn (owner
   decision 9);
@@ -148,7 +148,7 @@ records `web_search` with its query and results today; its mapping
 - `SessionOptions.web` and `WebAccess`.
 - `Capabilities.web_search` and `Capabilities.fetch_url` (`WebMode | None`), and
   `WebAccess.observed`.
-- Codex's `observed_action` maps `webSearch` items to `web_search` and `fetch_url`.
+- Codex's `observed_actions` maps `webSearch` items to `web_search` and `fetch_url`.
 - The floor rule for `web_search` and `fetch_url`.
 - The tool name `tradewind_fetch_url`, and the shared mapper that classifies it.
 - `floor_tradewind()` takes the session's web setting.

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import codecs
 import re
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -14,6 +15,7 @@ import urllib.request
 from html.parser import HTMLParser
 
 import anyio
+import certifi
 
 from tradewind.domain.models import Tool
 
@@ -102,7 +104,9 @@ def _is_text(ctype: str) -> bool:
 def _fetch_blocking(url: str) -> str:
     if not url.lower().startswith(("http://", "https://")):
         return _REFUSED
-    opener = urllib.request.build_opener(_NoRedirect)
+    # The default trust store fails on macOS; certifi is the bundle httpx and the SDKs use.
+    tls = ssl.create_default_context(cafile=certifi.where())
+    opener = urllib.request.build_opener(_NoRedirect, urllib.request.HTTPSHandler(context=tls))
     deadline = time.monotonic() + FETCH_TIMEOUT_S
     try:
         with opener.open(url, timeout=FETCH_TIMEOUT_S) as resp:

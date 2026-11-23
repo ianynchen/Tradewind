@@ -781,6 +781,21 @@ async def test_fetch_on_serves_the_fetch_tool_and_gates_it_by_kind(tmp_path: Pat
     assert broker.calls == ["fetch_url"]
 
 
+async def test_the_backend_receives_the_web_setting(tmp_path: Path) -> None:
+    tw, fake = _tradewind(tmp_path, [Say("ok")], web_search="gated", fetch_url="gated")
+    web = WebAccess(search=True, fetch=True)
+    session = await tw.create(_ID, SessionOptions(web=web))
+    await session.run("go")
+    assert fake.contexts[-1].web == web
+
+
+async def test_the_backend_receives_no_web_setting_when_unset(tmp_path: Path) -> None:
+    tw, fake = _tradewind(tmp_path, [Say("ok")])
+    session = await tw.create(_ID, SessionOptions())
+    await session.run("go")
+    assert fake.contexts[-1].web is None
+
+
 async def test_fetch_off_serves_only_the_callers_tools(tmp_path: Path) -> None:
     tw, fake = _tradewind(tmp_path, [Say("ok")], web_search="gated")
     session = await tw.create(_ID, SessionOptions(web=WebAccess(search=True, fetch=False)))

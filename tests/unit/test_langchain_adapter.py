@@ -522,6 +522,12 @@ async def test_uncapped_turn_still_hits_the_max_iterations_backstop() -> None:
     assert any(isinstance(e, TurnFailed) for e in events)
 
 
+def test_capabilities_declare_gated_fetch_and_no_search() -> None:
+    caps = _backend(_ScriptedChatModel(responses=[AIMessage(content="x")])).capabilities()
+    assert caps.fetch_url == "gated"
+    assert caps.web_search is None
+
+
 def test_capabilities_declare_tool_round_cap_support() -> None:
     caps = _backend(_ScriptedChatModel(responses=[AIMessage(content="x")])).capabilities()
     assert caps.supports_tool_round_cap is True

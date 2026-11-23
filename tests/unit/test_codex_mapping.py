@@ -702,9 +702,9 @@ def test_file_write_action_with_unknown_changes_is_missing_its_critical_field() 
     assert action.missing_critical_field is True
 
 
-def test_observed_action_covers_only_commands_and_file_changes() -> None:
-    """05 §7: observe sees completed command and file-change items only."""
-    from tradewind.adapters.codex_backend import observed_action
+def test_observed_actions_cover_commands_file_changes_and_web() -> None:
+    """05 §7, 07 §4: observe sees completed command, file-change and web items."""
+    from tradewind.adapters.codex_backend import observed_actions
 
     command = _item(
         CommandExecutionThreadItem(
@@ -730,15 +730,88 @@ def test_observed_action_covers_only_commands_and_file_changes() -> None:
     )
     text = _item(AgentMessageThreadItem(id="m-1", type="agentMessage", text="hi"))
 
-    shell = observed_action(command, workspace="/w")
-    write = observed_action(patch, workspace="/w")
+    (shell,) = observed_actions(command, workspace="/w")
+    (write,) = observed_actions(patch, workspace="/w")
 
-    assert shell is not None
     assert shell.kind == "shell"
     assert shell.fields["command"] == "ls"
-    assert write is not None
     assert write.kind == "file_write"
-    assert observed_action(text, workspace="/w") is None
+    assert observed_actions(text, workspace="/w") == []
+
+
+def _web_item(action: dict[str, Any] | None) -> Any:
+    return _item(
+        WebSearchThreadItem.model_validate(
+            {"id": "ws-9", "type": "webSearch", "query": "q", "action": action}
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "expected"),
+    [
+        ({"type": "search", "query": "a"}, [("web_search", "query", "a")]),
+        (
+            {"type": "search", "queries": ["a", "b"]},
+            [("web_search", "query", "a"), ("web_search", "query", "b")],
+        ),
+        (
+            {"type": "search", "query": "a", "queries": ["x", "y"]},
+            [
+                ("web_search", "query", "a"),
+                ("web_search", "query", "x"),
+                ("web_search", "query", "y"),
+            ],
+        ),
+        (
+            {"type": "search", "query": "a", "queries": ["a", "b"]},
+            [("web_search", "query", "a"), ("web_search", "query", "b")],
+        ),
+        ({"type": "openPage", "url": "https://e.com"}, [("fetch_url", "url", "https://e.com")]),
+        (
+            {"type": "findInPage", "url": "https://e.com", "pattern": "p"},
+            [("fetch_url", "url", "https://e.com")],
+        ),
+    ],
+)
+def test_observed_actions_map_web_items(
+    action: dict[str, Any], expected: list[tuple[str, str, str]]
+) -> None:
+    from tradewind.adapters.codex_backend import observed_actions
+
+    actions = observed_actions(_web_item(action), workspace=None)
+
+    assert [(a.kind, k, a.fields[k]) for a in actions for k in a.fields] == expected
+    for a in actions:
+        assert a.backend == "codex"
+        assert a.native_name == "webSearch"
+        assert a.native_args.items() >= action.items()
+        assert a.summary == next(iter(a.fields.values()))
+        assert a.missing_critical_field is False
+
+
+@pytest.mark.parametrize(
+    ("action", "kind"),
+    [
+        (None, "web_search"),
+        ({"type": "search"}, "web_search"),
+        ({"type": "search", "queries": []}, "web_search"),
+        ({"type": "openPage"}, "fetch_url"),
+        ({"type": "findInPage", "pattern": "p"}, "fetch_url"),
+        ({"type": "other"}, "web_search"),
+    ],
+)
+def test_observed_actions_web_item_missing_critical_field(
+    action: dict[str, Any] | None, kind: str
+) -> None:
+    from tradewind.adapters.codex_backend import observed_actions
+
+    (only,) = observed_actions(_web_item(action), workspace=None)
+
+    assert only.kind == kind
+    assert only.missing_critical_field is True
+    assert only.native_name == "webSearch"
+    assert only.summary == (action["type"] if action else "webSearch")
 
 
 @pytest.mark.parametrize(

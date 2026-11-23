@@ -37,7 +37,8 @@ serve every call, through two SDK-provided seams:
     `PermissionRequested` fires on "deny" exactly like `LangchainBackend`'s
     tool loop does (FR-4.1).
   - `ClaudeAgentOptions.tools=[]` disables the CLI's own built-in dev tools
-    (Bash, Read, Edit, ...) entirely: Tradewind's whole premise (module
+    (Bash, Read, Edit, ...) entirely (only `WebSearch` is switched on, and
+    gated, when the session turns search on): Tradewind's whole premise (module
     docstring, `tradewind/__init__.py`) is a caller-declared, broker-gated
     tool set, and leaving Claude Code's full built-in toolbox reachable by
     default -- auto-allowed for any caller that doesn't wire a broker, per
@@ -162,7 +163,7 @@ from tradewind.domain.models import (
     resume_degraded_notice,
     retry_notice,
 )
-from tradewind.domain.policy import TurnVars, floor_tradewind
+from tradewind.domain.policy import Action, TurnVars, floor_tradewind
 
 _logger = logging.getLogger(__name__)
 
@@ -197,9 +198,28 @@ _ABORTED_TERMINAL_REASONS = frozenset({"aborted_streaming", "aborted_tools"})
 _MCP_SERVER_NAME = "tradewind"
 
 # The CLI's own structured-output tool (added by `--json-schema`). Built-in
-# tools are disabled (`tools=[]`) and every caller tool arrives prefixed
+# tools are disabled (`tools=[]`, except `WebSearch` when the session turns
+# search on) and every caller tool arrives prefixed
 # `mcp__tradewind__`, so this bare name can only ever be that tool.
 _STRUCTURED_OUTPUT_TOOL = "StructuredOutput"
+
+# The CLI's own search tool, the only built-in left on, and only when the
+# session turns search on (07 §4). It arrives bare (no `mcp__` prefix).
+_WEB_SEARCH_TOOL = "WebSearch"
+
+
+def claude_web_search_action(tool_input: dict[str, object]) -> Action:
+    """The `web_search` `Action` for a `WebSearch` call (07 §4)."""
+    query = tool_input.get("query")
+    return Action(
+        kind="web_search",
+        fields={"query": query},
+        backend="claude",
+        native_name=_WEB_SEARCH_TOOL,
+        native_args=tool_input,
+        summary=query if isinstance(query, str) else "",
+        missing_critical_field=not isinstance(query, str),
+    )
 
 
 def _without_structured_output(
@@ -771,8 +791,14 @@ def _make_can_use_tool(
                 message=f"max_tool_rounds ({round_cap.cap}) reached", interrupt=True
             )
         bare_name = _strip_server_prefix(tool_name)
+        # Counts toward the round cap like any tool call (checked above).
+        action = (
+            claude_web_search_action(input_dict)
+            if tool_name == _WEB_SEARCH_TOOL
+            else caller_tool_action(bare_name, input_dict, backend="claude")
+        )
         decision = await policy.gate(
-            caller_tool_action(bare_name, input_dict, backend="claude"),
+            action,
             broker_name=bare_name,
             broker_args=input_dict,
         )
@@ -925,6 +951,10 @@ class ClaudeBackend(Backend):
             # through `can_use_tool` and the gate.
             supports_engine_auto=False,
             supports_action_policy=True,
+            # 07 §4: `WebSearch` is gated through `can_use_tool`; fetch is
+            # Tradewind's own tool, gated like any caller tool.
+            web_search="gated",
+            fetch_url="gated",
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -1009,9 +1039,10 @@ class ClaudeBackend(Backend):
         # invoked for calls "already permitted by ... permission_mode";
         # `ClaudeSDKClient.set_permission_mode`: "'auto': A model classifier
         # approves or denies each tool call"), which would bypass the gate
-        # (task-8 finding, RUNBOOK). Built-ins stay off (`tools=[]`).
+        # (task-8 finding, RUNBOOK). Built-ins stay off (`tools=[]`), except `WebSearch` when the
+        # session turns search on (gated in `can_use_tool`).
         return ClaudeAgentOptions(
-            tools=[],
+            tools=[_WEB_SEARCH_TOOL] if ctx.web is not None and ctx.web.search else [],
             mcp_servers=cast("dict[str, Any]", _build_mcp_servers(ctx.tools)),
             can_use_tool=_make_can_use_tool(
                 policy, pending_events, terminate_flag, stop_reason, round_cap

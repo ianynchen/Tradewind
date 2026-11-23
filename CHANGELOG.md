@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-23
+
+### Added
+
+- Web access, slice 2 (`docs/components/07-web-access.md`):
+  - `TurnContext.web` passes the session's web setting to the backend.
+  - Claude: `web_search="gated"` (its own `WebSearch`, on only when `web.search`; each call is gated as `web_search` with its `query`; a call with no usable query is a missing critical field) and `fetch_url="gated"` (`tradewind_fetch_url`).
+  - Codex: `web_search="observed"` (each completed web item is observed: a search is `web_search`, one action per query in order; `openPage` and `findInPage` are `fetch_url`; the first stop ends the turn) and `fetch_url="gated"` (through the shim). No web setting passes nothing (Codex keeps its default search); `web.search` on sets `web_search="live"`; a web setting with search off sets `"disabled"`. A Codex session that searches needs `fetch=True` too.
+  - LangChain: `web_search=None`, `fetch_url="gated"`. Cursor: `None` for both.
+  - Live tests: `tests/integration/test_web_live.py` (`TRADEWIND_RUN_WEB_INTEGRATION=1`).
+
+### Fixed
+
+- The fetch tool verifies TLS with certifi's CA bundle. The default trust store failed on macOS ("unable to get local issuer certificate").
+
+### Changed
+
+- `certifi` is now a declared dependency.
+
 ## [0.15.0] - 2026-11-22
 
 ### Added

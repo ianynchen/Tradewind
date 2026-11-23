@@ -24,6 +24,7 @@ from tradewind.domain.models import (
     StoredMessage,
     TurnStatus,
     TurnUsage,
+    WebAccess,
 )
 
 if TYPE_CHECKING:
@@ -376,6 +377,10 @@ class TurnContext:
     # The caller's live `SessionOptions.on_preflight` (05 §4), which
     # `run_checks` asks; None means every question gets its default.
     on_preflight: OnPreflight | None = None
+    # The session's stored web setting (07 §4), as the runner computed it for
+    # the floor; None when web access is not set. Adapters read it to wire
+    # their search and fetch.
+    web: WebAccess | None = None
     # The process report (05 §3.4), for a backend that spawns an engine
     # process: it calls `engine_started(pid)` once the engine is spawned
     # and `engine_closing()` just before it closes the engine, so the

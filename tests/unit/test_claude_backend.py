@@ -32,6 +32,7 @@ from tradewind.domain.models import (
     StoredMessage,
     SubscriptionAuth,
     Verdict,
+    WebAccess,
 )
 
 
@@ -2251,3 +2252,119 @@ async def test_isolation_reaches_the_cli_argv(monkeypatch: pytest.MonkeyPatch) -
     default_argv = argv_of(await _captured_options(monkeypatch, _profile()))
     assert "--strict-mcp-config" not in default_argv
     assert not any(a.startswith("--setting-sources") for a in default_argv)
+
+
+# --- web access slice 2 (07 §4): gated WebSearch, gated fetch ---
+
+
+def test_capabilities_declare_gated_web() -> None:
+    caps = ClaudeBackend(_profile(), NativeStoreConfig()).capabilities()
+    assert caps.web_search == "gated"
+    assert caps.fetch_url == "gated"
+
+
+@pytest.mark.parametrize(
+    ("web", "tools"),
+    [
+        (None, []),
+        (WebAccess(search=False, fetch=True), []),
+        (WebAccess(search=True, fetch=False), ["WebSearch"]),
+    ],
+)
+def test_options_tools_follow_the_web_setting(web: WebAccess | None, tools: list[str]) -> None:
+    ctx = _make_ctx(output_schema=None)
+    ctx.web = web
+    options = ClaudeBackend(_profile(), NativeStoreConfig())._build_options(
+        ctx, [], [False], [None]
+    )
+    assert options.tools == tools
+
+
+async def _web_search(
+    policy: Any, tool_input: dict[str, Any], pending: list[object] | None = None
+) -> Any:
+    from claude_agent_sdk import ToolPermissionContext
+
+    from tradewind.adapters.claude_backend import _make_can_use_tool
+
+    can_use_tool = _make_can_use_tool(
+        policy, cast(Any, pending if pending is not None else []), [False], [None]
+    )
+    return await can_use_tool("WebSearch", tool_input, ToolPermissionContext(tool_use_id="w1"))
+
+
+def _web_rule(outcome: str) -> Any:
+    from tradewind.domain.policy import Matcher, Rule
+
+    return Rule(
+        id=f"caller.web.{outcome}",
+        kind="web_search",
+        where={"query": Matcher("equals", "q")},
+        outcome=cast(Any, outcome),
+        reason="by rule",
+    )
+
+
+async def test_web_search_is_gated_as_a_web_search_action() -> None:
+    from claude_agent_sdk import PermissionResultAllow
+
+    policy = _policy(_NoBroker(), caller=[_web_rule("allow")])
+    gated: list[Any] = []
+    real_gate = policy.gate
+
+    async def spy(action: Any, **kwargs: Any) -> Any:
+        gated.append(action)
+        return await real_gate(action, **kwargs)
+
+    policy.gate = spy
+    result = await _web_search(policy, {"query": "q"})
+    assert isinstance(result, PermissionResultAllow)
+    assert [(a.kind, a.fields) for a in gated] == [("web_search", {"query": "q"})]
+
+
+async def test_web_search_deny_rule_stops_the_search() -> None:
+    from claude_agent_sdk import PermissionResultDeny
+
+    pending: list[object] = []
+    policy = _policy(_NoBroker(), caller=[_web_rule("deny")])
+    result = await _web_search(policy, {"query": "q"}, pending)
+    assert isinstance(result, PermissionResultDeny)
+    assert result.message == "by rule"
+    assert [type(e) for e in pending] == [PermissionRequested]
+
+
+async def test_web_search_without_a_query_is_denied_by_the_floor() -> None:
+    from claude_agent_sdk import PermissionResultDeny
+
+    from tradewind.domain.policy import Rule
+
+    allow_all = Rule(id="caller.web.all", kind="web_search", where={}, outcome="allow")
+    result = await _web_search(_policy(_NoBroker(), caller=[allow_all]), {})
+    assert isinstance(result, PermissionResultDeny)
+    assert result.message == "action is missing a critical field"
+
+
+def test_web_search_items_survive_without_structured_output() -> None:
+    from tradewind.adapters.claude_backend import _without_structured_output
+    from tradewind.domain.models import NormalizedMessage
+
+    use = NormalizedMessage(
+        role="assistant", kind="tool_use", content={"id": "w1", "name": "WebSearch", "input": {}}
+    )
+    result = NormalizedMessage(role="user", kind="tool_result", content={"tool_use_id": "w1"})
+    assert _without_structured_output([use, result], set()) == [use, result]
+
+
+def test_claude_web_search_action_shape() -> None:
+    from tradewind.adapters.claude_backend import claude_web_search_action
+
+    action = claude_web_search_action({"query": "q"})
+    assert (action.kind, action.fields, action.backend, action.native_name) == (
+        "web_search",
+        {"query": "q"},
+        "claude",
+        "WebSearch",
+    )
+    assert action.summary == "q"
+    assert action.missing_critical_field is False
+    assert claude_web_search_action({"query": 3}).missing_critical_field is True

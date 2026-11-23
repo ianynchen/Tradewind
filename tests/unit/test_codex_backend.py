@@ -10,6 +10,7 @@ session is `tests/conformance/test_codex.py` (`@pytest.mark.integration`).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import queue
 import threading
 from contextlib import aclosing
@@ -40,6 +41,7 @@ from tradewind.domain.models import (
     StoredMessage,
     SubscriptionAuth,
     Verdict,
+    WebAccess,
 )
 
 
@@ -438,6 +440,62 @@ def test_capabilities_match_the_brief() -> None:
     # 05 §2.5: Codex's own auto-reviewer; approval requests reach the gate.
     assert caps.supports_engine_auto is True
     assert caps.supports_action_policy is True
+    assert caps.web_search == "observed"
+    assert caps.fetch_url == "gated"
+
+
+@pytest.mark.parametrize(
+    ("web", "expected"),
+    [
+        (None, ()),
+        (WebAccess(search=True, fetch=False), ('web_search="live"',)),
+        (WebAccess(search=False, fetch=True), ('web_search="disabled"',)),
+    ],
+)
+def test_web_search_overrides(web: WebAccess | None, expected: tuple[str, ...]) -> None:
+    assert codex_backend.web_search_overrides(web) == expected
+
+
+@pytest.mark.parametrize(
+    ("web", "expected_tail"),
+    [(None, ()), (WebAccess(search=True, fetch=False), ('web_search="live"',))],
+)
+async def test_turn_config_has_the_web_override_after_the_shim_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    web: WebAccess | None,
+    expected_tail: tuple[str, ...],
+) -> None:
+    seen: list[tuple[str, ...]] = []
+    real = CodexBackend._engine_config
+
+    def spy(self: CodexBackend, config_overrides: tuple[str, ...] = ()) -> Any:
+        seen.append(config_overrides)
+        return real(self, config_overrides)
+
+    monkeypatch.setattr(CodexBackend, "_engine_config", spy)
+
+    real_drive_turn = codex_backend._drive_turn
+
+    def fake_drive_turn(*args: Any, **kwargs: Any) -> None:
+        # Bound by name against the real signature: a change breaks loudly.
+        bound = inspect.signature(real_drive_turn).bind(*args, **kwargs)
+        bound.arguments["out_queue"].put(codex_backend._DONE)
+
+    monkeypatch.setattr(codex_backend, "_drive_turn", fake_drive_turn)
+    backend = CodexBackend(_profile(), NativeStoreConfig())
+    tool_host = ToolHost([], [], lambda ref: ref)
+    ctx = _make_turn_context(broker=_ScriptedBroker("allow"), tools=tool_host)
+    ctx.web = web
+    shim_def = await tool_host.shim_server_def()
+    try:
+        async with aclosing(backend.run(ctx)) as stream:
+            async for _ in stream:
+                pass
+    finally:
+        await tool_host.stop_socket()
+
+    assert seen[0][0].startswith("mcp_servers.")
+    assert seen[0] == codex_backend.mcp_server_config_overrides(shim_def) + expected_tail
 
 
 # --- probe_native: cheap id-truthiness check ---------------------------
@@ -1345,6 +1403,103 @@ async def test_observed_file_change_without_request_can_stop_the_turn() -> None:
     )
 
     assert interrupts == [True]
+    assert any(isinstance(e, TurnFailed) for e in events)
+
+
+async def test_observed_web_item_stops_at_the_first_stopped_action() -> None:
+    """07 §4: each query of a search is its own action, in order; the first
+    stop ends the turn."""
+    from openai_codex.generated.v2_all import ThreadItem
+
+    from tradewind.domain.events import TurnFailed
+
+    item = ThreadItem.model_validate(
+        {
+            "id": "ws-1",
+            "type": "webSearch",
+            "query": "a",
+            "action": {"type": "search", "queries": ["a", "b"]},
+        }
+    )
+    policy = _gate(
+        _RaisingBroker(),
+        caller=[
+            _rule("web_search", "allow", query="a"),
+            _rule("web_search", "deny", "no web"),
+        ],
+    )
+
+    events, interrupts = await _consume_all(
+        _queue_of(_completed(item), _turn_done("completed")),
+        policy=policy,
+        ledger=ApprovalLedger(wait_s=0.0),
+    )
+
+    assert interrupts == [True]
+    (failed,) = [e for e in events if isinstance(e, TurnFailed)]
+    assert "web_search 'b'" in failed.error
+    assert "no web" in failed.error
+
+
+def _web_completed(action: dict[str, Any]) -> Any:
+    from openai_codex.generated.v2_all import ThreadItem
+
+    return _completed(
+        ThreadItem.model_validate(
+            {"id": "ws-2", "type": "webSearch", "query": "q", "action": action}
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("action", "named"),
+    [
+        ({"type": "openPage"}, "fetch_url 'openPage'"),
+        ({"type": "other"}, "web_search 'other'"),
+    ],
+)
+async def test_observed_web_item_missing_its_field_is_stopped_by_the_floor(
+    action: dict[str, Any], named: str
+) -> None:
+    from tradewind.domain.events import TurnFailed
+
+    events, interrupts = await _consume_all(
+        _queue_of(_web_completed(action), _turn_done("completed")),
+        policy=_gate(_RaisingBroker()),
+        ledger=ApprovalLedger(wait_s=0.0),
+    )
+
+    assert interrupts == [True]
+    (failed,) = [e for e in events if isinstance(e, TurnFailed)]
+    assert named in failed.error
+
+
+async def test_observed_web_item_never_evaluates_queries_after_the_stop() -> None:
+    from tradewind.domain.events import TurnFailed
+
+    policy = _gate(
+        _RaisingBroker(),
+        caller=[_rule("web_search", "allow", query="a"), _rule("web_search", "deny")],
+    )
+    seen: list[str] = []
+    observe = policy.observe
+
+    def recording(action: Any) -> Any:
+        seen.append(action.summary)
+        return observe(action)
+
+    policy.observe = recording
+
+    events, _ = await _consume_all(
+        _queue_of(
+            _web_completed({"type": "search", "queries": ["a", "b", "c"]}),
+            _turn_done("completed"),
+        ),
+        policy=policy,
+        ledger=ApprovalLedger(wait_s=0.0),
+    )
+
+    assert seen == ["a", "b"]
     assert any(isinstance(e, TurnFailed) for e in events)
 
 

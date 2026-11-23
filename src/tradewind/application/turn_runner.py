@@ -1019,6 +1019,7 @@ class TurnRunner:
                     work=supervisor,
                     engine_started=watch.started,
                     engine_closing=watch.snapshot,
+                    web=web,
                 )
                 self._watches[session_id] = watch
                 report_ctx = ctx

@@ -200,6 +200,7 @@ from openai_codex.generated.v2_all import (
     DynamicToolCallThreadItem,
     FileChangeThreadItem,
     FileUpdateChange,
+    FindInPageWebSearchAction,
     InputTextDynamicToolCallOutputContentItem,
     ItemCompletedNotification,
     ItemGuardianApprovalReviewCompletedNotification,
@@ -209,11 +210,13 @@ from openai_codex.generated.v2_all import (
     McpToolCallStatus,
     McpToolCallThreadItem,
     MessagePhase,
+    OpenPageWebSearchAction,
     ReasoningEffort,
     ReasoningSummaryTextDeltaNotification,
     ReasoningTextDeltaNotification,
     ReasoningThreadItem,
     SandboxMode,
+    SearchWebSearchAction,
     TerminalInteractionNotification,
     TextUserInput,
     ThreadItem,
@@ -257,12 +260,13 @@ from tradewind.domain.models import (
     Profile,
     SessionRow,
     TurnResult,
+    WebAccess,
     calculate_cost,
     engine_compaction_record,
     resume_degraded_notice,
     retry_notice,
 )
-from tradewind.domain.policy import Action, TurnVars, floor_tradewind
+from tradewind.domain.policy import Action, ActionKind, TurnVars, floor_tradewind
 
 _logger = logging.getLogger(__name__)
 
@@ -675,6 +679,14 @@ def mcp_server_config_overrides(server: McpServerDef) -> tuple[str, ...]:
     return tuple(overrides)
 
 
+def web_search_overrides(web: WebAccess | None) -> tuple[str, ...]:
+    """`--config` entries for Codex's own web search (07 §4a). No web
+    setting leaves Codex's default as it is (owner decision 11)."""
+    if web is None:
+        return ()
+    return ('web_search="live"',) if web.search else ('web_search="disabled"',)
+
+
 # --- approval handler: JSON-RPC server-request -> policy gate ----------
 
 
@@ -768,19 +780,54 @@ def mcp_action(server: object, tool: str | None, args: dict[str, object]) -> Act
     )
 
 
-def observed_action(item: ThreadItem, *, workspace: str | None) -> Action | None:
-    """The action of a completed command or file-change item, for
-    `observe` (05 §7); `None` for every other item kind."""
+def _web_actions(item: WebSearchThreadItem) -> list[Action]:
+    """The actions of a completed `webSearch` item (07 §4): a search is
+    `web_search` (one action per distinct query, `query` then `queries`),
+    `openPage` and `findInPage` are `fetch_url`; no action, an unknown one,
+    or a missing query or url sets `missing_critical_field` (decision 13)."""
+    root = item.action.root if item.action is not None else None
+    native_args = root.model_dump(mode="json", by_alias=True) if root is not None else {}
+    # What the stop message names when the query or url is missing.
+    unmapped = root.type if root is not None else "webSearch"
+
+    def one(kind: ActionKind, field: str, value: str | None) -> Action:
+        return Action(
+            kind=kind,
+            fields={field: value},
+            backend="codex",
+            native_name="webSearch",
+            native_args=native_args,
+            summary=value or unmapped,
+            missing_critical_field=value is None,
+        )
+
+    if isinstance(root, SearchWebSearchAction):
+        queries = dict.fromkeys(q for q in [root.query, *(root.queries or [])] if q is not None)
+        return [one("web_search", "query", q) for q in queries] or [
+            one("web_search", "query", None)
+        ]
+    if isinstance(root, OpenPageWebSearchAction | FindInPageWebSearchAction):
+        return [one("fetch_url", "url", root.url)]
+    return [one("web_search", "query", None)]
+
+
+def observed_actions(item: ThreadItem, *, workspace: str | None) -> list[Action]:
+    """The actions of a completed command, file-change or web item, for
+    `observe` (05 §7, 07 §4); `[]` for every other item kind."""
     root = item.root
     if isinstance(root, CommandExecutionThreadItem):
-        return shell_action({"command": root.command, "cwd": root.cwd.root})
+        return [shell_action({"command": root.command, "cwd": root.cwd.root})]
     if isinstance(root, FileChangeThreadItem):
-        return file_write_action(
-            root.changes,
-            workspace=workspace,
-            native_args={"changes": [c.model_dump(mode="json") for c in root.changes]},
-        )
-    return None
+        return [
+            file_write_action(
+                root.changes,
+                workspace=workspace,
+                native_args={"changes": [c.model_dump(mode="json") for c in root.changes]},
+            )
+        ]
+    if isinstance(root, WebSearchThreadItem):
+        return _web_actions(root)
+    return []
 
 
 def report_work(work: WorkSupervisor, payload: object) -> None:
@@ -1444,6 +1491,8 @@ class CodexBackend(Backend):
             # still reach the client, and the shim, go through the gate.
             supports_engine_auto=True,
             supports_action_policy=True,
+            web_search="observed",
+            fetch_url="gated",
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -1547,7 +1596,9 @@ class CodexBackend(Backend):
         approval_handler = make_approval_handler(policy, loop, out_queue, ledger, workspace)
         try:
             shim_def = await ctx.tools.shim_server_def()
-            config = self._engine_config(mcp_server_config_overrides(shim_def))
+            config = self._engine_config(
+                mcp_server_config_overrides(shim_def) + web_search_overrides(ctx.web)
+            )
 
             def make_client() -> CodexClient:
                 return _EngineReportingClient(
@@ -1697,20 +1748,21 @@ class CodexBackend(Backend):
         ledger: ApprovalLedger | None,
         workspace: str | None,
     ) -> str | None:
-        """Observe a completed command or file change that had no approval
-        request (05 §2.1, §7): `item/started` comes before a possible
+        """Observe a completed command, file change or web item that had no
+        approval request (05 §2.1, §7, 07 §4): `item/started` comes before a possible
         request, so only the completion is observed, and a requested item is
         decided at the gate only. Returns the stop reason, or `None`."""
         if policy is None or ledger is None:
             return None
-        action = observed_action(item, workspace=workspace)
-        if action is None or ledger.was_requested(item.root.id):
+        actions = observed_actions(item, workspace=workspace)
+        if not actions or ledger.was_requested(item.root.id):
             return None
-        observation = policy.observe(action)
-        if observation.outcome == "allow":
-            return None
-        stopped = f"turn stopped by policy after {action.kind} {action.summary!r}"
-        return f"{stopped}: {observation.reason}" if observation.reason else stopped
+        for action in actions:
+            observation = policy.observe(action)
+            if observation.outcome != "allow":
+                stopped = f"turn stopped by policy after {action.kind} {action.summary!r}"
+                return f"{stopped}: {observation.reason}" if observation.reason else stopped
+        return None
 
     async def _consume(
         self,
@@ -1729,8 +1781,8 @@ class CodexBackend(Backend):
         """Drain `out_queue` into events. With `work`, every notification also
         feeds the work supervisor (`report_work`, never an event); with
         `policy` and `ledger`, a completed command or file change that had no
-        approval request is observed (05 §2.1), and an observed `stop` -- or
-        a gate `stop` (`_StopRequested`) -- interrupts the turn and ends it
+        approval request is observed (05 §2.1), as is a completed web item,
+        and an observed `stop` -- or a gate `stop` (`_StopRequested`) -- interrupts the turn and ends it
         with `TurnFailed(reason)`. No settle wait (05 §3.3): every Codex item
         is `tool` work that ends inside the engine's turn, so no background
         or subagent work outlives `turn/completed`."""
