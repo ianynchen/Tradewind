@@ -14,7 +14,7 @@ from tradewind.application.policy_gate import (
 )
 from tradewind.domain.events import Event, ItemCompleted
 from tradewind.domain.models import Denial, SessionOptions
-from tradewind.domain.policy import Action, Matcher, Rule, TurnVars
+from tradewind.domain.policy import Action, Matcher, Rule, TurnVars, floor_tradewind
 
 
 def _turn(mode="broker") -> TurnVars:
@@ -296,3 +296,17 @@ def test_a_fetch_call_with_no_usable_url_is_missing_a_field(args):
     assert caller_tool_action(
         "tradewind_fetch_url", args, backend="langchain"
     ).missing_critical_field
+
+
+async def test_broker_denies_a_fetch_call_without_a_url_by_the_floor():
+    gate, _ = _gate(floor=floor_tradewind())
+    assert isinstance(await gate.as_broker().decide("tradewind_fetch_url", {}), Denial)
+
+
+async def test_broker_evaluates_a_fetch_call_as_fetch_url():
+    rule = Rule("c", "fetch_url", {"url": Matcher("equals", "https://example.com")}, "allow")
+    broker = _Broker("deny")
+    gate, _ = _gate(broker, floor=floor_tradewind(), caller=[rule])
+    out = await gate.as_broker().decide("tradewind_fetch_url", {"url": "https://example.com"})
+    assert out == "allow"
+    assert broker.calls == []
