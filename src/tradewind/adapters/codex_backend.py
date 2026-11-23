@@ -495,11 +495,18 @@ def thread_item_to_messages(item: ThreadItem) -> list[NormalizedMessage]:
             )
         ]
     if isinstance(root, WebSearchThreadItem):
+        # Record the action and queries so every URL Codex opened is in the record (07 §6).
+        action = root.action.root if root.action is not None else None
         return [
             NormalizedMessage(
                 role="assistant",
                 kind="web_search",
-                content={"query": root.query, "results": root.results},
+                content={
+                    "query": root.query,
+                    "results": root.results,
+                    "action": action.model_dump(mode="json", by_alias=True) if action else None,
+                    "queries": getattr(action, "queries", None),
+                },
                 native_id=native_id,
             )
         ]

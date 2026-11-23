@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 from openai_codex.generated.v2_all import (
     AbsolutePathBuf,
@@ -264,8 +266,64 @@ def test_web_search_maps_to_web_search_kind() -> None:
 
     assert len(messages) == 1
     assert messages[0].kind == "web_search"
-    assert messages[0].content == {"query": "weather today", "results": None}
+    assert messages[0].content == {
+        "query": "weather today",
+        "results": None,
+        "action": None,
+        "queries": None,
+    }
     assert messages[0].native_id == "ws-1"
+
+
+@pytest.mark.parametrize(
+    ("action", "query", "expected_action", "expected_queries"),
+    [
+        (
+            {"type": "search", "query": "site:python.org latest", "queries": None},
+            "site:python.org latest",
+            {"type": "search", "query": "site:python.org latest", "queries": None},
+            None,
+        ),
+        (
+            {"type": "search", "query": None, "queries": ["a", "b"]},
+            "a ...",
+            {"type": "search", "query": None, "queries": ["a", "b"]},
+            ["a", "b"],
+        ),
+        (
+            {"type": "openPage", "url": "https://example.com"},
+            "https://example.com",
+            {"type": "openPage", "url": "https://example.com"},
+            None,
+        ),
+        (
+            {"type": "findInPage", "url": "https://example.com", "pattern": "x"},
+            "x",
+            {"type": "findInPage", "url": "https://example.com", "pattern": "x"},
+            None,
+        ),
+    ],
+)
+def test_web_search_records_action_and_queries(
+    action: dict[str, Any],
+    query: str,
+    expected_action: dict[str, Any],
+    expected_queries: list[str] | None,
+) -> None:
+    item = _item(
+        WebSearchThreadItem.model_validate(
+            {"id": "ws-2", "type": "webSearch", "query": query, "action": action}
+        )
+    )
+
+    (message,) = thread_item_to_messages(item)
+
+    assert message.content == {
+        "query": query,
+        "results": None,
+        "action": expected_action,
+        "queries": expected_queries,
+    }
 
 
 def test_unknown_item_kind_maps_to_event_with_raw() -> None:
