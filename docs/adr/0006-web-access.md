@@ -34,6 +34,7 @@ cannot be stopped in advance treats the agent as a suspect, so the caller choose
 4. **One fetch tool**, `tradewind_fetch_url`: standard library only, `http` and `https`,
    no redirects (a redirect ends the fetch and names its target), time and size
    limits, text only. It is served only when `web.fetch` is on.
+   It is not reachable until slice 2, because every backend's `fetch_url` is still `None`.
 5. **One shared mapper** classifies Tradewind's own tools, so `tradewind_fetch_url` is
    the `fetch_url` kind on every backend.
 6. **No web setting: every backend as today.** Tradewind does not change an engine's
