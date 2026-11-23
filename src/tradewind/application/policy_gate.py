@@ -69,7 +69,7 @@ def caller_tool_action(name: str, args: dict[str, object], *, backend: str) -> A
             backend=backend,
             native_name=name,
             native_args=args,
-            summary=name,
+            summary=url if isinstance(url, str) else name,
             missing_critical_field=not isinstance(url, str),
         )
     return Action(
