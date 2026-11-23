@@ -10,6 +10,7 @@ session is `tests/conformance/test_codex.py` (`@pytest.mark.integration`).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import queue
 import threading
 from contextlib import aclosing
@@ -455,8 +456,14 @@ def test_web_search_overrides(web: WebAccess | None, expected: tuple[str, ...]) 
     assert codex_backend.web_search_overrides(web) == expected
 
 
+@pytest.mark.parametrize(
+    ("web", "expected_tail"),
+    [(None, ()), (WebAccess(search=True, fetch=False), ('web_search="live"',))],
+)
 async def test_turn_config_has_the_web_override_after_the_shim_overrides(
     monkeypatch: pytest.MonkeyPatch,
+    web: WebAccess | None,
+    expected_tail: tuple[str, ...],
 ) -> None:
     seen: list[tuple[str, ...]] = []
     real = CodexBackend._engine_config
@@ -467,14 +474,19 @@ async def test_turn_config_has_the_web_override_after_the_shim_overrides(
 
     monkeypatch.setattr(CodexBackend, "_engine_config", spy)
 
-    def fake_drive_turn(*args: Any, **kwargs: Any) -> None:  # noqa: ARG001
-        args[10].put(codex_backend._DONE)
+    real_drive_turn = codex_backend._drive_turn
+
+    def fake_drive_turn(*args: Any, **kwargs: Any) -> None:
+        # Bound by name against the real signature: a change breaks loudly.
+        bound = inspect.signature(real_drive_turn).bind(*args, **kwargs)
+        bound.arguments["out_queue"].put(codex_backend._DONE)
 
     monkeypatch.setattr(codex_backend, "_drive_turn", fake_drive_turn)
     backend = CodexBackend(_profile(), NativeStoreConfig())
     tool_host = ToolHost([], [], lambda ref: ref)
     ctx = _make_turn_context(broker=_ScriptedBroker("allow"), tools=tool_host)
-    ctx.web = WebAccess(search=True, fetch=False)
+    ctx.web = web
+    shim_def = await tool_host.shim_server_def()
     try:
         async with aclosing(backend.run(ctx)) as stream:
             async for _ in stream:
@@ -482,8 +494,8 @@ async def test_turn_config_has_the_web_override_after_the_shim_overrides(
     finally:
         await tool_host.stop_socket()
 
-    assert seen[0][-1] == 'web_search="live"'
     assert seen[0][0].startswith("mcp_servers.")
+    assert seen[0] == codex_backend.mcp_server_config_overrides(shim_def) + expected_tail
 
 
 # --- probe_native: cheap id-truthiness check ---------------------------
