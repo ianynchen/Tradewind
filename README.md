@@ -534,7 +534,10 @@ verifies TLS with certifi's CA bundle. Per backend (0.16.0): Claude searches wit
 by itself and each finished web item is observed (`observed`); LangChain has fetch only;
 Cursor has neither. Codex opens pages as part of a search, and that maps to `fetch_url`, so a
 Codex session that searches needs `fetch=True` too, or the floor stops the turn at the first
-opened page. Design: `docs/components/07-web-access.md`, ADR-0006.
+opened page. Codex web items are observed even with no web setting (Codex keeps its own
+search, recorded); with no caller rules they are allowed, but a web item with no usable action
+(an unknown action type or a missing query or url) stops the turn as a missing critical field
+(owner decisions 11 and 13). Design: `docs/components/07-web-access.md`, ADR-0006.
 
 ## Workspace safety — scan and decide
 

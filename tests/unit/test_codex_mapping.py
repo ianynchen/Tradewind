@@ -757,7 +757,15 @@ def _web_item(action: dict[str, Any] | None) -> Any:
         ),
         (
             {"type": "search", "query": "a", "queries": ["x", "y"]},
-            [("web_search", "query", "a")],
+            [
+                ("web_search", "query", "a"),
+                ("web_search", "query", "x"),
+                ("web_search", "query", "y"),
+            ],
+        ),
+        (
+            {"type": "search", "query": "a", "queries": ["a", "b"]},
+            [("web_search", "query", "a"), ("web_search", "query", "b")],
         ),
         ({"type": "openPage", "url": "https://e.com"}, [("fetch_url", "url", "https://e.com")]),
         (

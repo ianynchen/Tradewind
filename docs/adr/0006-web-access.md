@@ -31,7 +31,7 @@ cannot be stopped in advance treats the agent as a suspect, so the caller choose
    raises `Unsupported`.
 3. **A floor rule per kind**, built from the setting (`floor_tradewind(web)`): `web_search`
    is denied unless `web.search` is on, `fetch_url` unless `web.fetch` is on.
-4. **One fetch tool**, `tradewind_fetch_url`: standard library only, `http` and `https`,
+4. **One fetch tool**, `tradewind_fetch_url`: standard library plus certifi's CA bundle for TLS, `http` and `https`,
    no redirects (a redirect ends the fetch and names its target), time and size
    limits, text only. It is served only when `web.fetch` is on.
    It is not reachable until slice 2, because every backend's `fetch_url` is still `None`.

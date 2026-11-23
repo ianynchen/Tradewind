@@ -802,9 +802,8 @@ def _web_actions(item: WebSearchThreadItem) -> list[Action]:
         )
 
     if isinstance(root, SearchWebSearchAction):
-        if root.query is not None:
-            return [one("web_search", "query", root.query)]
-        return [one("web_search", "query", q) for q in root.queries or []] or [
+        queries = dict.fromkeys(q for q in [root.query, *(root.queries or [])] if q is not None)
+        return [one("web_search", "query", q) for q in queries] or [
             one("web_search", "query", None)
         ]
     if isinstance(root, OpenPageWebSearchAction | FindInPageWebSearchAction):
@@ -1782,7 +1781,7 @@ class CodexBackend(Backend):
         """Drain `out_queue` into events. With `work`, every notification also
         feeds the work supervisor (`report_work`, never an event); with
         `policy` and `ledger`, a completed command or file change that had no
-        approval request is observed (05 §2.1), and an observed `stop` -- or
+        approval request is observed (05 §2.1), as is a completed web item, and an observed `stop` -- or
         a gate `stop` (`_StopRequested`) -- interrupts the turn and ends it
         with `TurnFailed(reason)`. No settle wait (05 §3.3): every Codex item
         is `tool` work that ends inside the engine's turn, so no background
