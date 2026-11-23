@@ -44,6 +44,7 @@ from tradewind.application.process_report import (
 from tradewind.application.resume import ResumePlanner
 from tradewind.application.supervisor import WorkSupervisor
 from tradewind.application.tool_host import RESULT_TOOL_NAME, SHIM_MODULE, ToolHost
+from tradewind.application.web_fetch import FETCH_TOOL_NAME, fetch_tool
 from tradewind.application.workspace_decision import apply_delete, check_backup_dir, resolve
 from tradewind.application.workspace_scan import scan_session
 from tradewind.domain.errors import (
@@ -790,6 +791,15 @@ class TurnRunner:
             _check_governance_support(backend, permission_mode, policy_rules)
             web = web_from_snapshot(snapshot)
             _check_web_support(backend, web)
+            if (
+                web is not None
+                and web.fetch
+                and any(t.name == FETCH_TOOL_NAME for t in options.tools)
+            ):
+                raise ConfigError(
+                    f"a caller tool is named {FETCH_TOOL_NAME!r}, which web fetch serves; "
+                    "rename the tool or turn web fetch off"
+                )
             # FR-6.1 resume routing (Phase 4, closes P-7): probe only where
             # it is real and cheap (claude's local-jsonl existence check;
             # other backends return truthy-id probes), then let the planner
@@ -909,7 +919,7 @@ class TurnRunner:
             gate.on_approval_change = supervisor.approvals_changed
             tool_host_broker = gate.as_broker() if backend.name == "codex" else None
             async with ToolHost(
-                options.tools,
+                [*options.tools, fetch_tool()] if web is not None and web.fetch else options.tools,
                 options.mcp_servers,
                 self._resolve_ref,
                 socket_dir=self._config.tool_host.socket_dir,

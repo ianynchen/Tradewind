@@ -41,7 +41,14 @@ from tradewind.domain.events import (
     TurnFailed,
     TurnStarted,
 )
-from tradewind.domain.models import ApiKeyAuth, ModelSpec, Profile, SessionOptions, WebAccess
+from tradewind.domain.models import (
+    ApiKeyAuth,
+    ModelSpec,
+    Profile,
+    SessionOptions,
+    Tool,
+    WebAccess,
+)
 from tradewind.domain.policy import Matcher, Rule
 
 _ID = "44444444-4444-4444-4444-444444444444"
@@ -738,3 +745,68 @@ async def test_no_web_setting_leaves_the_backend_as_it_is(tmp_path: Path) -> Non
 
     assert fake.decisions == [("web_search", "allow")]
     assert isinstance(events[-1], TurnCompleted)
+
+
+# --- web fetch tool (07 §5) --------------------------------------------
+
+
+def _served(fake: FakeGovernedBackend) -> list[str]:
+    return [str(schema["name"]) for schema in fake.contexts[-1].tools.schemas()]
+
+
+async def test_fetch_on_serves_the_fetch_tool_and_gates_it_by_kind(tmp_path: Path) -> None:
+    url = "https://example.com"
+    other = "https://other.example"
+    call = action("fetch_url", url=url)
+    other_call = action("fetch_url", url=other)
+    allow = Rule(id="u", kind="fetch_url", where={"url": Matcher("equals", url)}, outcome="allow")
+    tw, fake = _tradewind(
+        tmp_path,
+        [Request(call), Request(other_call), Say("ok")],
+        fetch_url="gated",
+    )
+    broker = _CountingBroker("deny")
+    session = await tw.create(
+        _ID,
+        SessionOptions(
+            web=WebAccess(search=False, fetch=True), policy_rules=[allow], permission_broker=broker
+        ),
+    )
+
+    await session.run("go")
+
+    assert "tradewind_fetch_url" in _served(fake)
+    assert fake.decisions == [("fetch_url", "allow"), ("fetch_url", "deny")]
+    assert broker.calls == ["fetch_url"]
+
+
+async def test_fetch_off_serves_only_the_callers_tools(tmp_path: Path) -> None:
+    tw, fake = _tradewind(tmp_path, [Say("ok")], web_search="gated")
+    session = await tw.create(_ID, SessionOptions(web=WebAccess(search=True, fetch=False)))
+    await session.run("go")
+    assert "tradewind_fetch_url" not in _served(fake)
+
+
+async def test_a_caller_tool_with_the_fetch_name_is_refused_when_fetch_is_on(
+    tmp_path: Path,
+) -> None:
+    async def handler(**_kw: object) -> str:
+        return ""
+
+    mine = Tool(
+        name="tradewind_fetch_url",
+        description="x",
+        input_schema={"type": "object"},
+        handler=handler,
+    )
+    tw, _fake = _tradewind(tmp_path, [Say("ok")], fetch_url="gated")
+    session = await tw.create(
+        _ID, SessionOptions(web=WebAccess(search=False, fetch=True), tools=[mine])
+    )
+
+    events: list[Event] = []
+    with pytest.raises(ConfigError, match="tradewind_fetch_url"):
+        async for event in session.stream("go"):
+            events.append(event)
+
+    assert not any(isinstance(e, TurnStarted) for e in events)
