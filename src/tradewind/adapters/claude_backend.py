@@ -135,7 +135,7 @@ from claude_agent_sdk import (
 
 from tradewind.application.config import NativeStoreConfig
 from tradewind.application.engine_env import engine_env
-from tradewind.application.policy_gate import PolicyGate, caller_tool_source
+from tradewind.application.policy_gate import PolicyGate, caller_tool_action
 from tradewind.application.ports import Backend, TurnContext
 from tradewind.application.supervisor import WorkSupervisor
 from tradewind.application.tool_host import ToolHost
@@ -162,7 +162,7 @@ from tradewind.domain.models import (
     resume_degraded_notice,
     retry_notice,
 )
-from tradewind.domain.policy import Action, TurnVars, floor_tradewind
+from tradewind.domain.policy import TurnVars, floor_tradewind
 
 _logger = logging.getLogger(__name__)
 
@@ -755,7 +755,7 @@ def _make_can_use_tool(
             # FR-1.3 / 05 §2.3: the CLI's own structured-output tool is the
             # result tool -- a structural pass-through, never asked.
             await policy.gate(
-                _caller_tool_action(tool_name, input_dict),
+                caller_tool_action(tool_name, input_dict, backend="claude"),
                 broker_name=tool_name,
                 broker_args=input_dict,
                 pass_through=True,
@@ -772,7 +772,7 @@ def _make_can_use_tool(
             )
         bare_name = _strip_server_prefix(tool_name)
         decision = await policy.gate(
-            _caller_tool_action(bare_name, input_dict),
+            caller_tool_action(bare_name, input_dict, backend="claude"),
             broker_name=bare_name,
             broker_args=input_dict,
         )
@@ -808,17 +808,6 @@ def _make_can_use_tool(
         return PermissionResultAllow()
 
     return can_use_tool
-
-
-def _caller_tool_action(name: str, args: dict[str, object]) -> Action:
-    return Action(
-        kind="caller_tool",
-        fields={"name": name, "args": args, "source": caller_tool_source(name)},
-        backend="claude",
-        native_name=name,
-        native_args=args,
-        summary=name,
-    )
 
 
 def _isolated_from_options(backend_options: dict[str, Any]) -> bool:

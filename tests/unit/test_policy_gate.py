@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import anyio
+import pytest
 
 from tradewind.application.policy_gate import (
     Observation,
     PolicyGate,
     broker_args_with_action,
+    caller_tool_action,
     caller_tool_source,
 )
 from tradewind.domain.events import Event, ItemCompleted
@@ -268,3 +270,29 @@ def test_snapshot_includes_permission_mode_and_rules():
     assert snap["policy_rules"] == [rule.to_dict()]
     assert SessionOptions().snapshot()["permission_mode"] is None
     assert SessionOptions().snapshot()["policy_rules"] == []
+
+
+def test_a_caller_tool_maps_as_today():
+    a = caller_tool_action("lookup", {"q": 1}, backend="claude")
+    assert (a.kind, a.fields["name"], a.fields["source"], a.summary) == (
+        "caller_tool",
+        "lookup",
+        "local",
+        "lookup",
+    )
+
+
+def test_the_fetch_tool_maps_to_fetch_url():
+    a = caller_tool_action("tradewind_fetch_url", {"url": "https://example.com"}, backend="codex")
+    assert (a.kind, a.fields, a.missing_critical_field) == (
+        "fetch_url",
+        {"url": "https://example.com"},
+        False,
+    )
+
+
+@pytest.mark.parametrize("args", [{}, {"url": 7}, {"url": None}])
+def test_a_fetch_call_with_no_usable_url_is_missing_a_field(args):
+    assert caller_tool_action(
+        "tradewind_fetch_url", args, backend="langchain"
+    ).missing_critical_field
