@@ -105,8 +105,8 @@ Each adapter maps its own web tools to the shared kinds, with the critical field
 
 - Claude: `WebSearch` → `web_search` (`query`), on the gate path.
 - Codex: a `webSearch` item → on the observe path, by its action: `search` →
-  `web_search` (`query`; a `queries` list gives one action for each query, in list
-  order, and the first stop ends the turn), `openPage` and `findInPage` → `fetch_url`
+  `web_search` (`query`; one action for each distinct query, `query` first and then
+  the `queries` list in order, and the first stop ends the turn), `openPage` and `findInPage` → `fetch_url`
   (`url`). No action, an unknown action, or a page action with no `url` sets
   `missing_critical_field` (owner decision 13). Today `observed_actions` maps only
   commands and file changes; it gains these.

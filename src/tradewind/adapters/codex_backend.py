@@ -782,7 +782,7 @@ def mcp_action(server: object, tool: str | None, args: dict[str, object]) -> Act
 
 def _web_actions(item: WebSearchThreadItem) -> list[Action]:
     """The actions of a completed `webSearch` item (07 §4): a search is
-    `web_search` (one action per entry of `queries` when `query` is unset),
+    `web_search` (one action per distinct query, `query` then `queries`),
     `openPage` and `findInPage` are `fetch_url`; no action, an unknown one,
     or a missing query or url sets `missing_critical_field` (decision 13)."""
     root = item.action.root if item.action is not None else None
@@ -1781,8 +1781,8 @@ class CodexBackend(Backend):
         """Drain `out_queue` into events. With `work`, every notification also
         feeds the work supervisor (`report_work`, never an event); with
         `policy` and `ledger`, a completed command or file change that had no
-        approval request is observed (05 §2.1), as is a completed web item, and an observed `stop` -- or
-        a gate `stop` (`_StopRequested`) -- interrupts the turn and ends it
+        approval request is observed (05 §2.1), as is a completed web item,
+        and an observed `stop` -- or a gate `stop` (`_StopRequested`) -- interrupts the turn and ends it
         with `TurnFailed(reason)`. No settle wait (05 §3.3): every Codex item
         is `tool` work that ends inside the engine's turn, so no background
         or subagent work outlives `turn/completed`."""
