@@ -66,6 +66,11 @@ SpawnKind = Literal["fork", "subagent"]
 CONTENT_SHAPE_VERSION = 1
 
 
+# How a backend offers a web kind (07-web-access §2): "gated" goes through the
+# gate path before it runs, "observed" through the observe path right after.
+WebMode = Literal["gated", "observed"]
+
+
 class Capabilities(BaseModel):
     """What a backend adapter can and cannot do; adapters raise `Unsupported`
     for capabilities their flags deny (R-1)."""
@@ -111,6 +116,10 @@ class Capabilities(BaseModel):
     # (05 §2). False (Cursor, 05 §2.7) raises `Unsupported` when
     # `policy_rules` or `permission_mode` is set.
     supports_action_policy: bool = False
+    # How the backend offers web search / URL fetch; None = not offered
+    # (07-web-access §2).
+    web_search: WebMode | None = None
+    fetch_url: WebMode | None = None
 
 
 class ModelCostTier(BaseModel):
@@ -305,6 +314,24 @@ def _redact_secret_map(values: dict[str, str]) -> tuple[dict[str, str], bool]:
     return redacted, has_unrefed
 
 
+class WebAccess(BaseModel):
+    """The session's web setting (07-web-access §2). `observed=True` accepts a
+    kind that the backend offers only as observed."""
+
+    model_config = ConfigDict(frozen=True)
+
+    search: bool
+    fetch: bool
+    observed: bool = False
+
+
+def web_from_snapshot(snapshot: dict[str, Any]) -> WebAccess | None:
+    """The web setting of a stored snapshot; a session stored before the
+    setting existed has no key and so no web access."""
+    web = snapshot.get("web")
+    return WebAccess(**web) if web is not None else None
+
+
 class SessionOptions(BaseModel):
     """Declarative parts snapshot into `options_json` (I-2); `tools`,
     `permission_broker` and `on_preflight` carry live objects re-supplied
@@ -327,6 +354,7 @@ class SessionOptions(BaseModel):
     cwd: Path | None = None
     permission_mode: Mode | None = None
     policy_rules: list[Rule] = []
+    web: WebAccess | None = None
 
     @field_validator("policy_rules", mode="before")
     @classmethod
@@ -374,6 +402,7 @@ class SessionOptions(BaseModel):
             "cwd": str(self.cwd) if self.cwd is not None else None,
             "permission_mode": self.permission_mode,
             "policy_rules": [rule.to_dict() for rule in self.policy_rules],
+            "web": self.web.model_dump() if self.web is not None else None,
             "has_unrefed_secrets": has_unrefed_secrets,
         }
 
