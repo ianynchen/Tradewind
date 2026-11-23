@@ -7,7 +7,7 @@ import json
 import pytest
 
 from tradewind.domain.errors import ConfigError
-from tradewind.domain.models import SessionOptions
+from tradewind.domain.models import SessionOptions, WebAccess
 from tradewind.domain.policy import (
     Action,
     Matcher,
@@ -252,3 +252,17 @@ def test_good_rule_dict_accepted_by_session_options():
     opts = SessionOptions(policy_rules=[_GOOD_RULE])
     assert opts.policy_rules == [Rule.from_dict(_GOOD_RULE)]
     assert Matcher("ne", "$turn.result_tool").value == "$turn.result_tool"
+
+
+def test_floor_without_web_is_unchanged() -> None:
+    assert [r.id for r in floor_tradewind()] == ["floor.missing_critical_field"]
+    assert [r.id for r in floor_tradewind(None)] == ["floor.missing_critical_field"]
+
+
+def test_floor_denies_each_kind_left_off() -> None:
+    ids = {r.id for r in floor_tradewind(WebAccess(search=False, fetch=True))}
+    assert "floor.web_search_off" in ids
+    assert "floor.fetch_url_off" not in ids
+    ids = {r.id for r in floor_tradewind(WebAccess(search=True, fetch=False))}
+    assert "floor.fetch_url_off" in ids
+    assert "floor.web_search_off" not in ids

@@ -66,8 +66,10 @@ from tradewind.domain.models import (
     TurnResult,
     TurnStatus,
     Verdict,
+    WebAccess,
     customization_notice,
     timeout_notice,
+    web_from_snapshot,
 )
 from tradewind.domain.policy import Rule, TurnVars, floor_tradewind
 from tradewind.domain.supervision import Limits
@@ -558,6 +560,34 @@ def _check_governance_support(
         )
 
 
+def _check_web_support(backend: Backend, web: WebAccess | None) -> None:
+    """Refuse, before `prepare_turn` and `TurnStarted`, a web kind the
+    backend does not offer, or only observes when the caller has not
+    accepted that (07 §2, §3).
+
+    Failure modes:
+        Unsupported: a web setting without `supports_action_policy`; a kind
+            the setting turns on whose mode is `None`; or one whose mode is
+            `"observed"` while `web.observed` is False.
+    """
+    if web is None:
+        return
+    caps = backend.capabilities()
+    for on, mode, label in (
+        (web.search, caps.web_search, "web search"),
+        (web.fetch, caps.fetch_url, "web fetch"),
+    ):
+        if not on:
+            continue
+        if mode is None or not caps.supports_action_policy:
+            raise Unsupported(f"{label} is not offered on backend {backend.name!r}")
+        if mode == "observed" and not web.observed:
+            raise Unsupported(
+                f"{label} is only observed on backend {backend.name!r}; "
+                "set WebAccess(observed=True) to accept it"
+            )
+
+
 class TurnRunner:
     """Orchestrates one turn per `execute()` call (see module docstring)."""
 
@@ -753,6 +783,8 @@ class TurnRunner:
             # the adapters that read it.
             permission_mode, policy_rules = _stored_governance(snapshot)
             _check_governance_support(backend, permission_mode, policy_rules)
+            web = web_from_snapshot(snapshot)
+            _check_web_support(backend, web)
             # FR-6.1 resume routing (Phase 4, closes P-7): probe only where
             # it is real and cheap (claude's local-jsonl existence check;
             # other backends return truthy-id probes), then let the planner
@@ -845,7 +877,7 @@ class TurnRunner:
             uses_result_tool = backend.uses_result_tool and output_schema is not None
             gate = PolicyGate(
                 broker=broker,
-                floor=[*floor_tradewind(), *backend.floor_rules()],
+                floor=[*floor_tradewind(web), *backend.floor_rules()],
                 caller=policy_rules,
                 defaults=backend.default_rules(),
                 turn=TurnVars(

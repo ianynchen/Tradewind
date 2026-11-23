@@ -54,6 +54,7 @@ from tradewind.domain.models import (
     Profile,
     SessionRow,
     TurnResult,
+    WebMode,
 )
 from tradewind.domain.policy import Action, ActionKind, Matcher, Rule
 from tradewind.domain.supervision import WorkKind
@@ -130,7 +131,9 @@ class FakeGovernedBackend(Backend):
     `delete` preflight answer removed). `engine_auto` and `action_policy`
     set the matching capability flags; `run()` itself never checks them,
     so a refusal proves the runner's check. `patterns` are its
-    `customization_patterns()` (06 §1); none by default.
+    `customization_patterns()` (06 §1); none by default. `web_search` and
+    `fetch_url` are its web capability modes (07 §2); test-only, as real
+    backends keep both `None`.
     """
 
     name: ClassVar[BackendName] = "codex"
@@ -150,6 +153,8 @@ class FakeGovernedBackend(Backend):
         on_engine_closed: Callable[[], None] | None = None,
         answers_interrupt: bool = True,
         patterns: list[CustomizationPattern] | None = None,
+        web_search: WebMode | None = None,
+        fetch_url: WebMode | None = None,
     ) -> None:
         super().__init__(profile, native_config)
         self._script = script
@@ -161,6 +166,8 @@ class FakeGovernedBackend(Backend):
         self._on_engine_closed = on_engine_closed
         self._answers_interrupt = answers_interrupt
         self._patterns = patterns or []
+        self._web_search = web_search
+        self._fetch_url = fetch_url
         self._interrupts: dict[str, asyncio.Event] = {}
         self.calls: list[str] = []
         self.contexts: list[TurnContext] = []
@@ -184,6 +191,8 @@ class FakeGovernedBackend(Backend):
             supports_engine_auto=self._engine_auto,
             supports_work_supervisor=True,
             supports_action_policy=self._action_policy,
+            web_search=self._web_search,
+            fetch_url=self._fetch_url,
         )
 
     def floor_rules(self) -> list[Rule]:
