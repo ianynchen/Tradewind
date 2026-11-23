@@ -200,6 +200,7 @@ from openai_codex.generated.v2_all import (
     DynamicToolCallThreadItem,
     FileChangeThreadItem,
     FileUpdateChange,
+    FindInPageWebSearchAction,
     InputTextDynamicToolCallOutputContentItem,
     ItemCompletedNotification,
     ItemGuardianApprovalReviewCompletedNotification,
@@ -209,11 +210,13 @@ from openai_codex.generated.v2_all import (
     McpToolCallStatus,
     McpToolCallThreadItem,
     MessagePhase,
+    OpenPageWebSearchAction,
     ReasoningEffort,
     ReasoningSummaryTextDeltaNotification,
     ReasoningTextDeltaNotification,
     ReasoningThreadItem,
     SandboxMode,
+    SearchWebSearchAction,
     TerminalInteractionNotification,
     TextUserInput,
     ThreadItem,
@@ -768,19 +771,53 @@ def mcp_action(server: object, tool: str | None, args: dict[str, object]) -> Act
     )
 
 
-def observed_action(item: ThreadItem, *, workspace: str | None) -> Action | None:
-    """The action of a completed command or file-change item, for
-    `observe` (05 §7); `None` for every other item kind."""
+def _web_actions(item: WebSearchThreadItem) -> list[Action]:
+    """The actions of a completed `webSearch` item (07 §4): a search is
+    `web_search` (one action per entry of `queries` when `query` is unset),
+    `openPage` and `findInPage` are `fetch_url`; no action, an unknown one,
+    or a missing query or url sets `missing_critical_field` (decision 13)."""
+    root = item.action.root if item.action is not None else None
+    native_args = root.model_dump(mode="json", by_alias=True) if root is not None else {}
+
+    def one(kind: str, field: str, value: str | None) -> Action:
+        return Action(
+            kind=kind,  # type: ignore[arg-type]
+            fields={field: value},
+            backend="codex",
+            native_name="webSearch",
+            native_args=native_args,
+            summary=value or "",
+            missing_critical_field=value is None,
+        )
+
+    if isinstance(root, SearchWebSearchAction):
+        if root.query is not None:
+            return [one("web_search", "query", root.query)]
+        return [one("web_search", "query", q) for q in root.queries or []] or [
+            one("web_search", "query", None)
+        ]
+    if isinstance(root, OpenPageWebSearchAction | FindInPageWebSearchAction):
+        return [one("fetch_url", "url", root.url)]
+    return [one("web_search", "query", None)]
+
+
+def observed_actions(item: ThreadItem, *, workspace: str | None) -> list[Action]:
+    """The actions of a completed command, file-change or web item, for
+    `observe` (05 §7, 07 §4); `[]` for every other item kind."""
     root = item.root
     if isinstance(root, CommandExecutionThreadItem):
-        return shell_action({"command": root.command, "cwd": root.cwd.root})
+        return [shell_action({"command": root.command, "cwd": root.cwd.root})]
     if isinstance(root, FileChangeThreadItem):
-        return file_write_action(
-            root.changes,
-            workspace=workspace,
-            native_args={"changes": [c.model_dump(mode="json") for c in root.changes]},
-        )
-    return None
+        return [
+            file_write_action(
+                root.changes,
+                workspace=workspace,
+                native_args={"changes": [c.model_dump(mode="json") for c in root.changes]},
+            )
+        ]
+    if isinstance(root, WebSearchThreadItem):
+        return _web_actions(root)
+    return []
 
 
 def report_work(work: WorkSupervisor, payload: object) -> None:
@@ -1703,14 +1740,15 @@ class CodexBackend(Backend):
         decided at the gate only. Returns the stop reason, or `None`."""
         if policy is None or ledger is None:
             return None
-        action = observed_action(item, workspace=workspace)
-        if action is None or ledger.was_requested(item.root.id):
+        actions = observed_actions(item, workspace=workspace)
+        if not actions or ledger.was_requested(item.root.id):
             return None
-        observation = policy.observe(action)
-        if observation.outcome == "allow":
-            return None
-        stopped = f"turn stopped by policy after {action.kind} {action.summary!r}"
-        return f"{stopped}: {observation.reason}" if observation.reason else stopped
+        for action in actions:
+            observation = policy.observe(action)
+            if observation.outcome != "allow":
+                stopped = f"turn stopped by policy after {action.kind} {action.summary!r}"
+                return f"{stopped}: {observation.reason}" if observation.reason else stopped
+        return None
 
     async def _consume(
         self,

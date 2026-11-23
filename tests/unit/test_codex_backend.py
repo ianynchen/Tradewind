@@ -1348,6 +1348,41 @@ async def test_observed_file_change_without_request_can_stop_the_turn() -> None:
     assert any(isinstance(e, TurnFailed) for e in events)
 
 
+async def test_observed_web_item_stops_at_the_first_stopped_action() -> None:
+    """07 §4: each query of a search is its own action, in order; the first
+    stop ends the turn."""
+    from openai_codex.generated.v2_all import ThreadItem
+
+    from tradewind.domain.events import TurnFailed
+
+    item = ThreadItem.model_validate(
+        {
+            "id": "ws-1",
+            "type": "webSearch",
+            "query": "a",
+            "action": {"type": "search", "queries": ["a", "b"]},
+        }
+    )
+    policy = _gate(
+        _RaisingBroker(),
+        caller=[
+            _rule("web_search", "allow", query="a"),
+            _rule("web_search", "deny", "no web"),
+        ],
+    )
+
+    events, interrupts = await _consume_all(
+        _queue_of(_completed(item), _turn_done("completed")),
+        policy=policy,
+        ledger=ApprovalLedger(wait_s=0.0),
+    )
+
+    assert interrupts == [True]
+    (failed,) = [e for e in events if isinstance(e, TurnFailed)]
+    assert "web_search 'b'" in failed.error
+    assert "no web" in failed.error
+
+
 def test_report_work_maps_items_deltas_and_turn_end() -> None:
     """05 §7 Codex row: items open and close work; output, progress,
     auto-review and terminal input are activity; message and reasoning
