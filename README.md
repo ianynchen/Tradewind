@@ -473,6 +473,8 @@ emulates silently — an unsupported call raises `Unsupported`.
 | `supports_action_policy` | yes | yes | yes | no |
 | `supports_work_supervisor` | yes | yes | yes | no (keeps the 600 s hard cap) |
 | `supports_engine_auto` | no | no (the SDK's auto mode bypasses `can_use_tool`) | yes (Codex's auto-reviewer, workspace-write sandbox) | no |
+| `web_search` | None | None | None | None |
+| `fetch_url` | None | None | None | None |
 
 Engine-auto strength differs by engine: on Codex the engine's own auto review decides its tools
 inside its sandbox; elsewhere `permission_mode="engine_auto"` raises `Unsupported`.
@@ -525,7 +527,8 @@ the call), `"observed"` (the call runs, then your rules can stop the turn; needs
 `observed=True`) or `None`. Read it with `tw.capabilities(profile=None).web_search` and
 `.fetch_url`; no session and no network call. A setting the backend cannot serve raises
 `Unsupported`. Fetch is Tradewind's own `tradewind_fetch_url` tool (http/https, no redirects,
-text only). In 0.15.0 every backend still reports `None` for both kinds (slice 2 turns on
+text only: `text/*`, JSON and XML). A session that has a caller tool named
+`tradewind_fetch_url` while `web.fetch` is on raises `ConfigError`. In 0.15.0 every backend still reports `None` for both kinds (slice 2 turns on
 Claude and Codex search). Design: `docs/components/07-web-access.md`, ADR-0006.
 
 ## Workspace safety — scan and decide

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 import urllib.error
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+import anyio
 import pytest
 
 from tradewind.application import web_fetch
@@ -41,6 +43,23 @@ class _Server:
                     except OSError:
                         pass
                     return
+                if self.path == "/relredirect":
+                    self.send_response(301)
+                    self.send_header("Location", "/docs/")
+                    self.end_headers()
+                    return
+                if self.path in ("/pngslow", "/hang"):
+                    # headers now, the body only after a delay
+                    self.send_response(200)
+                    ctype = "image/png" if self.path == "/pngslow" else "text/plain"
+                    self.send_header("Content-Type", ctype)
+                    self.send_header("Content-Length", "4")
+                    self.end_headers()
+                    self.wfile.flush()
+                    time.sleep(2)
+                    with contextlib.suppress(OSError):
+                        self.wfile.write(b"\x89PNG")
+                    return
                 if self.path == "/notmod":
                     self.send_response(304)
                     self.end_headers()
@@ -51,6 +70,9 @@ class _Server:
                     "/page": ("text/html; charset=utf-8", b"<script>x()</script><p>Hello</p>"),
                     "/big": ("text/plain", b"a" * (FETCH_MAX_BYTES + 10)),
                     "/png": ("image/png", b"\x89PNG"),
+                    "/json": ("application/json", b'{"a": "<b>1</b>"}'),
+                    "/rss": ("application/rss+xml", b"<rss><item>x</item></rss>"),
+                    "/xhtml": ("application/xhtml+xml", b"<html><body><p>Hi</p></body></html>"),
                 }[self.path]
                 self.send_response(200)
                 self.send_header("Content-Type", ctype)
@@ -126,3 +148,34 @@ async def test_block_tags_separate_text(server: _Server) -> None:
 async def test_a_3xx_without_location_is_an_error_not_a_redirect(server: _Server) -> None:
     with pytest.raises(urllib.error.HTTPError):
         await _fetch(f"{server.base}/notmod")
+
+
+async def test_json_is_returned_as_is(server: _Server) -> None:
+    assert await _fetch(f"{server.base}/json") == '{"a": "<b>1</b>"}'
+
+
+async def test_a_plus_xml_type_is_returned_as_is(server: _Server) -> None:
+    assert await _fetch(f"{server.base}/rss") == "<rss><item>x</item></rss>"
+
+
+async def test_xhtml_is_converted_to_text(server: _Server) -> None:
+    assert await _fetch(f"{server.base}/xhtml") == "Hi"
+
+
+async def test_a_refused_type_is_not_downloaded(server: _Server) -> None:
+    # The server holds the body back for 2 s; a fetch that reads it would wait.
+    start = time.monotonic()
+    assert await _fetch(f"{server.base}/pngslow") == "Not a text page (image/png)."
+    assert time.monotonic() - start < 1
+
+
+async def test_a_relative_location_is_resolved(server: _Server) -> None:
+    text = await _fetch(f"{server.base}/relredirect")
+    assert text == f"Redirect 301 to {server.base}/docs/; not followed."
+
+
+async def test_a_cancelled_fetch_returns_promptly(server: _Server) -> None:
+    start = time.monotonic()
+    with anyio.move_on_after(0.3):
+        await _fetch(f"{server.base}/hang")
+    assert time.monotonic() - start < 1

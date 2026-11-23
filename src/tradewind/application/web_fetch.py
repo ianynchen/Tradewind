@@ -9,6 +9,7 @@ import codecs
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from html.parser import HTMLParser
 
@@ -90,6 +91,14 @@ def _decode(raw: bytes, charset: str) -> str:
     return raw.decode(charset, errors="replace")
 
 
+def _is_text(ctype: str) -> bool:
+    return (
+        ctype.startswith("text/")
+        or ctype in ("application/json", "application/xml")
+        or ctype.endswith(("+json", "+xml"))
+    )
+
+
 def _fetch_blocking(url: str) -> str:
     if not url.lower().startswith(("http://", "https://")):
         return _REFUSED
@@ -98,6 +107,8 @@ def _fetch_blocking(url: str) -> str:
     try:
         with opener.open(url, timeout=FETCH_TIMEOUT_S) as resp:
             ctype = resp.headers.get_content_type()
+            if not _is_text(ctype):
+                return f"Not a text page ({ctype})."  # refused before the body is read
             charset = resp.headers.get_content_charset() or "utf-8"
             chunks: list[bytes] = []
             size = 0
@@ -117,21 +128,21 @@ def _fetch_blocking(url: str) -> str:
         try:
             location = err.headers.get("Location")
             if 300 <= err.code < 400 and location:
-                return f"Redirect {err.code} to {location}; not followed."
+                return (
+                    f"Redirect {err.code} to {urllib.parse.urljoin(url, location)}; not followed."
+                )
         finally:
             err.close()
         raise
-    if not ctype.startswith("text/"):
-        return f"Not a text page ({ctype})."
     cut = timed_out or len(raw) > FETCH_MAX_BYTES
     text = _decode(raw[:FETCH_MAX_BYTES], charset)
-    if ctype == "text/html":
+    if ctype in ("text/html", "application/xhtml+xml"):
         text = _html_to_text(text)
     return f"{text}\n[truncated]" if cut else text
 
 
 async def fetch_url(url: str) -> str:
-    return await anyio.to_thread.run_sync(_fetch_blocking, url)
+    return await anyio.to_thread.run_sync(_fetch_blocking, url, abandon_on_cancel=True)
 
 
 def fetch_tool() -> Tool:
