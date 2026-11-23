@@ -260,3 +260,10 @@ def test_capabilities_web_modes_default_to_none() -> None:
     required = dict.fromkeys(_capabilities_kwargs(), False)
     caps = Capabilities(**required)
     assert caps.web_search is None and caps.fetch_url is None
+
+
+def test_web_access_observed_round_trips() -> None:
+    web = WebAccess(search=True, fetch=True, observed=True)
+    snap = SessionOptions(web=web).snapshot()
+    assert snap["web"] == {"search": True, "fetch": True, "observed": True}
+    assert web_from_snapshot(snap) == web
