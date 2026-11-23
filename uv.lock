@@ -1775,6 +1775,7 @@ version = "0.15.0"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },
+    { name = "certifi" },
     { name = "claude-agent-sdk" },
     { name = "cursor-sdk" },
     { name = "jsonschema" },
@@ -1800,6 +1801,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "anyio", specifier = ">=4" },
+    { name = "certifi", specifier = ">=2024.2.2" },
     { name = "claude-agent-sdk", specifier = "==0.2.151" },
     { name = "cursor-sdk", specifier = "==1.0.30" },
     { name = "jsonschema", specifier = ">=4.26,<5" },

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import contextlib
+import ssl
 import threading
 import time
 import urllib.error
@@ -10,6 +11,7 @@ from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import anyio
+import certifi
 import pytest
 
 from tradewind.application import web_fetch
@@ -179,3 +181,17 @@ async def test_a_cancelled_fetch_returns_promptly(server: _Server) -> None:
     with anyio.move_on_after(0.3):
         await _fetch(f"{server.base}/hang")
     assert time.monotonic() - start < 1
+
+
+async def test_https_trusts_the_certifi_bundle(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[str | None] = []
+    real = ssl.create_default_context
+
+    def spy(*, cafile: str | None = None) -> ssl.SSLContext:
+        calls.append(cafile)
+        return real()
+
+    monkeypatch.setattr(web_fetch.ssl, "create_default_context", spy)
+    with contextlib.suppress(Exception):  # nothing listens on port 1; only the context matters
+        await _fetch("https://127.0.0.1:1/")
+    assert calls == [certifi.where()]
