@@ -40,6 +40,7 @@ from tradewind.domain.models import (
     StoredMessage,
     SubscriptionAuth,
     Verdict,
+    WebAccess,
 )
 
 
@@ -438,6 +439,51 @@ def test_capabilities_match_the_brief() -> None:
     # 05 §2.5: Codex's own auto-reviewer; approval requests reach the gate.
     assert caps.supports_engine_auto is True
     assert caps.supports_action_policy is True
+    assert caps.web_search == "observed"
+    assert caps.fetch_url == "gated"
+
+
+@pytest.mark.parametrize(
+    ("web", "expected"),
+    [
+        (None, ()),
+        (WebAccess(search=True, fetch=False), ('web_search="live"',)),
+        (WebAccess(search=False, fetch=True), ('web_search="disabled"',)),
+    ],
+)
+def test_web_search_overrides(web: WebAccess | None, expected: tuple[str, ...]) -> None:
+    assert codex_backend.web_search_overrides(web) == expected
+
+
+async def test_turn_config_has_the_web_override_after_the_shim_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[str, ...]] = []
+    real = CodexBackend._engine_config
+
+    def spy(self: CodexBackend, config_overrides: tuple[str, ...] = ()) -> Any:
+        seen.append(config_overrides)
+        return real(self, config_overrides)
+
+    monkeypatch.setattr(CodexBackend, "_engine_config", spy)
+
+    def fake_drive_turn(*args: Any, **kwargs: Any) -> None:  # noqa: ARG001
+        args[10].put(codex_backend._DONE)
+
+    monkeypatch.setattr(codex_backend, "_drive_turn", fake_drive_turn)
+    backend = CodexBackend(_profile(), NativeStoreConfig())
+    tool_host = ToolHost([], [], lambda ref: ref)
+    ctx = _make_turn_context(broker=_ScriptedBroker("allow"), tools=tool_host)
+    ctx.web = WebAccess(search=True, fetch=False)
+    try:
+        async with aclosing(backend.run(ctx)) as stream:
+            async for _ in stream:
+                pass
+    finally:
+        await tool_host.stop_socket()
+
+    assert seen[0][-1] == 'web_search="live"'
+    assert seen[0][0].startswith("mcp_servers.")
 
 
 # --- probe_native: cheap id-truthiness check ---------------------------

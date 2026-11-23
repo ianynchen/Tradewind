@@ -260,6 +260,7 @@ from tradewind.domain.models import (
     Profile,
     SessionRow,
     TurnResult,
+    WebAccess,
     calculate_cost,
     engine_compaction_record,
     resume_degraded_notice,
@@ -676,6 +677,14 @@ def mcp_server_config_overrides(server: McpServerDef) -> tuple[str, ...]:
     if server.env:
         overrides.append(f"mcp_servers.{server.name}.env={_toml_inline_table(server.env)}")
     return tuple(overrides)
+
+
+def web_search_overrides(web: WebAccess | None) -> tuple[str, ...]:
+    """`--config` entries for Codex's own web search (07 §4a). No web
+    setting leaves Codex's default as it is (owner decision 11)."""
+    if web is None:
+        return ()
+    return ('web_search="live"',) if web.search else ('web_search="disabled"',)
 
 
 # --- approval handler: JSON-RPC server-request -> policy gate ----------
@@ -1483,6 +1492,8 @@ class CodexBackend(Backend):
             # still reach the client, and the shim, go through the gate.
             supports_engine_auto=True,
             supports_action_policy=True,
+            web_search="observed",
+            fetch_url="gated",
         )
 
     async def probe_native(self, session: SessionRow) -> bool:
@@ -1586,7 +1597,9 @@ class CodexBackend(Backend):
         approval_handler = make_approval_handler(policy, loop, out_queue, ledger, workspace)
         try:
             shim_def = await ctx.tools.shim_server_def()
-            config = self._engine_config(mcp_server_config_overrides(shim_def))
+            config = self._engine_config(
+                mcp_server_config_overrides(shim_def) + web_search_overrides(ctx.web)
+            )
 
             def make_client() -> CodexClient:
                 return _EngineReportingClient(
