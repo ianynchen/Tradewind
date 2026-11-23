@@ -745,6 +745,7 @@ async def test_no_web_setting_leaves_the_backend_as_it_is(tmp_path: Path) -> Non
 
     assert fake.decisions == [("web_search", "allow")]
     assert isinstance(events[-1], TurnCompleted)
+    assert "tradewind_fetch_url" not in _served(fake)
 
 
 # --- web fetch tool (07 §5) --------------------------------------------
