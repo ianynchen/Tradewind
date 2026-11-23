@@ -284,11 +284,17 @@ def test_a_caller_tool_maps_as_today():
 
 def test_the_fetch_tool_maps_to_fetch_url():
     a = caller_tool_action("tradewind_fetch_url", {"url": "https://example.com"}, backend="codex")
-    assert (a.kind, a.fields, a.missing_critical_field) == (
+    assert (a.kind, a.fields, a.missing_critical_field, a.summary) == (
         "fetch_url",
         {"url": "https://example.com"},
         False,
+        "https://example.com",
     )
+
+
+def test_a_fetch_call_with_no_url_is_summarized_by_the_tool_name():
+    a = caller_tool_action("tradewind_fetch_url", {}, backend="claude")
+    assert a.summary == "tradewind_fetch_url"
 
 
 @pytest.mark.parametrize("args", [{}, {"url": 7}, {"url": None}])

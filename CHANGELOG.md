@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.1] - 2026-11-23
+
+### Fixed
+- A `fetch_url` action of Tradewind's fetch tool now has the URL as its `summary`, as Codex's
+  `openPage` and `findInPage` already do. Before, the summary was the tool's name
+  (`tradewind_fetch_url`), so a recorded decision (`record=True`) did not show which URL the
+  call fetched. A call with no usable URL keeps the tool's name.
+
 ## [0.16.0] - 2026-11-23
 
 ### Added
