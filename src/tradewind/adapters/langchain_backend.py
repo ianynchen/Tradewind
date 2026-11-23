@@ -486,6 +486,8 @@ class LangchainBackend(Backend):
             # loop gates every call.
             supports_engine_auto=False,
             supports_action_policy=True,
+            # 07 §4: the own tool loop serves and gates the fetch tool; no search.
+            fetch_url="gated",
         )
 
     async def probe_native(
