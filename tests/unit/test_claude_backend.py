@@ -2308,10 +2308,18 @@ def _web_rule(outcome: str) -> Any:
 async def test_web_search_is_gated_as_a_web_search_action() -> None:
     from claude_agent_sdk import PermissionResultAllow
 
-    emitted: list[object] = []
-    policy = _policy(_NoBroker(), caller=[_web_rule("allow")], emitted=emitted)
+    policy = _policy(_NoBroker(), caller=[_web_rule("allow")])
+    gated: list[Any] = []
+    real_gate = policy.gate
+
+    async def spy(action: Any, **kwargs: Any) -> Any:
+        gated.append(action)
+        return await real_gate(action, **kwargs)
+
+    policy.gate = spy
     result = await _web_search(policy, {"query": "q"})
     assert isinstance(result, PermissionResultAllow)
+    assert [(a.kind, a.fields) for a in gated] == [("web_search", {"query": "q"})]
 
 
 async def test_web_search_deny_rule_stops_the_search() -> None:
@@ -2328,8 +2336,23 @@ async def test_web_search_deny_rule_stops_the_search() -> None:
 async def test_web_search_without_a_query_is_denied_by_the_floor() -> None:
     from claude_agent_sdk import PermissionResultDeny
 
-    result = await _web_search(_policy(_NoBroker(), caller=[_web_rule("allow")]), {})
+    from tradewind.domain.policy import Rule
+
+    allow_all = Rule(id="caller.web.all", kind="web_search", where={}, outcome="allow")
+    result = await _web_search(_policy(_NoBroker(), caller=[allow_all]), {})
     assert isinstance(result, PermissionResultDeny)
+    assert result.message == "action is missing a critical field"
+
+
+def test_web_search_items_survive_without_structured_output() -> None:
+    from tradewind.adapters.claude_backend import _without_structured_output
+    from tradewind.domain.models import NormalizedMessage
+
+    use = NormalizedMessage(
+        role="assistant", kind="tool_use", content={"id": "w1", "name": "WebSearch", "input": {}}
+    )
+    result = NormalizedMessage(role="user", kind="tool_result", content={"tool_use_id": "w1"})
+    assert _without_structured_output([use, result], set()) == [use, result]
 
 
 def test_claude_web_search_action_shape() -> None:
