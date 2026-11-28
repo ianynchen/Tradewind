@@ -1773,7 +1773,6 @@ wheels = [
 
 [[package]]
 name = "tradewind"
-version = "0.16.2"
 source = { editable = "." }
 dependencies = [
     { name = "anyio" },

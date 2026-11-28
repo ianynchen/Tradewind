@@ -1,10 +1,10 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
 
 [project]
 name = "tradewind"
-version = "0.16.2"
+dynamic = ["version"]  # from the git tag (v0.17.0 -> 0.17.0), see [tool.hatch.version]
 description = "Agent infrastructure and policy execution engine"
 requires-python = ">=3.12"
 dependencies = [
@@ -31,6 +31,9 @@ dev = [
     "langchain-groq>=1.1.3",
     "pre-commit",
 ]
+
+[tool.hatch.version]
+source = "vcs"  # hatch-vcs: the tag v<semver> is the version; a commit after it is a .devN version
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/tradewind"]

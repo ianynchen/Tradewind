@@ -1,9 +1,11 @@
 name: Release
 
-# A pushed tag "v" + a semantic version (for example v0.16.3) on main makes a
-# GitHub release named by the version without the "v" (0.16.3), with the
-# CHANGELOG section as its notes and the wheel and sdist attached. The checks in
-# scripts/release-check.sh run first; if one fails, nothing is released.
+# A pushed tag "v" + a semantic version (for example v0.17.0) on main makes a
+# GitHub release named by the version without the "v" (0.17.0), with notes that
+# GitHub generates from the PRs merged since the previous tag, and the wheel and
+# sdist attached. The tag is the version: the build reads it from git
+# (hatch-vcs). The checks in scripts/release-check.sh run first; if one fails,
+# nothing is released.
 on:
   push:
     tags:
@@ -23,7 +25,7 @@ jobs:
       - name: Check the tag, the branch and the version
         id: check
         run: |
-          version="$(./scripts/release-check.sh "$GITHUB_REF_NAME" release-notes.md)"
+          version="$(./scripts/release-check.sh "$GITHUB_REF_NAME")"
           echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Install uv
@@ -32,7 +34,12 @@ jobs:
           python-version: "3.12"
 
       - name: Build (wheel + sdist)
-        run: uv build
+        run: |
+          uv build
+          # the tag is the version: a build from it must carry exactly that version
+          # (in Python's form: 1.0.0-rc.1 is 1.0.0rc1)
+          want="$(uv run --no-project --with packaging python -c 'import sys; from packaging.version import Version; print(Version(sys.argv[1]))' "${{ steps.check.outputs.version }}")"
+          ls dist/tradewind-"$want"-*.whl
 
       - name: Create the release
         env:
@@ -42,4 +49,4 @@ jobs:
           pre=""
           case "$VERSION" in *-*) pre="--prerelease" ;; esac
           gh release create "$GITHUB_REF_NAME" dist/* \
-            --verify-tag --title "$VERSION" --notes-file release-notes.md $pre
+            --verify-tag --title "$VERSION" --generate-notes $pre
