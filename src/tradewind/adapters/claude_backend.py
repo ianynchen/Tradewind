@@ -83,11 +83,8 @@ or the CLI's own `error_max_structured_output_retries` -- still COMPLETES,
 keeping its text, with `structured_output=None`; an honest partial
 (`max_tool_rounds`, `max_tokens`) keeps its `end_reason`.
 
-`ModelSpec.effort` is not wired to `ClaudeAgentOptions.effort`:
-the task-10 brief's options list does not name it, and GUIDELINES §1.1
-treats an unlisted option as out of scope rather than a silent addition;
-flagged in the task-10 report for controller follow-up alongside the two
-points above.
+`ModelSpec.effort` goes to `ClaudeAgentOptions.effort` unchanged (None: the
+SDK's own default).
 """
 
 from __future__ import annotations
@@ -1053,6 +1050,7 @@ class ClaudeBackend(Backend):
             hooks={"PreCompact": [HookMatcher(hooks=[_make_precompact_hook(pending_events)])]},
             system_prompt=cast(Any, system_prompt),
             model=ctx.model_spec.model,
+            effort=ctx.model_spec.effort,
             cwd=ctx.session.cwd,
             # FR-6.5: the cap itself is enforced exactly by
             # `_CallerRoundCap` (the CLI runs a response's tools before its

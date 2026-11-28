@@ -26,6 +26,7 @@ from tradewind.adapters.codex_backend import (
     ApprovalLedger,
     CodexBackend,
     _codex_env,
+    _reasoning_effort,
     _sandbox_mode_from_options,
     make_approval_handler,
 )
@@ -1896,3 +1897,8 @@ def test_installed_sdk_keeps_the_app_server_process_where_the_adapter_reads_it()
 
     assert hasattr(CodexClient(), "_proc")
     assert "self._proc = subprocess.Popen(" in inspect.getsource(CodexClient.start)
+
+
+def test_max_effort_maps_to_codex_s_highest_level() -> None:
+    assert _reasoning_effort("max") == _reasoning_effort("xhigh")
+    assert _reasoning_effort("high") is not None and _reasoning_effort(None) is None

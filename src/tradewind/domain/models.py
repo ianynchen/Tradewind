@@ -17,7 +17,7 @@ from tradewind.domain.policy import Mode, Rule
 
 BackendName = Literal["claude", "codex", "cursor", "langchain"]
 TierName = str
-EffortLevel = Literal["low", "medium", "high", "xhigh"]
+EffortLevel = Literal["low", "medium", "high", "xhigh", "max"]
 Role = Literal["user", "assistant", "tool", "system"]
 Kind = Literal[
     "text",

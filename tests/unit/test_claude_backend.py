@@ -26,6 +26,7 @@ from tradewind.application.tool_host import ToolHost
 from tradewind.domain.errors import Unsupported
 from tradewind.domain.events import ItemCompleted, PermissionRequested, TurnCompleted, TurnFailed
 from tradewind.domain.models import (
+    EffortLevel,
     ModelSpec,
     Profile,
     SessionRow,
@@ -63,7 +64,10 @@ def _history_loader(messages: list[StoredMessage]):
 
 
 def _make_ctx(
-    *, output_schema: dict[str, object] | None, max_tool_rounds: int | None = None
+    *,
+    output_schema: dict[str, object] | None,
+    max_tool_rounds: int | None = None,
+    effort: EffortLevel | None = None,
 ) -> TurnContext:
     return TurnContext(
         session=SessionRow(
@@ -71,7 +75,7 @@ def _make_ctx(
         ),
         turn_id="turn-1",
         prompt="hello",
-        model_spec=ModelSpec(model="claude-sonnet-4-5"),
+        model_spec=ModelSpec(model="claude-sonnet-4-5", effort=effort),
         system_prompt=None,
         output_schema=output_schema,
         tools=ToolHost([], [], lambda ref: ref),
@@ -2368,3 +2372,15 @@ def test_claude_web_search_action_shape() -> None:
     assert action.summary == "q"
     assert action.missing_critical_field is False
     assert claude_web_search_action({"query": 3}).missing_critical_field is True
+
+
+@pytest.mark.parametrize("effort", [None, "high", "max"])
+async def test_the_model_spec_effort_is_passed_to_the_sdk(
+    monkeypatch: pytest.MonkeyPatch, effort: EffortLevel | None
+) -> None:
+    captured = _install_fake_sdk_client(monkeypatch, [_success_result()])
+    backend = ClaudeBackend(_profile(), NativeStoreConfig())
+
+    [event async for event in backend.run(_make_ctx(output_schema=None, effort=effort))]
+
+    assert cast(Any, captured[0]).effort == effort
