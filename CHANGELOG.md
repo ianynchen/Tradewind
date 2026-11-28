@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- The version comes from the git tag (hatch-vcs): the commit tagged `v0.17.0` builds as `0.17.0`,
+  a later commit as a `.devN` version, and `tradewind.__version__` reads the installed version.
+  A release is only a pushed tag `v` + a semantic version on `main`; no file holds the version, and
+  the release notes are generated from the PRs merged since the previous tag.
+
 ### Added
 - The Claude backend passes `ModelSpec.effort` to the SDK (`ClaudeAgentOptions.effort`); before,
   the setting was ignored and every Claude session ran at the SDK's default effort. `EffortLevel`

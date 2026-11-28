@@ -12,6 +12,7 @@ build them (see `tradewind.application.client` module docstring for the
 full rationale).
 """
 
+from importlib.metadata import version as _version
 from pathlib import Path
 
 from tradewind.adapters.claude_backend import ClaudeBackend
@@ -36,7 +37,7 @@ from tradewind.application.workspace_scan import (
 )
 from tradewind.domain.models import CustomizationDecision, Profile, WebAccess, WebMode
 
-__version__ = "0.16.2"
+__version__ = _version("tradewind")  # the installed version, from the git tag at build time
 
 
 def _build_default_store(path: Path) -> SessionStorePort:
