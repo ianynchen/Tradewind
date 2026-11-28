@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.16.2] - 2026-11-28
+
+### Changed
+- `claude-agent-sdk` is now 0.2.189 (was 0.2.151). It bundles Claude Code 2.1.332. The old
+  2.1.258 refused `claude-opus-5-5` ("version 2.1.280 or newer is required"), so a Claude
+  session on Opus 5.5 failed before its first turn.
+
 ## [0.16.1] - 2026-11-23
 
 ### Fixed
