@@ -632,7 +632,10 @@ def _usage_dict(usage: ThreadTokenUsage) -> dict[str, int]:
 
 
 def _reasoning_effort(effort: EffortLevel | None) -> ReasoningEffort | None:
-    return ReasoningEffort(effort) if effort is not None else None
+    # Codex has no "max": its highest level is "xhigh".
+    if effort is None:
+        return None
+    return ReasoningEffort("xhigh" if effort == "max" else effort)
 
 
 # --- config_overrides: McpServerDef -> `--config` TOML assignments ------

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- The Claude backend passes `ModelSpec.effort` to the SDK (`ClaudeAgentOptions.effort`); before,
+  the setting was ignored and every Claude session ran at the SDK's default effort. `EffortLevel`
+  also takes `"max"`, the SDK's highest level; the Codex backend, whose highest level is `"xhigh"`,
+  maps `"max"` to `"xhigh"`.
+
 ## [0.16.2] - 2026-11-28
 
 ### Changed
