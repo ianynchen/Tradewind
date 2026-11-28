@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-28
+
 ### Added
 - The Claude backend passes `ModelSpec.effort` to the SDK (`ClaudeAgentOptions.effort`); before,
   the setting was ignored and every Claude session ran at the SDK's default effort. `EffortLevel`

@@ -36,7 +36,7 @@ from tradewind.application.workspace_scan import (
 )
 from tradewind.domain.models import CustomizationDecision, Profile, WebAccess, WebMode
 
-__version__ = "0.16.2"
+__version__ = "0.17.0"
 
 
 def _build_default_store(path: Path) -> SessionStorePort:
