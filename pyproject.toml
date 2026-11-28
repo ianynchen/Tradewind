@@ -13,7 +13,7 @@ dependencies = [
     "mcp==2.1.1",
     "langchain-anthropic==1.7.0",
     "langchain-core==1.6.1",
-    "claude-agent-sdk==0.2.151",
+    "claude-agent-sdk==0.2.189",
     "openai-codex==0.147.0",
     "cursor-sdk==1.0.30",
     "yoyo-migrations==9.0.0",
