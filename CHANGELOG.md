@@ -12,6 +12,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the setting was ignored and every Claude session ran at the SDK's default effort. `EffortLevel`
   also takes `"max"`, the SDK's highest level; the Codex backend, whose highest level is `"xhigh"`,
   maps `"max"` to `"xhigh"`.
+- A release workflow (`.github/workflows/release.yml`): a pushed tag `v` + a semantic version on
+  `main` (for example `v0.16.3`) makes a GitHub release named `0.16.3`, with the version's
+  CHANGELOG section as its notes and the wheel and sdist attached. `scripts/release-check.sh`
+  first checks the tag, that its commit is on `main`, and that `pyproject.toml` and
+  `tradewind.__version__` hold that version; a failed check releases nothing.
 
 ## [0.16.2] - 2026-11-28
 
